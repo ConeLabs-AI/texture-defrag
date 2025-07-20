@@ -25,6 +25,7 @@
 #include "logging.h"
 #include "math_utils.h"
 
+#include <Eigen/IterativeLinearSolvers>
 #include <iomanip>
 #include <unordered_set>
 
@@ -331,10 +332,9 @@ ARAPSolveInfo ARAP::Solve()
     double e = CurrentEnergy();
 
     // The system matrix is not symmetric
-    Eigen::SparseLU<Eigen::SparseMatrix<double>> solver;
+    Eigen::BiCGSTAB<Eigen::SparseMatrix<double>> solver;
 
-    solver.analyzePattern(A);
-    solver.factorize(A);
+    solver.compute(A);
 
     if (solver.info() != Eigen::Success) {
         LOG_WARN << "Cotan matrix factorization failed: " << solver.info();

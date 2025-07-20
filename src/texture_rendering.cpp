@@ -139,6 +139,39 @@ int FacesByTextureIndex(Mesh& m, std::vector<std::vector<Mesh::FacePointer>>& fv
     return fv.size();
 }
 
+void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObjectHandle textureObject, const std::vector<TextureSize> &texSizes,
+                                                   bool filter, RenderMode imode)
+{
+    std::vector<std::vector<Mesh::FacePointer>> facesByTexture;
+    int nTex = FacesByTextureIndex(m, facesByTexture);
+
+    ensure(nTex <= (int) texSizes.size());
+
+    m.textures.clear();
+
+    QFileInfo fi(outFileName.c_str());
+    QString wd = QDir::currentPath();
+    QDir::setCurrent(fi.absoluteDir().absolutePath());
+
+    for (int i = 0; i < nTex; ++i) {
+        std::shared_ptr<QImage> teximg = RenderTexture(facesByTexture[i], m, textureObject, filter, imode, texSizes[i].w, texSizes[i].h);
+
+        std::stringstream suffix;
+        suffix << "_texture_" << i << ".png";
+        std::string s(outFileName);
+        std::string texturePath = s.substr(0, s.find_last_of('.')).append(suffix.str());
+
+        QFileInfo texFI(texturePath.c_str());
+        m.textures.push_back(texFI.fileName().toStdString());
+
+        if (teximg->save(texturePath.c_str(), "png", 66) == false) {
+            LOG_ERR << "Error saving texture file " << texturePath;
+        }
+    }
+
+    QDir::setCurrent(wd);
+}
+
 std::vector<std::shared_ptr<QImage>> RenderTexture(Mesh& m, TextureObjectHandle textureObject, const std::vector<TextureSize> &texSizes,
                                                    bool filter, RenderMode imode)
 {

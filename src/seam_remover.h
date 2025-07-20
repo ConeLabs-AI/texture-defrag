@@ -167,7 +167,7 @@ struct AlgoState {
 void PrepareMesh(Mesh& m, int *vndup);
 AlgoStateHandle InitializeState(GraphHandle graph, const AlgoParameters& algoParameters);
 void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoParameters& params);
-void Finalize(GraphHandle graph, int *vndup);
+void Finalize(GraphHandle graph, const std::string& outname, int *vndup);
 
 
 #endif // SEAM_REMOVER_H

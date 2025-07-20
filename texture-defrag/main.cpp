@@ -130,7 +130,13 @@ int main(int argc, char *argv[])
 
     int vndupOut;
 
-    Finalize(graph, &vndupOut);
+    std::string savename = args.outfile;
+    if (savename == "")
+        savename = "out_" + m.name;
+    if (savename.substr(savename.size() - 3, 3) == "fbx")
+        savename.append(".obj");
+
+    Finalize(graph, savename, &vndupOut);
 
     double zeroResamplingFraction = 0;
 
@@ -221,13 +227,7 @@ int main(int argc, char *argv[])
 
     LOG_INFO << "Saving mesh file...";
 
-    std::string savename = args.outfile;
-    if (savename == "")
-        savename = "out_" + m.name;
-    if (savename.substr(savename.size() - 3, 3) == "fbx")
-        savename.append(".obj");
-
-    if (SaveMesh(savename.c_str(), m, newTextures, true) == false)
+    if (SaveMesh(savename.c_str(), m, {}, true) == false)
         LOG_ERR << "Model not saved correctly";
 
     LOG_INFO << "Processing took " << t.TimeElapsed() << " seconds";

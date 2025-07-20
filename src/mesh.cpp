@@ -95,12 +95,14 @@ bool SaveMesh(const char *fileName, Mesh& m, const std::vector<std::shared_ptr<Q
 {
     int mask = tri::io::Mask::IOM_WEDGTEXCOORD;
 
-    m.textures.clear();
-    for (std::size_t i = 0; i < textureImages.size(); ++i) {
-        std::stringstream suffix;
-        suffix << "_texture_" << i << ".png";
-        std::string s(fileName);
-        m.textures.push_back(s.substr(0, s.find_last_of('.')).append(suffix.str()));
+    if (textureImages.size() > 0 && m.textures.empty()) {
+        m.textures.clear();
+        for (std::size_t i = 0; i < textureImages.size(); ++i) {
+            std::stringstream suffix;
+            suffix << "_texture_" << i << ".png";
+            std::string s(fileName);
+            m.textures.push_back(s.substr(0, s.find_last_of('.')).append(suffix.str()));
+        }
     }
 
     Timer t;
@@ -113,23 +115,25 @@ bool SaveMesh(const char *fileName, Mesh& m, const std::vector<std::shared_ptr<Q
     }
     LOG_INFO << "Saving mesh took " << t.TimeElapsed() << " seconds";
 
-    QFileInfo fi(fileName);
-    ensure (fi.exists());
+    if (!textureImages.empty()) {
+        QFileInfo fi(fileName);
+        ensure (fi.exists());
 
-    QString wd = QDir::currentPath();
-    QDir::setCurrent(fi.absoluteDir().absolutePath());
+        QString wd = QDir::currentPath();
+        QDir::setCurrent(fi.absoluteDir().absolutePath());
 
-    t.Reset();
-    LOG_INFO << "Saving texture files... ";
-    for (std::size_t i = 0; i < textureImages.size(); ++i) {
-        if (textureImages[i]->save(m.textures[i].c_str(), "png", 66) == false) {
-            LOG_ERR << "Error saving texture file " << m.textures[i];
-            return false;
+        t.Reset();
+        LOG_INFO << "Saving texture files... ";
+        for (std::size_t i = 0; i < textureImages.size(); ++i) {
+            if (textureImages[i]->save(m.textures[i].c_str(), "png", 66) == false) {
+                LOG_ERR << "Error saving texture file " << m.textures[i];
+                return false;
+            }
         }
-    }
-    LOG_INFO << "Writing textures took " << t.TimeElapsed() << " seconds";
+        LOG_INFO << "Writing textures took " << t.TimeElapsed() << " seconds";
 
-    QDir::setCurrent(wd);
+        QDir::setCurrent(wd);
+    }
     return true;
 }
 

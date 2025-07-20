@@ -29,6 +29,8 @@
 #include "arap.h"
 #include "timer.h"
 #include "logging.h"
+#include "seams.h"
+#include "texture_rendering.h"
 
 
 #include <fstream>
@@ -307,7 +309,8 @@ void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoPara
 {
     ClearGlobals();
 
-    Timer timer;
+    Timer t;
+    Timer tglobal;
 
     PrintStateInfo(state, graph, params);
 
@@ -324,7 +327,7 @@ void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoPara
             break;
         }
 
-        if (params.timelimit > 0 && timer.TimeElapsed() > params.timelimit) {
+        if (params.timelimit > 0 && t.TimeElapsed() > params.timelimit) {
             LOG_INFO << "Timelimit hit, interrupting.";
             break;
         }
@@ -402,7 +405,7 @@ void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoPara
 
 }
 
-void Finalize(GraphHandle graph, int *vndup)
+void Finalize(GraphHandle graph, const std::string& outname, int *vndup)
 {
     std::unordered_set<Mesh::ConstVertexPointer> vset;
     for (const MeshFace& f : graph->mesh.face)
@@ -411,6 +414,8 @@ void Finalize(GraphHandle graph, int *vndup)
 
     *vndup = (int) vset.size();
 
+    // The following two calls are probably not necessary as at this point the mesh has been cut along texture seams
+    // and there should not be any duplicate vertex. In any case, it is safer to leave them here.
     tri::Clean<Mesh>::RemoveDuplicateVertex(graph->mesh);
     tri::Clean<Mesh>::RemoveUnreferencedVertex(graph->mesh);
     tri::UpdateTopology<Mesh>::VertexFace(graph->mesh);

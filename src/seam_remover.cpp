@@ -319,7 +319,7 @@ void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoPara
     int k = 0;
     while (state->queue.size() > 0) {
 
-        if (state->queue.size() > 5 * state->cost.size())
+        if (state->queue.size() > 2 * state->cost.size())
             PurgeQueue(state);
 
         if (state->queue.size() == 0) {
@@ -593,16 +593,16 @@ static inline bool Valid(const WeightedSeam& ws, ConstAlgoStateHandle state)
 
 static inline void PurgeQueue(AlgoStateHandle state)
 {
-    std::unordered_set<ClusteredSeamHandle> valid;
-    while (!state->queue.empty()) {
-        WeightedSeam ws = state->queue.top();
-        if (Valid(ws, state) && ws.second != Infinity())
-            valid.insert(ws.first);
-        state->queue.pop();
+    if (state->queue.empty()) return;
+    LOG_INFO << "Purging queue of size " << state->queue.size() << " (cost map size is " << state->cost.size() << ")";
+    AlgoState::QueueType newQueue;
+    for (const auto& costEntry : state->cost) {
+        if (costEntry.second != Infinity()) {
+            newQueue.push(std::make_pair(costEntry.first, costEntry.second));
+        }
     }
-    ensure(state->queue.empty());
-    for (ClusteredSeamHandle csh : valid)
-        state->queue.push(std::make_pair(csh, state->cost[csh]));
+    state->queue.swap(newQueue);
+    LOG_INFO << "Queue purged, new size is " << state->queue.size();
 }
 
 static void ComputeSeamData(SeamData& sd, ClusteredSeamHandle csh, GraphHandle graph, AlgoStateHandle state)

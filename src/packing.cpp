@@ -34,7 +34,7 @@
 typedef vcg::RasterizedOutline2Packer<float, QtOutline2Rasterizer> RasterizationBasedPacker;
 
 
-int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObject, std::vector<TextureSize>& texszVec)
+int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObject, std::vector<TextureSize>& texszVec, const struct AlgoParameters& params)
 {
     // Pack the atlas
 
@@ -64,7 +64,8 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         packingArea += containerVec[i].X() * containerVec[i].Y();
         textureArea += textureObject->TextureWidth(i) * textureObject->TextureHeight(i);
     }
-    double packingScale = std::sqrt(packingArea / (double) textureArea);
+    double targetTextureArea = textureArea * params.resolutionScaling * params.resolutionScaling;
+    double packingScale = std::sqrt(packingArea / targetTextureArea);
 
     RasterizationBasedPacker::Parameters packingParams;
     packingParams.costFunction = RasterizationBasedPacker::Parameters::LowestHorizon;

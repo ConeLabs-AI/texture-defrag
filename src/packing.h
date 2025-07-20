@@ -23,6 +23,7 @@
 #define PACKING_H
 
 #include "types.h"
+#include "seam_remover.h"
 
 #include <vector>
 #include <map>
@@ -31,7 +32,7 @@
 /* Pack the texture atlas encoded in the graph. Assumes the segmentation
  * correctly reflects the texture coordinates.
  * Returns the actual number of charts packed */
-int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObject, std::vector<TextureSize>& texszVec);
+int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObject, std::vector<TextureSize>& texszVec, const struct AlgoParameters& params);
 
 /* Computes the UV outline(s) of the given chart. If the chart has no outlines,
  * which can happen for some inputs on small closed components that are ignored

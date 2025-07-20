@@ -39,6 +39,16 @@
 
 #include <vcg/complex/algorithms/clean.h>
 
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+#elif defined(__linux__)
+#include <string>
+#include <fstream>
+#elif defined(_WIN32)
+#include <windows.h>
+#endif
+
 
 constexpr double PENALTY_MULTIPLIER = 2.0;
 
@@ -138,8 +148,83 @@ static void ClearGlobals()
     retry_success = 0;
 }
 
+static void LogMemoryUsage()
+{
+#if defined(__APPLE__)
+    // macOS implementation
+    mach_port_t host_port = mach_host_self();
+    mach_msg_type_number_t host_size = sizeof(vm_statistics64_data_t) / sizeof(integer_t);
+    vm_size_t pagesize;
+    host_page_size(host_port, &pagesize);
+
+    vm_statistics64_data_t vm_stat;
+    if (host_statistics64(host_port, HOST_VM_INFO64, (host_info64_t)&vm_stat, &host_size) != KERN_SUCCESS) {
+        LOG_WARN << "Failed to fetch macOS vm statistics";
+        return;
+    }
+
+    uint64_t total_mem_val;
+    size_t len = sizeof(total_mem_val);
+    if (sysctlbyname("hw.memsize", &total_mem_val, &len, NULL, 0) != 0) {
+        LOG_WARN << "Failed to fetch macOS total memory";
+        return;
+    }
+
+    uint64_t used_memory = (vm_stat.active_count + vm_stat.inactive_count + vm_stat.wire_count) * (uint64_t)pagesize;
+
+    double used_mem_gb = (double)used_memory / (1024.0 * 1024.0 * 1024.0);
+    double total_mem_gb = (double)total_mem_val / (1024.0 * 1024.0 * 1024.0);
+
+    LOG_INFO << "System RAM: " << std::fixed << std::setprecision(2) << used_mem_gb << " / " << total_mem_gb << " GB used";
+
+#elif defined(__linux__)
+    // Linux implementation
+    std::ifstream meminfo("/proc/meminfo");
+    if (!meminfo.is_open()) {
+        LOG_WARN << "Could not open /proc/meminfo to read memory stats";
+        return;
+    }
+
+    std::string line;
+    long long mem_total = -1, mem_available = -1;
+    while (std::getline(meminfo, line)) {
+        if (line.rfind("MemTotal:", 0) == 0) {
+            try { mem_total = std::stoll(line.substr(10)); } catch (...) {}
+        }
+        if (line.rfind("MemAvailable:", 0) == 0) {
+            try { mem_available = std::stoll(line.substr(13)); } catch (...) {}
+        }
+    }
+
+    if (mem_total != -1 && mem_available != -1) {
+        long long used_mem = mem_total - mem_available; // in kB
+        double used_mem_gb = (double)used_mem / (1024.0 * 1024.0);
+        double total_mem_gb = (double)mem_total / (1024.0 * 1024.0);
+        LOG_INFO << "System RAM: " << std::fixed << std::setprecision(2) << used_mem_gb << " / " << total_mem_gb << " GB used";
+    } else {
+        LOG_WARN << "Could not parse MemTotal/MemAvailable from /proc/meminfo";
+    }
+
+#elif defined(_WIN32)
+    // Windows implementation
+    MEMORYSTATUSEX statex;
+    statex.dwLength = sizeof(statex);
+    if (GlobalMemoryStatusEx(&statex)) {
+        double total_mem_gb = (double)statex.ullTotalPhys / (1024.0 * 1024.0 * 1024.0);
+        double used_mem_gb = (double)(statex.ullTotalPhys - statex.ullAvailPhys) / (1024.0 * 1024.0 * 1024.0);
+
+        LOG_INFO << "System RAM: " << std::fixed << std::setprecision(2) << used_mem_gb << " / " << total_mem_gb << " GB used";
+    } else {
+        LOG_WARN << "Windows GlobalMemoryStatusEx failed.";
+    }
+#else
+    LOG_WARN << "Memory usage logging not implemented for this platform.";
+#endif
+}
+
 void LogExecutionStats()
 {
+    LogMemoryUsage();
     LOG_INFO    << "======== EXECUTION STATS ========";
     LOG_INFO    << "INIT       " << std::fixed << std::setprecision(3) << perf.t_init / perf.timer.TimeElapsed()                                << " , " << std::defaultfloat << std::setprecision(6)<< perf.t_init << " secs";
     LOG_INFO    << "SEAM       " << std::fixed << std::setprecision(3) << perf.t_seamdata / perf.timer.TimeElapsed()                            << " , " << std::defaultfloat << std::setprecision(6)<< perf.t_seamdata << " secs";

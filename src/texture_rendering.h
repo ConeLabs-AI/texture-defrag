@@ -36,9 +36,9 @@ enum RenderMode {
 
 int FacesByTextureIndex(Mesh& m, std::vector<std::vector<Mesh::FacePointer>>& fv);
 
-std::vector<std::shared_ptr<QImage>>
-RenderTexture(Mesh& m, TextureObjectHandle textureObject, const std::vector<TextureSize> &texSizes,
-              bool filter, RenderMode imode);
+void
+RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObjectHandle textureObject, const std::vector<TextureSize> &texSizes,
+                     bool filter, RenderMode imode);
 
 #endif // TEXTURE_RENDERING_H
 

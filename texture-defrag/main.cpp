@@ -184,7 +184,7 @@ int main(int argc, char *argv[])
 
     Timer tp;
     std::vector<TextureSize> texszVec;
-    int npacked = Pack(chartsToPack, textureObject, texszVec);
+    int npacked = Pack(chartsToPack, textureObject, texszVec, ap);
 
     LOG_INFO << "Packed " << npacked << " charts in " << tp.TimeElapsed() << " seconds";
     if (npacked < (int) chartsToPack.size()) {
@@ -202,13 +202,13 @@ int main(int argc, char *argv[])
 
     LOG_INFO << "Rendering texture...";
 
-    std::vector<std::shared_ptr<QImage>> newTextures = RenderTexture(m, textureObject, texszVec, true, RenderMode::Linear);
+    RenderTextureAndSave(savename, m, textureObject, texszVec, true, RenderMode::Linear);
 
     double outputMP;
     {
         int64_t totArea = 0;
-        for (unsigned i = 0; i < newTextures.size(); ++i) {
-            totArea += newTextures[i]->width() * newTextures[i]->height();
+        for (const auto& sz : texszVec) {
+            totArea += (int64_t)sz.w * sz.h;
         }
         outputMP = totArea / 1000000.0;
     }

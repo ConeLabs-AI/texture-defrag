@@ -115,25 +115,6 @@ bool SaveMesh(const char *fileName, Mesh& m, const std::vector<std::shared_ptr<Q
     }
     LOG_INFO << "Saving mesh took " << t.TimeElapsed() << " seconds";
 
-    if (!textureImages.empty()) {
-        QFileInfo fi(fileName);
-        ensure (fi.exists());
-
-        QString wd = QDir::currentPath();
-        QDir::setCurrent(fi.absoluteDir().absolutePath());
-
-        t.Reset();
-        LOG_INFO << "Saving texture files... ";
-        for (std::size_t i = 0; i < textureImages.size(); ++i) {
-            if (textureImages[i]->save(m.textures[i].c_str(), "png", 66) == false) {
-                LOG_ERR << "Error saving texture file " << m.textures[i];
-                return false;
-            }
-        }
-        LOG_INFO << "Writing textures took " << t.TimeElapsed() << " seconds";
-
-        QDir::setCurrent(wd);
-    }
     return true;
 }
 

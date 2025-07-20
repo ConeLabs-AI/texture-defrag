@@ -36,6 +36,9 @@
 #include <algorithm>
 
 #include <QImage>
+#include <QFileInfo>
+#include <QDir>
+#include <QString>
 
 #include <QOpenGLContext>
 #include <QSurfaceFormat>
@@ -154,6 +157,7 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
     QDir::setCurrent(fi.absoluteDir().absolutePath());
 
     for (int i = 0; i < nTex; ++i) {
+        LOG_INFO << "Processing sheet " << (i + 1) << " of " << nTex << "...";
         std::shared_ptr<QImage> teximg = RenderTexture(facesByTexture[i], m, textureObject, filter, imode, texSizes[i].w, texSizes[i].h);
 
         std::stringstream suffix;
@@ -170,23 +174,6 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
     }
 
     QDir::setCurrent(wd);
-}
-
-std::vector<std::shared_ptr<QImage>> RenderTexture(Mesh& m, TextureObjectHandle textureObject, const std::vector<TextureSize> &texSizes,
-                                                   bool filter, RenderMode imode)
-{
-    std::vector<std::vector<Mesh::FacePointer>> facesByTexture;
-    int nTex = FacesByTextureIndex(m, facesByTexture);
-
-    ensure(nTex <= (int) texSizes.size());
-
-    std::vector<std::shared_ptr<QImage>> newTextures;
-    for (int i = 0; i < nTex; ++i) {
-        std::shared_ptr<QImage> teximg = RenderTexture(facesByTexture[i], m, textureObject, filter, imode, texSizes[i].w, texSizes[i].h);
-        newTextures.push_back(teximg);
-    }
-
-    return newTextures;
 }
 
 static std::shared_ptr<QImage> RenderTexture(std::vector<Mesh::FacePointer>& fvec,

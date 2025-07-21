@@ -331,8 +331,8 @@ ARAPSolveInfo ARAP::Solve()
 
     double e = CurrentEnergy();
 
-    // The system matrix is not symmetric
-    Eigen::BiCGSTAB<Eigen::SparseMatrix<double>> solver;
+    // The system matrix is not symmetric - using preconditioned BiCGSTAB
+    Eigen::BiCGSTAB<Eigen::SparseMatrix<double>, Eigen::IncompleteLUT<double>> solver;
 
     solver.compute(A);
 
@@ -362,6 +362,8 @@ ARAPSolveInfo ARAP::Solve()
             return si;
         }
 
+        LOG_DEBUG << "ARAP solve (u) converged in " << solver.iterations() << " iterations with error " << solver.error();
+
         Eigen::VectorXd xv_iter = solver.solve(bv);
 
         if (!(solver.info() == Eigen::Success)) {
@@ -369,6 +371,8 @@ ARAPSolveInfo ARAP::Solve()
             si.numericalError = true;
             return si;
         }
+
+        LOG_DEBUG << "ARAP solve (v) converged in " << solver.iterations() << " iterations with error " << solver.error();
 
         for (auto& f : m.face) {
             for (int i = 0; i < 3; ++i) {

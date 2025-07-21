@@ -680,7 +680,7 @@ static inline void PurgeQueue(AlgoStateHandle state)
 {
     if (state->queue.empty()) return;
     LOG_INFO << "Purging queue of size " << state->queue.size() << " (cost map size is " << state->cost.size() << ")";
-    AlgoState::QueueType newQueue;
+    decltype(state->queue) newQueue;
     for (const auto& costEntry : state->cost) {
         if (costEntry.second != Infinity()) {
             newQueue.push(std::make_pair(costEntry.first, costEntry.second));

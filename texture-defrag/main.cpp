@@ -158,6 +158,8 @@ int main(int argc, char *argv[])
     }
     zeroResamplingFraction = zeroResamplingMeshArea / graph->Area3D();
 
+    state.reset();
+
     int outputCharts = graph->Count();
     double outputUVLen = graph->BorderUV();
 

@@ -180,7 +180,7 @@ int main(int argc, char *argv[])
             emptyCharts++;
         }
         for (auto fptr : chart->fpVec) {
-            if (fptr == nullptr || !vcg::tri::Index(m, fptr)->IsFace()) {
+            if (fptr == nullptr || !fptr->IsFace()) {
                  LOG_ERR << "[VALIDATION] CRITICAL: Chart " << id << " contains an invalid face pointer!";
             }
         }
@@ -338,8 +338,8 @@ bool ParseOption(const std::string& option, const std::string& argument, Args *a
                 std::cerr << "Unrecognized option " << option << std::endl << std::endl;
                 return false;
         }
-    } catch (std::exception e) {
-        std::cerr << "Error while parsing option `" << option << " " << argument << "`" << std::endl << std::endl;;
+    } catch (const std::exception& e) {
+        std::cerr << "Error while parsing option `" << option << " " << argument << "`: " << e.what() << std::endl << std::endl;;
         return false;
     }
     return true;

@@ -109,4 +109,23 @@ void Logger::Log(const std::string& s)
         (*os) << ss.str() << std::flush;
 }
 
+void LogMemoryUsage()
+{
+#ifdef __linux__
+    std::ifstream status("/proc/self/status");
+    if (!status.is_open()) {
+        LOG_WARN << "[MEM] Could not open /proc/self/status";
+        return;
+    }
+    std::string line;
+    while (getline(status, line)) {
+        if (line.rfind("VmSize:", 0) == 0 || line.rfind("VmRSS:", 0) == 0 || line.rfind("VmHWM:", 0) == 0) {
+            LOG_INFO << "[MEM] " << line;
+        }
+    }
+#else
+    LOG_WARN << "LogMemoryUsage() not implemented for this platform.";
+#endif
+}
+
 } // namespace logging

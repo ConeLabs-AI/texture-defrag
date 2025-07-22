@@ -80,11 +80,11 @@ void TextureObject::Bind(int i)
         //glFuncs->glTexStorage2D(GL_TEXTURE_2D, miplevels, GL_RGBA8, img.width(), img.height());
         glFuncs->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, img.width(), img.height(), GL_BGRA, GL_UNSIGNED_BYTE, img.constBits());
         glFuncs->glGenerateMipmap(GL_TEXTURE_2D);
-        CheckGLError();
+        CHECK_GL_ERROR();
     }
     else {
         glFuncs->glBindTexture(GL_TEXTURE_2D, texNameVec[i]);
-        CheckGLError();
+        CHECK_GL_ERROR();
     }
 }
 

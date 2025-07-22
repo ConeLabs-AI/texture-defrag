@@ -88,14 +88,50 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         if (nc >= containerVec.size())
             containerVec.push_back(vcg::Point2i(packingSize, packingSize));
 
-        std::vector<unsigned> outlineIndex_iter;
-        std::vector<Outline2f> outlines_iter;
+        std::vector<unsigned> outlineIndex_iter_batch;
+        std::vector<Outline2f> outlines_iter_batch;
         for (unsigned i = 0; i < containerIndices.size(); ++i) {
             if (containerIndices[i] == -1) {
-                outlineIndex_iter.push_back(i);
-                outlines_iter.push_back(outlines[i]);
+                outlineIndex_iter_batch.push_back(i);
+                outlines_iter_batch.push_back(outlines[i]);
             }
         }
+
+        if (outlineIndex_iter_batch.empty())
+            break;
+
+        const float QIMAGE_MAX_DIM = 32766.0f; // QImage limit is 32767
+        std::vector<Outline2f> outlines_iter;
+        std::vector<unsigned> map_to_batch; // map from outlines_iter to outlines_iter_batch
+
+        for(size_t i = 0; i < outlines_iter_batch.size(); ++i) {
+            if (outlines_iter_batch[i].empty()) {
+                LOG_WARN << "[DIAG] Skipping empty outline for original chart index " << outlineIndex_iter_batch[i];
+                containerIndices[outlineIndex_iter_batch[i]] = -2; // Mark as skipped
+                totPacked++;
+                continue;
+            }
+
+            vcg::Box2f bbox;
+            for(const auto& p : outlines_iter_batch[i]) bbox.Add(p);
+
+            float w = bbox.DimX() * packingScale;
+            float h = bbox.DimY() * packingScale;
+
+            if (w > QIMAGE_MAX_DIM || h > QIMAGE_MAX_DIM) {
+                LOG_WARN << "[DIAG] Skipping chart with original index " << outlineIndex_iter_batch[i]
+                         << " because its scaled dimensions (" << w << "x" << h
+                         << ") exceed QImage limits. This chart will not be packed.";
+                containerIndices[outlineIndex_iter_batch[i]] = -3; // Mark as skipped due to size
+                totPacked++;
+                continue;
+            }
+            outlines_iter.push_back(outlines_iter_batch[i]);
+            map_to_batch.push_back(i);
+        }
+
+        if (outlines_iter.empty())
+            continue;
 
         // --- [DIAGNOSTIC] START: Identify Largest Chart ---
         if (!outlines_iter.empty()) {
@@ -109,7 +145,8 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
                     largest_outline_idx = i;
                 }
             }
-            LOG_INFO << "[DIAG] Largest chart in this packing batch is index " << outlineIndex_iter[largest_outline_idx]
+            size_t original_batch_idx = map_to_batch[largest_outline_idx];
+            LOG_INFO << "[DIAG] Largest chart in this packing batch is index " << outlineIndex_iter_batch[original_batch_idx]
                      << " with UV area " << max_area;
         }
         // --- [DIAGNOSTIC] END ---
@@ -151,7 +188,8 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             for (unsigned i = 0; i < outlines_iter.size(); ++i) {
                 if (polyToContainer[i] != -1) {
                     ensure(polyToContainer[i] == 0); // We only use a single container
-                    int outlineInd = outlineIndex_iter[i];
+                    int batchInd = map_to_batch[i];
+                    int outlineInd = outlineIndex_iter_batch[batchInd];
                     ensure(containerIndices[outlineInd] == -1);
                     containerIndices[outlineInd] = nc;
                     packingTransforms[outlineInd] = transforms[i];

@@ -99,7 +99,7 @@ int main(int argc, char *argv[])
     // --- [DIAGNOSTIC] START: Initial State ---
     LOG_INFO << "[DIAG] Input mesh loaded: " << m.FN() << " faces, " << m.VN() << " vertices.";
     LOG_INFO << "[DIAG] Initial memory usage:";
-    LogMemoryUsage();
+    logging::LogMemoryUsage();
     // --- [DIAGNOSTIC] END ---
 
     ensure(loadMask & tri::io::Mask::IOM_WEDGTEXCOORD);
@@ -136,7 +136,7 @@ int main(int argc, char *argv[])
 
     // --- [DIAGNOSTIC] START: Post-Optimization Validation ---
     LOG_INFO << "[DIAG] Greedy optimization finished. Memory usage BEFORE releasing state:";
-    LogMemoryUsage();
+    logging::LogMemoryUsage();
 
     int vndupOut;
 
@@ -169,7 +169,7 @@ int main(int argc, char *argv[])
     zeroResamplingFraction = zeroResamplingMeshArea / graph->Area3D();
 
     LOG_INFO << "[DIAG] AlgoState released. Memory usage AFTER releasing state:";
-    LogMemoryUsage();
+    logging::LogMemoryUsage();
 
     LOG_INFO << "[VALIDATION] Checking graph and mesh integrity post-optimization...";
     int emptyCharts = 0;
@@ -180,7 +180,7 @@ int main(int argc, char *argv[])
             emptyCharts++;
         }
         for (auto fptr : chart->fpVec) {
-            if (fptr == nullptr || !fptr->IsFace()) {
+            if (fptr == nullptr || fptr->IsD()) {
                  LOG_ERR << "[VALIDATION] CRITICAL: Chart " << id << " contains an invalid face pointer!";
             }
         }
@@ -229,7 +229,7 @@ int main(int argc, char *argv[])
 
     // --- [DIAGNOSTIC] START: Post-Packing Sanity Check ---
     LOG_INFO << "[DIAG] Packing function finished.";
-    LogMemoryUsage();
+    logging::LogMemoryUsage();
     if (npacked < (int) chartsToPack.size()) {
         LOG_ERR << "[VALIDATION] Not all charts were packed! Expected " << chartsToPack.size() << ", got " << npacked;
         // The original code exits here, which is correct. This just adds a clearer log.

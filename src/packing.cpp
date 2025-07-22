@@ -131,10 +131,10 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             polyToContainer.clear();
             LOG_INFO << "Packing into grid of size " << containerVec[nc].X() << " " << containerVec[nc].Y() << " (Attempt " << packAttempts << ")";
             LOG_INFO << "[DIAG] Memory usage BEFORE PackBestEffortAtScale:";
-            LogMemoryUsage();
+            logging::LogMemoryUsage();
             n = RasterizationBasedPacker::PackBestEffortAtScale(outlines_iter, {containerVec[nc]}, transforms, polyToContainer, packingParams, packingScale);
             LOG_INFO << "[DIAG] Packing attempt finished. Charts packed: " << n << ". Memory usage AFTER PackBestEffortAtScale:";
-            LogMemoryUsage();
+            logging::LogMemoryUsage();
             if (n == 0) {
                 containerVec[nc].X() *= 1.1;
                 containerVec[nc].Y() *= 1.1;

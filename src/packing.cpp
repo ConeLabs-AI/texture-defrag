@@ -259,7 +259,7 @@ Outline2d ExtractOutline2d(FaceGroup& chart)
     if (useChartBBAsOutline) {
         // --- [DIAGNOSTIC] START: Outline Failure Details ---
         LOG_WARN << "[DIAG] Failed to compute outline for chart " << chart.id
-                 << ". It has " << chart.FN() << " faces and " << chart.VN() << " vertices."
+                 << ". It has " << chart.FN() << " faces."
                  << " BBox Area: " << box.Area()
                  << ". Falling back to UV bounding box.";
         // --- [DIAGNOSTIC] END ---

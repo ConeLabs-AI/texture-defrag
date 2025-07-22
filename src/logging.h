@@ -102,6 +102,8 @@ public:
 
 };
 
+void LogMemoryUsage();
+
 }
 
 #endif // LOGGING_H

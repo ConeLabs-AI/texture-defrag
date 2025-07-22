@@ -307,15 +307,15 @@ static std::shared_ptr<QImage> RenderTexture(std::vector<Mesh::FacePointer>& fve
     // --- [DIAGNOSTIC] START: QImage Allocation ---
     LOG_INFO << "[DIAG] Attempting to allocate QImage for rendering. Size: " << textureWidth << "x" << textureHeight;
     LOG_INFO << "[DIAG] Memory usage BEFORE QImage allocation:";
-    LogMemoryUsage();
+    logging::LogMemoryUsage();
     std::shared_ptr<QImage> textureImage = std::make_shared<QImage>(renderedTexWidth, renderedTexHeight, QImage::Format_ARGB32);
     if (textureImage->isNull()) {
         LOG_ERR << "[DIAG] FATAL: QImage allocation FAILED. System is out of memory.";
-        LogMemoryUsage();
+        logging::LogMemoryUsage();
         std::exit(-1);
     }
     LOG_INFO << "[DIAG] QImage allocation successful. Memory usage AFTER QImage allocation:";
-    LogMemoryUsage();
+    logging::LogMemoryUsage();
     // --- [DIAGNOSTIC] END ---
 
     // disable depth and stencil test (if they were enabled) as the render target does not have the buffers attached

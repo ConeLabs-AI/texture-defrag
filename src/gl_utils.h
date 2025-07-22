@@ -35,7 +35,9 @@ OpenGLFunctionsHandle GetOpenGLFunctionsHandle();
 
 
 /* Prints the last OpenGL error code */
-void CheckGLError();
+void CheckGLError(const char* file, int line);
+// Add a macro for convenience
+#define CHECK_GL_ERROR() CheckGLError(__FILE__, __LINE__)
 
 /* Reads a shader from path into a string and returns it */
 std::string ReadShader(const char *path);

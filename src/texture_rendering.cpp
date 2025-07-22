@@ -218,6 +218,7 @@ static std::shared_ptr<QImage> RenderTexture(std::vector<Mesh::FacePointer>& fve
     }
 
     OpenGLFunctionsHandle glFuncs = GetOpenGLFunctionsHandle();
+    CHECK_GL_ERROR(); // Initial check
 
     // OpenGL setup
 
@@ -228,7 +229,7 @@ static std::shared_ptr<QImage> RenderTexture(std::vector<Mesh::FacePointer>& fve
     GLint program = CompileShaders(vs_text, fs_text);
     glFuncs->glUseProgram(program);
 
-    CheckGLError();
+    CHECK_GL_ERROR();
 
     // Allocate vertex data
 
@@ -298,11 +299,24 @@ static std::shared_ptr<QImage> RenderTexture(std::vector<Mesh::FacePointer>& fve
     glFuncs->glBindTexture(GL_TEXTURE_2D, 0);
 
     if (glFuncs->glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        LOG_ERR << "Framebuffer is not complete " << glFuncs->glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        LOG_ERR << "[OPENGL] FATAL: Framebuffer is not complete.";
+        CHECK_GL_ERROR(); // Get detailed error
         std::exit(-1);
     }
 
+    // --- [DIAGNOSTIC] START: QImage Allocation ---
+    LOG_INFO << "[DIAG] Attempting to allocate QImage for rendering. Size: " << textureWidth << "x" << textureHeight;
+    LOG_INFO << "[DIAG] Memory usage BEFORE QImage allocation:";
+    LogMemoryUsage();
     std::shared_ptr<QImage> textureImage = std::make_shared<QImage>(renderedTexWidth, renderedTexHeight, QImage::Format_ARGB32);
+    if (textureImage->isNull()) {
+        LOG_ERR << "[DIAG] FATAL: QImage allocation FAILED. System is out of memory.";
+        LogMemoryUsage();
+        std::exit(-1);
+    }
+    LOG_INFO << "[DIAG] QImage allocation successful. Memory usage AFTER QImage allocation:";
+    LogMemoryUsage();
+    // --- [DIAGNOSTIC] END ---
 
     // disable depth and stencil test (if they were enabled) as the render target does not have the buffers attached
     glFuncs->glDisable(GL_DEPTH_TEST);
@@ -366,7 +380,7 @@ static std::shared_ptr<QImage> RenderTexture(std::vector<Mesh::FacePointer>& fve
         }
 
         glFuncs->glDrawArrays(GL_TRIANGLES, baseIndex, count);
-        CheckGLError();
+        CHECK_GL_ERROR();
 
         textureObject->Release(currTexIndex);
 

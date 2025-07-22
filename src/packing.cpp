@@ -97,15 +97,44 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             }
         }
 
+        // --- [DIAGNOSTIC] START: Identify Largest Chart ---
+        if (!outlines_iter.empty()) {
+            size_t largest_outline_idx = 0;
+            double max_area = 0;
+            for(size_t i = 0; i < outlines_iter.size(); ++i) {
+                vcg::Box2f bbox;
+                for(const auto& p : outlines_iter[i]) bbox.Add(p);
+                if (bbox.Area() > max_area) {
+                    max_area = bbox.Area();
+                    largest_outline_idx = i;
+                }
+            }
+            LOG_INFO << "[DIAG] Largest chart in this packing batch is index " << outlineIndex_iter[largest_outline_idx]
+                     << " with UV area " << max_area;
+        }
+        // --- [DIAGNOSTIC] END ---
+
         const int MAX_SIZE = 20000;
         std::vector<vcg::Similarity2f> transforms;
         std::vector<int> polyToContainer;
         int n = 0;
+        int packAttempts = 0;
+        const int MAX_PACK_ATTEMPTS = 50;
         do {
+            if (++packAttempts > MAX_PACK_ATTEMPTS) {
+                LOG_ERR << "[DIAG] FATAL: Packing loop exceeded " << MAX_PACK_ATTEMPTS << " attempts. Aborting.";
+                LOG_ERR << "[DIAG] This likely indicates an un-packable chart or runaway logic.";
+                LOG_ERR << "[DIAG] Current target grid size: " << containerVec[nc].X() << "x" << containerVec[nc].Y();
+                std::exit(-1);
+            }
             transforms.clear();
             polyToContainer.clear();
-            LOG_INFO << "Packing into grid of size " << containerVec[nc].X() << " " << containerVec[nc].Y();
+            LOG_INFO << "Packing into grid of size " << containerVec[nc].X() << " " << containerVec[nc].Y() << " (Attempt " << packAttempts << ")";
+            LOG_INFO << "[DIAG] Memory usage BEFORE PackBestEffortAtScale:";
+            LogMemoryUsage();
             n = RasterizationBasedPacker::PackBestEffortAtScale(outlines_iter, {containerVec[nc]}, transforms, polyToContainer, packingParams, packingScale);
+            LOG_INFO << "[DIAG] Packing attempt finished. Charts packed: " << n << ". Memory usage AFTER PackBestEffortAtScale:";
+            LogMemoryUsage();
             if (n == 0) {
                 containerVec[nc].X() *= 1.1;
                 containerVec[nc].Y() *= 1.1;
@@ -228,7 +257,12 @@ Outline2d ExtractOutline2d(FaceGroup& chart)
     }
 
     if (useChartBBAsOutline) {
-        LOG_WARN << "Failed to compute outline, falling back to uv bounding box for chart " << chart.id;
+        // --- [DIAGNOSTIC] START: Outline Failure Details ---
+        LOG_WARN << "[DIAG] Failed to compute outline for chart " << chart.id
+                 << ". It has " << chart.FN() << " faces and " << chart.VN() << " vertices."
+                 << " BBox Area: " << box.Area()
+                 << ". Falling back to UV bounding box.";
+        // --- [DIAGNOSTIC] END ---
         outline.clear();
         outline.push_back(Point2d(box.min.X(), box.min.Y()));
         outline.push_back(Point2d(box.max.X(), box.min.Y()));

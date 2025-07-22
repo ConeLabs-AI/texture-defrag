@@ -31,6 +31,8 @@
 
 #include <QOpenGLContext>
 
+using OpenGLFunctionsHandle = OpenGLFunctionsVersion*;
+
 OpenGLFunctionsHandle GetOpenGLFunctionsHandle()
 {
     QOpenGLContext *currentContext = QOpenGLContext::currentContext();
@@ -46,19 +48,26 @@ OpenGLFunctionsHandle GetOpenGLFunctionsHandle()
     return glFuncs;
 }
 
-void CheckGLError()
-{
+void CheckGLError(const char* file, int line) {
     OpenGLFunctionsHandle glFuncs = GetOpenGLFunctionsHandle();
-    GLenum error = glFuncs->glGetError();
-    if (error != GL_NO_ERROR)
-    {
-        std::stringstream ss;
-        ss << "OpenGL error " << error  << " ";
-        if (error == GL_INVALID_VALUE) ss << "GL_INVALID_VALUE";
-        if (error == GL_INVALID_OPERATION) ss << "GL_INVALID_OPERATION";
-        LOG_ERR << ss.str();
+    GLenum err;
+    bool errorFound = false;
+    while ((err = glFuncs->glGetError()) != GL_NO_ERROR) {
+        errorFound = true;
+        const char* errorStr = "";
+        switch (err) {
+            case GL_INVALID_ENUM: errorStr = "INVALID_ENUM"; break;
+            case GL_INVALID_VALUE: errorStr = "INVALID_VALUE"; break;
+            case GL_INVALID_OPERATION: errorStr = "INVALID_OPERATION"; break;
+            case GL_OUT_OF_MEMORY: errorStr = "OUT_OF_MEMORY"; break;
+            case GL_INVALID_FRAMEBUFFER_OPERATION: errorStr = "INVALID_FRAMEBUFFER_OPERATION"; break;
+            default: errorStr = "UNKNOWN_ERROR"; break;
+        }
+        LOG_ERR << "[OPENGL] Error " << errorStr << " at " << file << ":" << line;
     }
 }
+
+#define CHECK_GL_ERROR() CheckGLError(__FILE__, __LINE__)
 
 std::string ReadShader(const char *path)
 {
@@ -127,7 +136,7 @@ uint32_t CompileShaders(const char **vs_text, const char **fs_text)
     glFuncs->glDeleteShader(vs);
     glFuncs->glDeleteShader(fs);
 
-    CheckGLError();
+    CHECK_GL_ERROR();
 
     return program;
 }

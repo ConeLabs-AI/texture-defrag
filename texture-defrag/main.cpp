@@ -96,6 +96,12 @@ int main(int argc, char *argv[])
         std::exit(-1);
     }
 
+    // --- [DIAGNOSTIC] START: Initial State ---
+    LOG_INFO << "[DIAG] Input mesh loaded: " << m.FN() << " faces, " << m.VN() << " vertices.";
+    LOG_INFO << "[DIAG] Initial memory usage:";
+    LogMemoryUsage();
+    // --- [DIAGNOSTIC] END ---
+
     ensure(loadMask & tri::io::Mask::IOM_WEDGTEXCOORD);
     tri::UpdateTopology<Mesh>::FaceFace(m);
 
@@ -128,6 +134,10 @@ int main(int argc, char *argv[])
 
     GreedyOptimization(graph, state, ap);
 
+    // --- [DIAGNOSTIC] START: Post-Optimization Validation ---
+    LOG_INFO << "[DIAG] Greedy optimization finished. Memory usage BEFORE releasing state:";
+    LogMemoryUsage();
+
     int vndupOut;
 
     std::string savename = args.outfile;
@@ -157,6 +167,33 @@ int main(int argc, char *argv[])
         }
     }
     zeroResamplingFraction = zeroResamplingMeshArea / graph->Area3D();
+
+    LOG_INFO << "[DIAG] AlgoState released. Memory usage AFTER releasing state:";
+    LogMemoryUsage();
+
+    LOG_INFO << "[VALIDATION] Checking graph and mesh integrity post-optimization...";
+    int emptyCharts = 0;
+    for (auto const& [id, chart] : graph->charts) {
+        if (chart == nullptr) {
+            LOG_ERR << "[VALIDATION] CRITICAL: Found null chart handle in graph!";
+        } else if (chart->fpVec.empty()) {
+            emptyCharts++;
+        }
+        for (auto fptr : chart->fpVec) {
+            if (fptr == nullptr || !vcg::tri::Index(m, fptr)->IsFace()) {
+                 LOG_ERR << "[VALIDATION] CRITICAL: Chart " << id << " contains an invalid face pointer!";
+            }
+        }
+    }
+    if(emptyCharts > 0) LOG_WARN << "[VALIDATION] Found " << emptyCharts << " charts with zero faces.";
+
+    int nonManifoldVerts = vcg::tri::Clean<Mesh>::CountNonManifoldVertexFF(m);
+    if (nonManifoldVerts > 0) {
+        LOG_WARN << "[VALIDATION] Mesh has " << nonManifoldVerts << " non-manifold vertices after optimization.";
+    } else {
+        LOG_INFO << "[VALIDATION] Mesh is manifold. Integrity check passed.";
+    }
+    // --- [DIAGNOSTIC] END ---
 
     state.reset();
 
@@ -189,6 +226,24 @@ int main(int argc, char *argv[])
     int npacked = Pack(chartsToPack, textureObject, texszVec, ap);
 
     LOG_INFO << "Packed " << npacked << " charts in " << tp.TimeElapsed() << " seconds";
+
+    // --- [DIAGNOSTIC] START: Post-Packing Sanity Check ---
+    LOG_INFO << "[DIAG] Packing function finished.";
+    LogMemoryUsage();
+    if (npacked < (int) chartsToPack.size()) {
+        LOG_ERR << "[VALIDATION] Not all charts were packed! Expected " << chartsToPack.size() << ", got " << npacked;
+        // The original code exits here, which is correct. This just adds a clearer log.
+        std::exit(-1);
+    }
+
+    int64_t totalNewTexturePixels = 0;
+    for (const auto& sz : texszVec) {
+        totalNewTexturePixels += (int64_t)sz.w * sz.h;
+    }
+    double totalNewTextureMB = (totalNewTexturePixels * 4.0) / (1024.0 * 1024.0);
+    LOG_INFO << "[DIAG] Total texture memory to be allocated by rendering: " << totalNewTextureMB << " MB";
+    // --- [DIAGNOSTIC] END ---
+
     if (npacked < (int) chartsToPack.size()) {
         LOG_ERR << "Not all charts were packed (" << chartsToPack.size() << " charts, " << npacked << " packed)";
         std::exit(-1);

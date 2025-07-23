@@ -48,7 +48,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         outlines.push_back(outline);
     }
 
-    int packingSize = 4096;
+    int packingSize = 16384;
     std::vector<std::pair<double,double>> trs = textureObject->ComputeRelativeSizes();
 
     std::vector<Point2i> containerVec;

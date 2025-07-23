@@ -65,7 +65,16 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         textureArea += textureObject->TextureWidth(i) * textureObject->TextureHeight(i);
     }
     double targetTextureArea = textureArea * params.resolutionScaling * params.resolutionScaling;
-    double packingScale = std::sqrt(packingArea / targetTextureArea);
+    double packingScale = (targetTextureArea > 0) ? std::sqrt(packingArea / targetTextureArea) : 1.0;
+
+    if (!std::isfinite(packingScale) || packingScale <= 0) {
+        LOG_WARN << "[DIAG] Invalid packingScale computed: " << packingScale
+                 << ". Resetting to 1.0. (packingArea=" << packingArea << ", targetTextureArea=" << targetTextureArea << ")";
+        packingScale = 1.0;
+    }
+
+    LOG_INFO << "[DIAG] Packing scale factor: " << packingScale
+             << " (packingArea=" << packingArea << ", targetTextureArea=" << targetTextureArea << ")";
 
     RasterizationBasedPacker::Parameters packingParams;
     packingParams.costFunction = RasterizationBasedPacker::Parameters::LowestHorizon;
@@ -115,13 +124,29 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             vcg::Box2f bbox;
             for(const auto& p : outlines_iter_batch[i]) bbox.Add(p);
 
+            if (!std::isfinite(bbox.DimX()) || !std::isfinite(bbox.DimY()) || bbox.DimX() < 0 || bbox.DimY() < 0) {
+                LOG_WARN << "[DIAG] Skipping chart with original index " << outlineIndex_iter_batch[i]
+                         << " due to invalid/non-finite UV bounding box. This chart will not be packed.";
+                containerIndices[outlineIndex_iter_batch[i]] = -4; // Mark as skipped due to invalid bbox
+                totPacked++;
+                continue;
+            }
+
             float w = bbox.DimX() * packingScale;
             float h = bbox.DimY() * packingScale;
+            float diagonal = std::sqrt(w * w + h * h);
 
-            if (w > QIMAGE_MAX_DIM || h > QIMAGE_MAX_DIM) {
+            if (w > 2000.0f || h > 2000.0f) {
+                LOG_INFO << "[DIAG] Potentially large rasterization for chart " << outlineIndex_iter_batch[i]
+                         << ". Scaled dims: " << w << "x" << h
+                         << " (original UV bbox: " << bbox.DimX() << "x" << bbox.DimY() << ", area: " << bbox.Area() << ")"
+                         << ", diagonal: " << diagonal;
+            }
+
+            if (diagonal > QIMAGE_MAX_DIM) {
                 LOG_WARN << "[DIAG] Skipping chart with original index " << outlineIndex_iter_batch[i]
-                         << " because its scaled dimensions (" << w << "x" << h
-                         << ") exceed QImage limits. This chart will not be packed.";
+                         << " because its scaled diagonal (" << diagonal
+                         << ") exceeds QImage limits. This chart will not be packed.";
                 containerIndices[outlineIndex_iter_batch[i]] = -3; // Mark as skipped due to size
                 totPacked++;
                 continue;
@@ -166,13 +191,14 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             }
             transforms.clear();
             polyToContainer.clear();
-            LOG_INFO << "Packing into grid of size " << containerVec[nc].X() << " " << containerVec[nc].Y() << " (Attempt " << packAttempts << ")";
+            LOG_INFO << "Packing " << outlines_iter.size() << " charts into grid of size " << containerVec[nc].X() << " " << containerVec[nc].Y() << " (Attempt " << packAttempts << ")";
             LOG_INFO << "[DIAG] Memory usage BEFORE PackBestEffortAtScale:";
             logging::LogMemoryUsage();
             n = RasterizationBasedPacker::PackBestEffortAtScale(outlines_iter, {containerVec[nc]}, transforms, polyToContainer, packingParams, packingScale);
             LOG_INFO << "[DIAG] Packing attempt finished. Charts packed: " << n << ". Memory usage AFTER PackBestEffortAtScale:";
             logging::LogMemoryUsage();
             if (n == 0) {
+                LOG_WARN << "[DIAG] Failed to pack any of the " << outlines_iter.size() << " charts in this batch.";
                 containerVec[nc].X() *= 1.1;
                 containerVec[nc].Y() *= 1.1;
             }

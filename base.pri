@@ -2,6 +2,7 @@ VCGPATH = $$PWD/vcglib
 
 CONFIG += console
 CONFIG += c++11
+CONFIG += release
 CONFIG -= app_bundle
 
 #### QT STUFF ##################################################################

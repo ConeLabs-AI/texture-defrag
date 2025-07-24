@@ -15,6 +15,19 @@ INCLUDEPATH += $$PWD/src $$VCGPATH $$VCGPATH/eigenlib
 
 #### PLATFORM SPECIFIC #########################################################
 
+unix|mingw-g++ {
+    # For GCC and Clang on Unix-like systems (including MinGW-g++)
+    QMAKE_CXXFLAGS += -fopenmp
+    QMAKE_LDFLAGS += -fopenmp
+}
+
+win32-msvc* {
+    # For Microsoft Visual C++ compiler on Windows
+    QMAKE_CXXFLAGS += /openmp
+    # MSVC does not typically require a separate linker flag for OpenMP
+}
+
+
 unix {
   LIBS += -lGLU
 }

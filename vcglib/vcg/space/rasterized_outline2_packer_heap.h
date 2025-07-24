@@ -26,6 +26,7 @@
 
 #include <vcg/space/rect_packer.h>
 #include <vcg/complex/algorithms/outline_support.h>
+#include <omp.h>
 
 namespace vcg
 {
@@ -218,6 +219,15 @@ class RasterizedOutline2Packer
     typedef typename vcg::Similarity2<SCALAR_TYPE> Similarity2x;
 
     static constexpr int INVALID_POSITION = -1;
+
+    struct PlacementResult {
+        int cost = INT_MAX;
+        int rastIndex = -1;
+        int polyX = -1;
+        int polyY = -1;
+        int container = -1;
+        bool placedUsingSecondaryHorizon = false;
+    };
 
 public:
 
@@ -983,126 +993,130 @@ public:
             packingFields.push_back(one);
         }
 
-        // **** First Step: Rasterize all the polygons ****
-        for (size_t i = 0; i < polyVec.size(); i++) {
+
+        // **** Main Loop: Iterate sequentially over polys, but find best position in parallel ****
+        for (size_t currPoly = 0; currPoly < polyVec.size(); currPoly++) {
+
+            int i = perm[currPoly];
+
+            // +++ Step 1: Just-In-Time Rasterization (Memory Safe) +++
+            // Rasterize the multiple rotations for *only the current chart* in parallel.
             polyVec[i].resetState(packingPar.rotationNum);
+            #pragma omp parallel for schedule(dynamic)
             for (int rast_i = 0; rast_i < packingPar.rotationNum/4; rast_i++) {
                 //create the rasterization (i.e. fills bottom/top/grids/internalWastedCells arrays)
                 RASTERIZER_TYPE::rasterize(polyVec[i], scaleFactor, rast_i, packingPar.rotationNum, packingPar.gutterWidth);
             }
-        }
 
-        // **** Second Step: iterate on the polys, and try to find the best position ****
-        for (size_t currPoly = 0; currPoly < polyVec.size(); currPoly++) {
+            // +++ Step 2: Parallel Placement Search +++
+            PlacementResult bestOverallResult;
 
-            int i = perm[currPoly];
-            int bestRastIndex = -1;
-            int bestCost = INT_MAX;
-            int bestPolyX = -1;
-            int bestPolyY = -1;
-            int bestContainer = -1; //the container where the poly fits best
+            #pragma omp parallel
+            {
+                PlacementResult bestThreadResult; // Each thread has its own local best result
 
-            bool placedUsingSecondaryHorizon = false;
+                // Parallelize the search over all rotations. Use a dynamic schedule for better
+                // load balancing, as work per rotation can be highly variable.
+                #pragma omp for schedule(dynamic, 1)
+                for (int rast_i = 0; rast_i < packingPar.rotationNum; rast_i++) {
 
-            //try all the rasterizations and choose the best fitting one
-            for (int rast_i = 0; rast_i < packingPar.rotationNum; rast_i++) {
+                    //try to fit the poly in all containers, in all valid positions
+                    for (int grid_i = 0; grid_i < containerNum; grid_i++) {
+                        int maxCol = gridSizes[grid_i].X() - polyVec[i].gridWidth(rast_i);
+                        int maxRow = gridSizes[grid_i].Y() - polyVec[i].gridHeight(rast_i);
 
-                int bestCostRast = INT_MAX;
-
-                //try to fit the poly in all containers, in all valid positions
-                for (int grid_i = 0; grid_i < containerNum; grid_i++) {
-                    int maxCol = gridSizes[grid_i].X() - polyVec[i].gridWidth(rast_i);
-                    int maxRow = gridSizes[grid_i].Y() - polyVec[i].gridHeight(rast_i);
-
-                    //look for the best position, dropping from top
-                    for (int col = 0; col < maxCol; col++) {
-                        int currPolyY;
-                        if (!placedUsingSecondaryHorizon) {
+                        //look for the best position, dropping from top
+                        for (int col = 0; col < maxCol; col++) {
+                            int currPolyY;
+                            // Check primary horizon
                             currPolyY = packingFields[grid_i].dropY(polyVec[i],col, rast_i);
                             if (currPolyY != INVALID_POSITION) {
-                                assert(currPolyY + polyVec[i].gridHeight(rast_i) < gridSizes[grid_i].Y() && "drop");
                                 int currCost = packingFields[grid_i].getCostY(polyVec[i], Point2i(col, currPolyY), rast_i);
                                 if (packingPar.doubleHorizon && (packingPar.minmax == true))
                                     currCost += packingFields[grid_i].getCostX(polyVec[i], Point2i(col, currPolyY), rast_i);
-                                if (currCost < bestCost) {
-                                    bestContainer = grid_i;
-                                    bestCost = currCost;
-                                    bestRastIndex = rast_i;
-                                    bestPolyX = col;
-                                    bestPolyY = currPolyY;
-                                    placedUsingSecondaryHorizon = false;
+                                if (currCost < bestThreadResult.cost) {
+                                    bestThreadResult.container = grid_i;
+                                    bestThreadResult.cost = currCost;
+                                    bestThreadResult.rastIndex = rast_i;
+                                    bestThreadResult.polyX = col;
+                                    bestThreadResult.polyY = currPolyY;
+                                    bestThreadResult.placedUsingSecondaryHorizon = false;
                                 }
-                                if (currCost < bestCostRast)
-                                    bestCostRast = currCost;
+                            }
+                            // Check inner horizon
+                            if (packingPar.innerHorizon) {
+                                currPolyY = packingFields[grid_i].dropYInner(polyVec[i],col, rast_i);
+                                if (currPolyY != INVALID_POSITION) {
+                                    int currCost = packingFields[grid_i].getCostY(polyVec[i], Point2i(col, currPolyY), rast_i);
+                                    if (packingPar.doubleHorizon && (packingPar.minmax == true))
+                                        currCost += packingFields[grid_i].getCostX(polyVec[i], Point2i(col, currPolyY), rast_i);
+                                    if (currCost < bestThreadResult.cost) {
+                                        bestThreadResult.container = grid_i;
+                                        bestThreadResult.cost = currCost;
+                                        bestThreadResult.rastIndex = rast_i;
+                                        bestThreadResult.polyX = col;
+                                        bestThreadResult.polyY = currPolyY;
+                                        bestThreadResult.placedUsingSecondaryHorizon = true;
+                                    }
+                                }
                             }
                         }
-                        if (packingPar.innerHorizon) {
-                            currPolyY = packingFields[grid_i].dropYInner(polyVec[i],col, rast_i);
-                            if (currPolyY != INVALID_POSITION) {
-                                assert(currPolyY + polyVec[i].gridHeight(rast_i) < gridSizes[grid_i].Y() && "drop_inner");
-                                int currCost = packingFields[grid_i].getCostY(polyVec[i], Point2i(col, currPolyY), rast_i);
-                                if (packingPar.doubleHorizon && (packingPar.minmax == true))
-                                    currCost += packingFields[grid_i].getCostX(polyVec[i], Point2i(col, currPolyY), rast_i);
-                                if (currCost < bestCost) {
-                                    bestContainer = grid_i;
-                                    bestCost = currCost;
-                                    bestRastIndex = rast_i;
-                                    bestPolyX = col;
-                                    bestPolyY = currPolyY;
-                                    placedUsingSecondaryHorizon = true;
-                                }
-                                if (currCost < bestCostRast)
-                                    bestCostRast = currCost;
-                            }
-                        }
-                    }
 
-                    if (!packingPar.doubleHorizon)
-                        continue;
-
-                    for (int row = 0; row < maxRow; row++) {
-                        int currPolyX;
-                        if (!placedUsingSecondaryHorizon) {
+                        if (!packingPar.doubleHorizon)
+                            continue;
+                        
+                        //look for the best position, dropping from left
+                        for (int row = 0; row < maxRow; row++) {
+                            int currPolyX;
+                            // Check primary horizon
                             currPolyX = packingFields[grid_i].dropX(polyVec[i],row, rast_i);
                             if (currPolyX != INVALID_POSITION) {
-                                assert(currPolyX + polyVec[i].gridWidth(rast_i) < gridSizes[grid_i].X() && "drop");
                                 int currCost = packingFields[grid_i].getCostX(polyVec[i], Point2i(currPolyX, row), rast_i);
                                 if (packingPar.doubleHorizon && (packingPar.minmax == true))
                                     currCost += packingFields[grid_i].getCostY(polyVec[i], Point2i(currPolyX, row), rast_i);
-                                if (currCost < bestCost) {
-                                    bestContainer = grid_i;
-                                    bestCost = currCost;
-                                    bestRastIndex = rast_i;
-                                    bestPolyX = currPolyX;
-                                    bestPolyY = row;
-                                    placedUsingSecondaryHorizon = false;
+                                if (currCost < bestThreadResult.cost) {
+                                    bestThreadResult.container = grid_i;
+                                    bestThreadResult.cost = currCost;
+                                    bestThreadResult.rastIndex = rast_i;
+                                    bestThreadResult.polyX = currPolyX;
+                                    bestThreadResult.polyY = row;
+                                    bestThreadResult.placedUsingSecondaryHorizon = false;
                                 }
                             }
-                        }
-                        if (packingPar.innerHorizon) {
-                            currPolyX = packingFields[grid_i].dropXInner(polyVec[i],row, rast_i);
-                            if (currPolyX != INVALID_POSITION) {
-                                assert(currPolyX + polyVec[i].gridWidth(rast_i) < gridSizes[grid_i].X() && "drop_inner");
-                                int currCost = packingFields[grid_i].getCostX(polyVec[i], Point2i(currPolyX, row), rast_i);
-                                if (packingPar.doubleHorizon && (packingPar.minmax == true))
-                                    currCost += packingFields[grid_i].getCostY(polyVec[i], Point2i(currPolyX, row), rast_i);
-                                if (currCost < bestCost) {
-                                    bestContainer = grid_i;
-                                    bestCost = currCost;
-                                    bestRastIndex = rast_i;
-                                    bestPolyX = currPolyX;
-                                    bestPolyY = row;
-                                    placedUsingSecondaryHorizon = true;
+                            // Check inner horizon
+                            if (packingPar.innerHorizon) {
+                                currPolyX = packingFields[grid_i].dropXInner(polyVec[i],row, rast_i);
+                                if (currPolyX != INVALID_POSITION) {
+                                    int currCost = packingFields[grid_i].getCostX(polyVec[i], Point2i(currPolyX, row), rast_i);
+                                    if (packingPar.doubleHorizon && (packingPar.minmax == true))
+                                        currCost += packingFields[grid_i].getCostY(polyVec[i], Point2i(currPolyX, row), rast_i);
+                                    if (currCost < bestThreadResult.cost) {
+                                        bestThreadResult.container = grid_i;
+                                        bestThreadResult.cost = currCost;
+                                        bestThreadResult.rastIndex = rast_i;
+                                        bestThreadResult.polyX = currPolyX;
+                                        bestThreadResult.polyY = row;
+                                        bestThreadResult.placedUsingSecondaryHorizon = true;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            }
+                } // end of parallel for loop over rotations
 
-            //if we couldn't find a valid position for the poly return false, as we couldn't pack with the current scaleFactor
-            if (bestRastIndex == -1) {
-//                printf("Items didn't fit using %f as scaleFactor\n", scaleFactor);
+                // Reduce Step: Each thread compares its local best against the shared global best.
+                // The critical section ensures this comparison and update is thread-safe.
+                #pragma omp critical
+                {
+                    if (bestThreadResult.cost < bestOverallResult.cost) {
+                        bestOverallResult = bestThreadResult;
+                    }
+                }
+            } // end of parallel block
+
+
+            // +++ Step 3: Sequential State Update +++
+            if (bestOverallResult.rastIndex == -1) {
                 if (bestEffort) {
                     polyToContainer[i] = -1;
                     trVec[i] = {};
@@ -1110,35 +1124,30 @@ public:
                     return false;
                 }
             } else {
-                //we found the best position for a given poly,
-                //let's place it, so that the horizons are updated accordingly
-                packingFields[bestContainer].placePoly(polyVec[i], Point2i(bestPolyX, bestPolyY), bestRastIndex);
+                // Place the polygon, which updates the horizons in the 'packingFields' object.
+                packingFields[bestOverallResult.container].placePoly(polyVec[i], Point2i(bestOverallResult.polyX, bestOverallResult.polyY), bestOverallResult.rastIndex);
 
-                //create the rotated bb which we will use to set the similarity translation prop
-                float angleRad = float(bestRastIndex)*(M_PI*2.0)/float(packingPar.rotationNum);
+                // Create the final similarity transform for this chart.
+                float angleRad = float(bestOverallResult.rastIndex)*(M_PI*2.0)/float(packingPar.rotationNum);
                 Box2f bb;
                 std::vector<Point2f> points = polyVec[i].getPoints();
-                for(size_t i=0;i<points.size();++i) {
-                    Point2f pp=points[i];
+                for(size_t p_idx=0; p_idx<points.size(); ++p_idx) {
+                    Point2f pp=points[p_idx];
                     pp.Rotate(angleRad);
                     bb.Add(pp);
                 }
 
-                //associate the poly to the container where it fitted best
-                polyToContainer[i] = bestContainer;
+                polyToContainer[i] = bestOverallResult.container;
 
-                //now we have bestPolyX/bestRastIndex
-                //we have to update the similarities vector accordingly!
-                float polyXInImgCoords = bestPolyX;
+                float polyXInImgCoords = bestOverallResult.polyX;
                 float scaledBBWidth = bb.DimX()*scaleFactor;
-                float polyWidthInImgCoords = polyVec[i].gridWidth(bestRastIndex);
+                float polyWidthInImgCoords = polyVec[i].gridWidth(bestOverallResult.rastIndex);
                 float offsetX = (polyWidthInImgCoords - ceil(scaledBBWidth))/2.0;
                 float scaledBBMinX = bb.min.X()*scaleFactor;
 
-                //note: bestPolyY is 0 if the poly is at the bottom of the grid
-                float imgHeight = containerSizes[bestContainer].Y();
-                float polyYInImgCoords = bestPolyY;
-                float polyHeightInImgCoords = polyVec[i].gridHeight(bestRastIndex);
+                float imgHeight = containerSizes[bestOverallResult.container].Y();
+                float polyYInImgCoords = bestOverallResult.polyY;
+                float polyHeightInImgCoords = polyVec[i].gridHeight(bestOverallResult.rastIndex);
                 float topPolyYInImgCoords = polyYInImgCoords + polyHeightInImgCoords;
                 float scaledBBHeight = bb.DimY()*scaleFactor;
                 float offsetY = (polyHeightInImgCoords - ceil(scaledBBHeight))/2.0;

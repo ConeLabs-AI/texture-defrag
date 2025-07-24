@@ -27,7 +27,7 @@
 #include "mesh_attribute.h"
 
 #include <vcg/complex/algorithms/outline_support.h>
-#include <vcg/space/rasterized_outline2_packer.h>
+#include <vcg/space/rasterized_outline2_packer_heap.h>
 #include <wrap/qt/outline2_rasterizer.h>
 //#include <wrap/qt/Outline2ToQImage.h>
 
@@ -79,7 +79,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     RasterizationBasedPacker::Parameters packingParams;
     packingParams.costFunction = RasterizationBasedPacker::Parameters::LowestHorizon;
     packingParams.doubleHorizon = false;
-    packingParams.innerHorizon = true;
+    packingParams.innerHorizon = false;
     //packingParams.permutations = false;
     packingParams.permutations = (charts.size() < 50);
     packingParams.rotationNum = 4;

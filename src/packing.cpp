@@ -28,7 +28,8 @@
 
 #include <vcg/complex/algorithms/outline_support.h>
 #include <vcg/space/rasterized_outline2_packer.h>
-#include <wrap/qt/outline2_rasterizer.h>
+#include <wrap/gl/opengl_outline2_rasterizer.h>
+// #include <wrap/qt/outline2_rasterizer.h>
 //#include <wrap/qt/Outline2ToQImage.h>
 
 typedef vcg::RasterizedOutline2Packer<float, QtOutline2Rasterizer> RasterizationBasedPacker;

@@ -96,11 +96,7 @@ int main(int argc, char *argv[])
         std::exit(-1);
     }
 
-    // --- [DIAGNOSTIC] START: Initial State ---
     LOG_INFO << "[DIAG] Input mesh loaded: " << m.FN() << " faces, " << m.VN() << " vertices.";
-    LOG_INFO << "[DIAG] Initial memory usage:";
-    logging::LogMemoryUsage();
-    // --- [DIAGNOSTIC] END ---
 
     ensure(loadMask & tri::io::Mask::IOM_WEDGTEXCOORD);
     tri::UpdateTopology<Mesh>::FaceFace(m);
@@ -133,11 +129,6 @@ int main(int argc, char *argv[])
     AlgoStateHandle state = InitializeState(graph, ap);
 
     GreedyOptimization(graph, state, ap);
-
-    // --- [DIAGNOSTIC] START: Post-Optimization Validation ---
-    LOG_INFO << "[DIAG] Greedy optimization finished. Memory usage BEFORE releasing state:";
-    logging::LogMemoryUsage();
-
     int vndupOut;
 
     std::string savename = args.outfile;
@@ -168,9 +159,6 @@ int main(int argc, char *argv[])
     }
     zeroResamplingFraction = zeroResamplingMeshArea / graph->Area3D();
 
-    LOG_INFO << "[DIAG] AlgoState released. Memory usage AFTER releasing state:";
-    logging::LogMemoryUsage();
-
     LOG_INFO << "[VALIDATION] Checking graph and mesh integrity post-optimization...";
     int emptyCharts = 0;
     for (auto const& [id, chart] : graph->charts) {
@@ -193,7 +181,6 @@ int main(int argc, char *argv[])
     } else {
         LOG_INFO << "[VALIDATION] Mesh is manifold. Integrity check passed.";
     }
-    // --- [DIAGNOSTIC] END ---
 
     state.reset();
 
@@ -227,9 +214,7 @@ int main(int argc, char *argv[])
 
     LOG_INFO << "Packed " << npacked << " charts in " << tp.TimeElapsed() << " seconds";
 
-    // --- [DIAGNOSTIC] START: Post-Packing Sanity Check ---
     LOG_INFO << "[DIAG] Packing function finished.";
-    logging::LogMemoryUsage();
     if (npacked < (int) chartsToPack.size()) {
         LOG_ERR << "[VALIDATION] Not all charts were packed! Expected " << chartsToPack.size() << ", got " << npacked;
         // The original code exits here, which is correct. This just adds a clearer log.
@@ -242,7 +227,6 @@ int main(int argc, char *argv[])
     }
     double totalNewTextureMB = (totalNewTexturePixels * 4.0) / (1024.0 * 1024.0);
     LOG_INFO << "[DIAG] Total texture memory to be allocated by rendering: " << totalNewTextureMB << " MB";
-    // --- [DIAGNOSTIC] END ---
 
     if (npacked < (int) chartsToPack.size()) {
         LOG_ERR << "Not all charts were packed (" << chartsToPack.size() << " charts, " << npacked << " packed)";

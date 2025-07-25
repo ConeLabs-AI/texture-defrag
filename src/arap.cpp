@@ -28,6 +28,7 @@
 #include <Eigen/IterativeLinearSolvers>
 #include <iomanip>
 #include <unordered_set>
+#include <omp.h>
 
 
 ARAP::ARAP(Mesh& mesh)
@@ -99,10 +100,12 @@ void ARAP::SetMaxIterations(int n)
 static std::vector<ARAP::Cot> ComputeCotangentVector(Mesh& m)
 {
     std::vector<ARAP::Cot> cotan;
-    cotan.reserve(m.FN());
+    cotan.resize(m.FN());
     auto tsa = GetTargetShapeAttribute(m);
     double eps = std::numeric_limits<double>::epsilon();
-    for (auto& f : m.face) {
+    #pragma omp parallel for
+    for (int fi = 0; fi < m.FN(); ++fi) {
+        auto& f = m.face[fi];
         ARAP::Cot c;
         for (int i = 0; i < 3; ++i) {
             int j = (i+1)%3;
@@ -110,12 +113,12 @@ static std::vector<ARAP::Cot> ComputeCotangentVector(Mesh& m)
             double alpha_i = std::max(VecAngle(tsa[f].P[j] - tsa[f].P[i], tsa[f].P[k] - tsa[f].P[i]), eps);
             c.v[i] = 0.5 * std::tan(M_PI_2 - alpha_i);
         }
-        cotan.push_back(c);
+        cotan[fi] = c;
     }
     return cotan;
 }
 
-void ARAP::ComputeSystemMatrix(Mesh& m, const std::vector<Cot>& cotan, Eigen::SparseMatrix<double>& L)
+void ARAP::ComputeSystemMatrix(Mesh& m, const std::vector<Cot>& cotan, Eigen::SparseMatrix<double, Eigen::RowMajor>& L)
 {
     using Td = Eigen::Triplet<double>;
 
@@ -123,35 +126,44 @@ void ARAP::ComputeSystemMatrix(Mesh& m, const std::vector<Cot>& cotan, Eigen::Sp
     L.setZero();
     std::vector<Td> tri;
     auto Idx = [&m](const Mesh::VertexPointer vp) { return (int) tri::Index(m, vp); };
-    for (auto &f : m.face) {
-        int fi = tri::Index(m, f);
-        for (int i = 0; i < 3; ++i) {
-            if (std::find(fixed_i.begin(), fixed_i.end(), (int) tri::Index(m, f.V(i))) == fixed_i.end()) {
-                Mesh::VertexPointer vi = f.V0(i);
-                int j = (i+1)%3;
-                Mesh::VertexPointer vj = f.V1(i);
-                int k = (i+2)%3;
-                Mesh::VertexPointer vk = f.V2(i);
 
-                ensure(Idx(vi) >= 0); ensure(Idx(vi) < m.VN());
-                ensure(Idx(vj) >= 0); ensure(Idx(vj) < m.VN());
-                ensure(Idx(vk) >= 0); ensure(Idx(vk) < m.VN());
+    #pragma omp parallel
+    {
+        std::vector<Td> tri_private;
+        #pragma omp for nowait
+        for (int fi = 0; fi < m.FN(); ++fi) {
+            auto &f = m.face[fi];
+            for (int i = 0; i < 3; ++i) {
+                if (std::find(fixed_i.begin(), fixed_i.end(), (int) tri::Index(m, f.V(i))) == fixed_i.end()) {
+                    Mesh::VertexPointer vi = f.V0(i);
+                    int j = (i+1)%3;
+                    Mesh::VertexPointer vj = f.V1(i);
+                    int k = (i+2)%3;
+                    Mesh::VertexPointer vk = f.V2(i);
 
-                double weight_ij = cotan[fi].v[k];
-                double weight_ik = cotan[fi].v[j];
+                    ensure(Idx(vi) >= 0); ensure(Idx(vi) < m.VN());
+                    ensure(Idx(vj) >= 0); ensure(Idx(vj) < m.VN());
+                    ensure(Idx(vk) >= 0); ensure(Idx(vk) < m.VN());
 
-                if (!std::isfinite(weight_ij))
-                    weight_ij = 1e-8;
+                    double weight_ij = cotan[fi].v[k];
+                    double weight_ik = cotan[fi].v[j];
 
-                if (!std::isfinite(weight_ik))
-                    weight_ik = 1e-8;
+                    if (!std::isfinite(weight_ij))
+                        weight_ij = 1e-8;
 
-                tri.push_back(Td(Idx(vi), Idx(vj), -weight_ij));
-                tri.push_back(Td(Idx(vi), Idx(vk), -weight_ik));
-                tri.push_back(Td(Idx(vi), Idx(vi), (weight_ij + weight_ik)));
+                    if (!std::isfinite(weight_ik))
+                        weight_ik = 1e-8;
+
+                    tri_private.push_back(Td(Idx(vi), Idx(vj), -weight_ij));
+                    tri_private.push_back(Td(Idx(vi), Idx(vk), -weight_ik));
+                    tri_private.push_back(Td(Idx(vi), Idx(vi), (weight_ij + weight_ik)));
+                }
             }
         }
+        #pragma omp critical
+        tri.insert(tri.end(), tri_private.begin(), tri_private.end());
     }
+
     for (auto vi : fixed_i) {
         tri.push_back(Td(vi, vi, 1));
     }
@@ -163,8 +175,10 @@ static std::vector<Eigen::Matrix2d> ComputeRotations(Mesh& m)
 {
     auto tsa = GetTargetShapeAttribute(m);
     std::vector<Eigen::Matrix2d> rotations;
-    rotations.reserve(m.FN());
-    for (auto& f : m.face) {
+    rotations.resize(m.FN());
+    #pragma omp parallel for
+    for (int fi = 0; fi < m.FN(); ++fi) {
+        auto& f = m.face[fi];
         vcg::Point2d x10, x20;
         LocalIsometry(tsa[f].P[1] - tsa[f].P[0], tsa[f].P[2] - tsa[f].P[0], x10, x20);
         Eigen::Matrix2d Jf = ComputeTransformationMatrix(x10, x20, f.WT(1).P() - f.WT(0).P(), f.WT(2).P() - f.WT(0).P());
@@ -179,7 +193,7 @@ static std::vector<Eigen::Matrix2d> ComputeRotations(Mesh& m)
             R = U * V.transpose();
         }
 
-        rotations.push_back(R);
+        rotations[fi] = R;
     }
 
     return rotations;
@@ -188,44 +202,59 @@ static std::vector<Eigen::Matrix2d> ComputeRotations(Mesh& m)
 void ARAP::ComputeRHS(Mesh& m, const std::vector<Eigen::Matrix2d>& rotations, const std::vector<Cot>& cotan, Eigen::VectorXd& bu, Eigen::VectorXd& bv)
 {
     auto Idx = [&m](const Mesh::VertexPointer vp) { return (int) tri::Index(m, vp); };
-    bu = Eigen::VectorXd::Constant(m.VN(), 0);
-    bv = Eigen::VectorXd::Constant(m.VN(), 0);
+    bu.setZero();
+    bv.setZero();
     auto tsa = GetTargetShapeAttribute(m);
-    for (auto &f : m.face) {
-        int fi = tri::Index(m, f);
-        const Eigen::Matrix2d& Rf = rotations[fi];
 
-        Eigen::Vector2d t[3];
+    #pragma omp parallel
+    {
+        Eigen::VectorXd bu_private = Eigen::VectorXd::Zero(m.VN());
+        Eigen::VectorXd bv_private = Eigen::VectorXd::Zero(m.VN());
+        #pragma omp for nowait
+        for (int fi = 0; fi < m.FN(); ++fi) {
+            auto &f = m.face[fi];
+            const Eigen::Matrix2d& Rf = rotations[fi];
 
-        // TODO this should be computed once and stored in the object state
-        Eigen::Vector2d x_10, x_20;
-        LocalIsometry(tsa[f].P[1] - tsa[f].P[0], tsa[f].P[2] - tsa[f].P[0], x_10, x_20);
-        t[0] = Eigen::Vector2d::Zero();
-        t[1] = t[0] + x_10;
-        t[2] = t[0] + x_20;
+            Eigen::Vector2d t[3];
 
-        for (int i = 0; i < 3; ++i) {
-            Mesh::VertexPointer vi = f.V0(i);
-            int j = (i+1)%3;
-            int k = (i+2)%3;
+            // TODO this should be computed once and stored in the object state
+            Eigen::Vector2d x_10, x_20;
+            LocalIsometry(tsa[f].P[1] - tsa[f].P[0], tsa[f].P[2] - tsa[f].P[0], x_10, x_20);
+            t[0] = Eigen::Vector2d::Zero();
+            t[1] = t[0] + x_10;
+            t[2] = t[0] + x_20;
 
-            double weight_ij = cotan[fi].v[k];
-            double weight_ik = cotan[fi].v[j];
+            for (int i = 0; i < 3; ++i) {
+                Mesh::VertexPointer vi = f.V0(i);
+                int j = (i+1)%3;
+                int k = (i+2)%3;
 
-            if (!std::isfinite(weight_ij))
-                weight_ij = 1e-8;
+                double weight_ij = cotan[fi].v[k];
+                double weight_ik = cotan[fi].v[j];
 
-            if (!std::isfinite(weight_ik))
-                weight_ik = 1e-8;
+                if (!std::isfinite(weight_ij))
+                    weight_ij = 1e-8;
 
-            Eigen::Vector2d x_ij = t[i] - t[j];
-            Eigen::Vector2d x_ik = t[i] - t[k];
+                if (!std::isfinite(weight_ik))
+                    weight_ik = 1e-8;
 
-            Eigen::Vector2d rhs = (weight_ij * Rf) * x_ij + (weight_ik * Rf) * x_ik;
-            bu(Idx(vi)) += rhs.x();
-            bv(Idx(vi)) += rhs.y();
+                Eigen::Vector2d x_ij = t[i] - t[j];
+                Eigen::Vector2d x_ik = t[i] - t[k];
+
+                Eigen::Vector2d rhs = (weight_ij * Rf) * x_ij + (weight_ik * Rf) * x_ik;
+                #pragma omp atomic
+                bu_private(Idx(vi)) += rhs.x();
+                #pragma omp atomic
+                bv_private(Idx(vi)) += rhs.y();
+            }
+        }
+        #pragma omp critical
+        {
+            bu += bu_private;
+            bv += bv_private;
         }
     }
+
     for (unsigned i = 0; i < fixed_i.size(); ++i) {
         bu(fixed_i[i]) = fixed_pos[i].X();
         bv(fixed_i[i]) = fixed_pos[i].Y();
@@ -251,7 +280,9 @@ double ARAP::ComputeEnergyFromStoredWedgeTC(const std::vector<Mesh::FacePointer>
     double n = 0;
     double d = 0;
     auto tsa = GetWedgeTexCoordStorageAttribute(m);
-    for (auto fptr : fpVec) {
+    #pragma omp parallel for reduction(+:n, d)
+    for (std::size_t i = 0; i < fpVec.size(); ++i) {
+        auto fptr = fpVec[i];
         vcg::Point2d x10 = tsa[fptr].tc[1].P() - tsa[fptr].tc[0].P();
         vcg::Point2d x20 = tsa[fptr].tc[2].P() - tsa[fptr].tc[0].P();
         vcg::Point2d u10 = fptr->WT(1).P() - fptr->WT(0).P();
@@ -275,7 +306,9 @@ double ARAP::ComputeEnergyFromStoredWedgeTC(Mesh& m, double *num, double *denom)
     double e = 0;
     double total_area = 0;
     auto tsa = GetWedgeTexCoordStorageAttribute(m);
-    for (auto& f : m.face) {
+    #pragma omp parallel for reduction(+:e, total_area)
+    for (int fi = 0; fi < m.FN(); ++fi) {
+        auto& f = m.face[fi];
         vcg::Point2d x10 = tsa[f].tc[1].P() - tsa[f].tc[0].P();
         vcg::Point2d x20 = tsa[f].tc[2].P() - tsa[f].tc[0].P();
         double area_f = std::abs(x10 ^ x20);
@@ -302,7 +335,9 @@ double ARAP::CurrentEnergy()
     double e = 0;
     double total_area = 0;
     auto tsa = GetTargetShapeAttribute(m);
-    for (auto& f : m.face) {
+    #pragma omp parallel for reduction(+:e, total_area)
+    for (int fi = 0; fi < m.FN(); ++fi) {
+        auto& f = m.face[fi];
         vcg::Point2d x10, x20;
         LocalIsometry(tsa[f].P[1] - tsa[f].P[0], tsa[f].P[2] - tsa[f].P[0], x10, x20);
         Eigen::Matrix2d Jf = ComputeTransformationMatrix(x10, x20, f.WT(1).P() - f.WT(0).P(), f.WT(2).P() - f.WT(0).P());
@@ -323,7 +358,7 @@ ARAPSolveInfo ARAP::Solve()
     ARAPSolveInfo si = {0, 0, 0, false};
     std::vector<Cot> cotan = ComputeCotangentVector(m);
 
-    Eigen::SparseMatrix<double> A;
+    Eigen::SparseMatrix<double, Eigen::RowMajor> A;
     ComputeSystemMatrix(m, cotan, A);
 
     Eigen::VectorXd xu = Eigen::VectorXd::Constant(m.VN(), 0);
@@ -332,7 +367,7 @@ ARAPSolveInfo ARAP::Solve()
     double e = CurrentEnergy();
 
     // The system matrix is not symmetric - using preconditioned BiCGSTAB
-    Eigen::BiCGSTAB<Eigen::SparseMatrix<double>, Eigen::IncompleteLUT<double>> solver;
+    Eigen::BiCGSTAB<Eigen::SparseMatrix<double, Eigen::RowMajor>, Eigen::IncompleteLUT<double>> solver;
 
     solver.compute(A);
 
@@ -374,12 +409,17 @@ ARAPSolveInfo ARAP::Solve()
 
         LOG_DEBUG << "ARAP solve (v) converged in " << solver.iterations() << " iterations with error " << solver.error();
 
-        for (auto& f : m.face) {
+        #pragma omp parallel for
+        for (int vi = 0; vi < m.VN(); ++vi) {
+            m.vert[vi].T().P().X() = xu_iter(vi);
+            m.vert[vi].T().P().Y() = xv_iter(vi);
+        }
+
+        #pragma omp parallel for
+        for (int fi = 0; fi < m.FN(); ++fi) {
+            auto& f = m.face[fi];
             for (int i = 0; i < 3; ++i) {
-                int vi = tri::Index(m, f.V(i));
-                f.WT(i).U() = xu_iter(vi);
-                f.WT(i).V() = xv_iter(vi);
-                f.V(i)->T().P() = f.WT(i).P();
+                f.WT(i).P() = f.V(i)->T().P();
             }
         }
 

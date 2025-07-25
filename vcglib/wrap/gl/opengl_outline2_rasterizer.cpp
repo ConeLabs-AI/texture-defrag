@@ -182,11 +182,11 @@ void OpenGLOutline2Rasterizer::rasterize(RasterizedOutline2 &poly, float scaleFa
     if (F_tri.rows() == 0) return;
 
     Matrix44f scale, rot, trans, offset, proj;
-    scale.SetScaling(Point3f(scaleFactor, scaleFactor, 1.f));
-    rot.SetRotation(rotRad, Point3f(0,0,1));
-    trans.SetTranslation(Point3f(-bb.min.X(), -bb.min.Y(), 0));
-    offset.SetTranslation(Point3f(gutter_pixels, gutter_pixels, 0));
-    proj.SetOrthographic(0, sizeX, 0, sizeY, -1, 1);
+    scale.SetScale(Point3f(scaleFactor, scaleFactor, 1.f));
+    rot.SetRotate(rotRad, Point3f(0,0,1));
+    trans.SetTranslate(Point3f(-bb.min.X(), -bb.min.Y(), 0));
+    offset.SetTranslate(Point3f(gutter_pixels, gutter_pixels, 0));
+    proj.SetOrtho(0, sizeX, 0, sizeY, -1, 1);
     Matrix44f mvp = proj * offset * scale * trans * rot;
     
     // Setup OpenGL objects

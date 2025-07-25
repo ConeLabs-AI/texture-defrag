@@ -181,11 +181,12 @@ void OpenGLOutline2Rasterizer::rasterize(RasterizedOutline2 &poly, float scaleFa
     TriangulatePolygon(original_points, V_tri_uv, F_tri);
     if (F_tri.rows() == 0) return;
 
-    Matrix44f scale = Matrix44f::createScaling(Point3f(scaleFactor, scaleFactor, 1.f));
-    Matrix44f rot = Matrix44f::createRotation(rotRad, Point3f(0,0,1));
-    Matrix44f trans = Matrix44f::createTranslation(Point3f(-bb.min.X(), -bb.min.Y(), 0));
-    Matrix44f offset = Matrix44f::createTranslation(Point3f(gutter_pixels, gutter_pixels, 0));
-    Matrix44f proj = Matrix44f::createOrthographic(0, sizeX, 0, sizeY, -1, 1);
+    Matrix44f scale, rot, trans, offset, proj;
+    scale.SetScaling(Point3f(scaleFactor, scaleFactor, 1.f));
+    rot.SetRotation(rotRad, Point3f(0,0,1));
+    trans.SetTranslation(Point3f(-bb.min.X(), -bb.min.Y(), 0));
+    offset.SetTranslation(Point3f(gutter_pixels, gutter_pixels, 0));
+    proj.SetOrthographic(0, sizeX, 0, sizeY, -1, 1);
     Matrix44f mvp = proj * offset * scale * trans * rot;
     
     // Setup OpenGL objects

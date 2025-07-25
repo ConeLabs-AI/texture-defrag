@@ -66,6 +66,7 @@ private:
 
 public:
     RasterizedOutline2() { }
+    bool hasGrid(int i) const { return gh.at(i) > 0; }
     int gridHeight(int i) { return gh.at(i); }
     int gridWidth( int i) { return gw.at(i); }
 

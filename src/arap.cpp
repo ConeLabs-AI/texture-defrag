@@ -242,9 +242,7 @@ void ARAP::ComputeRHS(Mesh& m, const std::vector<Eigen::Matrix2d>& rotations, co
                 Eigen::Vector2d x_ik = t[i] - t[k];
 
                 Eigen::Vector2d rhs = (weight_ij * Rf) * x_ij + (weight_ik * Rf) * x_ik;
-                #pragma omp atomic
                 bu_private(Idx(vi)) += rhs.x();
-                #pragma omp atomic
                 bv_private(Idx(vi)) += rhs.y();
             }
         }

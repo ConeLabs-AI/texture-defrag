@@ -32,7 +32,7 @@
 // #include <wrap/qt/outline2_rasterizer.h>
 //#include <wrap/qt/Outline2ToQImage.h>
 
-typedef vcg::RasterizedOutline2Packer<float, QtOutline2Rasterizer> RasterizationBasedPacker;
+typedef vcg::RasterizedOutline2Packer<float, OpenGLOutline2Rasterizer> RasterizationBasedPacker;
 
 
 int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObject, std::vector<TextureSize>& texszVec, const struct AlgoParameters& params)

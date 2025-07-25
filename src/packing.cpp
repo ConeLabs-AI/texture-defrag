@@ -27,7 +27,7 @@
 #include "mesh_attribute.h"
 
 #include <vcg/complex/algorithms/outline_support.h>
-#include <vcg/space/rasterized_outline2_packer_heap.h>
+#include <vcg/space/rasterized_outline2_packer.h>
 #include <wrap/qt/outline2_rasterizer.h>
 //#include <wrap/qt/Outline2ToQImage.h>
 

@@ -6,7 +6,6 @@
 #include <vcg/math/matrix44.h>
 
 #include <Eigen/Core>
-#include <igl/triangle/triangulate.h>
 
 #include <QOpenGLContext>
 #include <QSurfaceFormat>
@@ -36,24 +35,98 @@ static const char *fs_text[] = {
     "}\n"
 };
 
-// Triangulates a simple polygon (without holes).
+// Triangulates a simple polygon (without holes) using the ear-clipping algorithm.
 static void TriangulatePolygon(const std::vector<Point2f>& points, Eigen::MatrixXf& V, Eigen::MatrixXi& F)
 {
-    if (points.size() < 3) return;
+    size_t num_points = points.size();
+    if (num_points < 3) return;
 
-    Eigen::MatrixXf P(points.size(), 2);
-    Eigen::MatrixXi E(points.size(), 2);
-    for(size_t i = 0; i < points.size(); ++i) {
-        P(i, 0) = points[i].X();
-        P(i, 1) = points[i].Y();
-        E(i, 0) = i;
-        E(i, 1) = (i + 1) % points.size();
+    V.resize(num_points, 2);
+    for(size_t i = 0; i < num_points; ++i) {
+        V(i, 0) = points[i].X();
+        V(i, 1) = points[i].Y();
     }
 
-    Eigen::MatrixXf H; // No holes
-    // 'p' enforces polygon boundaries, 'Y' prohibits Steiner points on the boundary.
-    std::string flags = "pYq";
-    igl::triangle::triangulate(P, E, H, flags, V, F);
+    std::vector<int> indices;
+    indices.reserve(num_points);
+    for(size_t i = 0; i < num_points; ++i) {
+        indices.push_back(i);
+    }
+
+    std::vector<int> result_indices;
+    result_indices.reserve((num_points - 2) * 3);
+
+    auto cross_product_z = [](const Point2f& p1, const Point2f& p2, const Point2f& p3) {
+        return (p2.X() - p1.X()) * (p3.Y() - p1.Y()) - (p2.Y() - p1.Y()) * (p3.X() - p1.X());
+    };
+
+    auto is_inside_triangle = [&](const Point2f& p, const Point2f& a, const Point2f& b, const Point2f& c) {
+        return cross_product_z(a, b, p) >= 0 &&
+               cross_product_z(b, c, p) >= 0 &&
+               cross_product_z(c, a, p) >= 0;
+    };
+
+    int n = num_points;
+    int current_vertex_idx = 0;
+    int pass_counter = 0;
+    while (n > 2) {
+        if (pass_counter++ > n) {
+             LOG_WARN << "Triangulation failed, could not find an ear in a full pass. Polygon may be self-intersecting or degenerate.";
+             F.resize(0, 3);
+             return;
+        }
+
+        int prev_idx_in_list = (current_vertex_idx + n - 1) % n;
+        int next_idx_in_list = (current_vertex_idx + 1) % n;
+
+        int p_prev_i = indices[prev_idx_in_list];
+        int p_curr_i = indices[current_vertex_idx];
+        int p_next_i = indices[next_idx_in_list];
+
+        const Point2f& p_prev = points[p_prev_i];
+        const Point2f& p_curr = points[p_curr_i];
+        const Point2f& p_next = points[p_next_i];
+
+        bool is_ear = true;
+        if (cross_product_z(p_prev, p_curr, p_next) < 1e-9) {
+            is_ear = false;
+        } else {
+            for (int i = 0; i < n; ++i) {
+                int vertex_to_check_i = indices[i];
+                if (vertex_to_check_i == p_prev_i || vertex_to_check_i == p_curr_i || vertex_to_check_i == p_next_i) continue;
+                if (is_inside_triangle(points[vertex_to_check_i], p_prev, p_curr, p_next)) {
+                    is_ear = false;
+                    break;
+                }
+            }
+        }
+
+        if (is_ear) {
+            result_indices.push_back(p_prev_i);
+            result_indices.push_back(p_curr_i);
+            result_indices.push_back(p_next_i);
+
+            indices.erase(indices.begin() + current_vertex_idx);
+            n--;
+            pass_counter = 0;
+            if (current_vertex_idx >= n && n > 0) current_vertex_idx = 0;
+        } else {
+            current_vertex_idx = (current_vertex_idx + 1);
+            if (current_vertex_idx >= n) current_vertex_idx = 0;
+        }
+    }
+
+    if (result_indices.empty() && num_points >= 3) {
+        F.resize(0,3);
+        return;
+    }
+
+    F.resize(result_indices.size() / 3, 3);
+    for (size_t i = 0; i < result_indices.size() / 3; ++i) {
+        F(i, 0) = result_indices[i * 3 + 0];
+        F(i, 1) = result_indices[i * 3 + 1];
+        F(i, 2) = result_indices[i * 3 + 2];
+    }
 }
 
 void OpenGLOutline2Rasterizer::rasterize(RasterizedOutline2 &poly, float scaleFactor, int rast_i, int rotationNum, int gutterWidth)

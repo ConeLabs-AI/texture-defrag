@@ -244,7 +244,7 @@ static std::shared_ptr<QImage> RenderTexture(std::vector<Mesh::FacePointer>& fve
     }
 
     glFuncs->glBindBuffer(GL_ARRAY_BUFFER, vertexbuf);
-    glFuncs->glBufferData(GL_ARRAY_BUFFER, m.FN()*15*sizeof(float), NULL, GL_STATIC_DRAW);
+    glFuncs->glBufferData(GL_ARRAY_BUFFER, fvec.size()*15*sizeof(float), NULL, GL_STATIC_DRAW);
     float *p = (float *) glFuncs->glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY);
     for (auto fptr : fvec) {
         int ti = WTCSh[fptr].tc[0].N();

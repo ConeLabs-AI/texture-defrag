@@ -22,7 +22,7 @@ SOURCES += \
     $$VCGPATH/wrap/openfbx/src/ofbx.cpp \
     $$VCGPATH/wrap/openfbx/src/miniz.c \
     $$VCGPATH/wrap/ply/plylib.cpp \
-    $$VCGPATH/wrap/qt/outline2_rasterizer.cpp \
+    $$VCGPATH/wrap/gl/opengl_outline2_rasterizer.cpp
 
 HEADERS += \
     ../src/intersection.h \

@@ -183,6 +183,8 @@ public:
     Matrix44 &SetRotateDeg(T AngleDeg, const Point3<T> & axis);
     Matrix44 &SetRotateRad(T AngleRad, const Point3<T> & axis);
 
+    Matrix44 &Orthographic(T left, T right, T bottom, T top, T zNear, T zFar);
+
     T Determinant() const;
 
     template <class Q> void Import(const Matrix44<Q> &m) {
@@ -496,6 +498,18 @@ template <class T> Matrix44<T> &Matrix44<T>::SetRotateRad(T AngleRad, const Poin
     ElementAt(3,1) = 0;
     ElementAt(3,2) = 0;
     ElementAt(3,3) = 1;
+    return *this;
+}
+
+template <class T> Matrix44<T> &Matrix44<T>::Orthographic(T left, T right, T bottom, T top, T zNear, T zFar) {
+    SetZero();
+    ElementAt(0,0) = T(2) / (right-left);
+    ElementAt(1,1) = T(2) / (top-bottom);
+    ElementAt(2,2) = - T(2) / (zFar-zNear);
+    ElementAt(0,3) = - (right+left) / (right-left);
+    ElementAt(1,3) = - (top+bottom) / (top-bottom);
+    ElementAt(2,3) = - (zFar+zNear) / (zFar-zFar);
+    ElementAt(3,3) = T(1);
     return *this;
 }
 

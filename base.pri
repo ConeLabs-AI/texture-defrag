@@ -12,7 +12,10 @@ QT = core gui svg
 
 ##### INCLUDE PATH #############################################################
 
-INCLUDEPATH += $$PWD/src $$VCGPATH $$VCGPATH/eigenlib $$VCGPATH/libigl/include $$VCGPATH/libigl/external/triangle
+INCLUDEPATH += $$PWD/src $$VCGPATH $$VCGPATH/eigenlib $$VCGPATH/libigl/include $$VCGPATH/wrap/triangle
+
+# libigl's triangle wrapper needs these
+DEFINES += TRILIBRARY NO_TIMER
 
 #### PLATFORM SPECIFIC #########################################################
 

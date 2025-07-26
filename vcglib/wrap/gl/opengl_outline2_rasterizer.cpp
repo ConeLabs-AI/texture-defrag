@@ -6,7 +6,7 @@
 #include <vcg/math/matrix44.h>
 
 #include <Eigen/Core>
-#include <igl/triangle/triangulate.h>
+#include <wrap/earcut/earcut.hpp>
 
 #include <QOpenGLContext>
 #include <QSurfaceFormat>
@@ -15,6 +15,19 @@
 
 #include <vector>
 #include <cmath>
+
+namespace mapbox {
+namespace util {
+template <>
+struct nth<0, vcg::Point2f> {
+    inline static float get(const vcg::Point2f &p) { return p.X(); };
+};
+template <>
+struct nth<1, vcg::Point2f> {
+    inline static float get(const vcg::Point2f &p) { return p.Y(); };
+};
+} // namespace util
+} // namespace mapbox
 
 using namespace vcg;
 
@@ -40,31 +53,30 @@ static bool TriangulatePolygon(const std::vector<Point2f>& points, Eigen::Matrix
 {
     if (points.size() < 3) return false;
 
-    Eigen::MatrixXd V_in(points.size(), 2);
-    Eigen::MatrixXi E_in(points.size(), 2);
-    for(size_t i = 0; i < points.size(); ++i) {
-        V_in(i, 0) = points[i].X();
-        V_in(i, 1) = points[i].Y();
-        E_in(i, 0) = i;
-        E_in(i, 1) = (i + 1) % points.size();
-    }
+    std::vector<std::vector<Point2f>> polygon;
+    polygon.push_back(points);
 
-    Eigen::MatrixXd V_igl;
-    Eigen::MatrixXi F_igl;
-    Eigen::MatrixXd H; // No holes
+    using N = uint32_t;
+    std::vector<N> indices = mapbox::earcut<N>(polygon);
 
-    // 'p' enforces polygon boundaries. 'Y' prohibits Steiner points on the boundary.
-    // Using "-q30" for quality might be too slow, "-Q" for quiet is enough.
-    std::string flags = "pYQ";
-    igl::triangle::triangulate(V_in, E_in, H, flags, V_igl, F_igl);
-
-    if (F_igl.rows() == 0) {
+    if (indices.empty() && !points.empty()) {
         LOG_WARN << "Triangulation resulted in 0 faces. The polygon may be degenerate.";
         return false;
     }
 
-    V_out = V_igl.cast<float>();
-    F_out = F_igl;
+    size_t n_triangles = indices.size() / 3;
+    F_out.resize(n_triangles, 3);
+    for (size_t i = 0; i < n_triangles; ++i) {
+        F_out(i, 0) = indices[i * 3 + 0];
+        F_out(i, 1) = indices[i * 3 + 1];
+        F_out(i, 2) = indices[i * 3 + 2];
+    }
+
+    V_out.resize(points.size(), 2);
+    for (size_t i = 0; i < points.size(); ++i) {
+        V_out(i, 0) = points[i].X();
+        V_out(i, 1) = points[i].Y();
+    }
 
     return true;
 }

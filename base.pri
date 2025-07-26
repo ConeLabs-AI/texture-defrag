@@ -12,7 +12,7 @@ QT = core gui svg
 
 ##### INCLUDE PATH #############################################################
 
-INCLUDEPATH += $$PWD/src $$VCGPATH $$VCGPATH/eigenlib
+INCLUDEPATH += $$PWD/src $$VCGPATH $$VCGPATH/eigenlib $$VCGPATH/libigl/include
 
 #### PLATFORM SPECIFIC #########################################################
 

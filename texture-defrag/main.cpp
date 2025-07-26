@@ -41,6 +41,7 @@
 #include <vector>
 #include <iostream>
 #include <fstream>
+#include <map>
 
 #include <QApplication>
 #include <QImage>
@@ -90,11 +91,13 @@ int main(int argc, char *argv[])
     int loadMask;
 
     Timer t;
+    std::map<std::string, double> timings;
 
     if (LoadMesh(args.infile.c_str(), m, textureObject, loadMask) == false) {
         LOG_ERR << "Failed to open mesh";
         std::exit(-1);
     }
+    timings["Load mesh"] = t.TimeSinceLastCheck();
 
     LOG_INFO << "[DIAG] Input mesh loaded: " << m.FN() << " faces, " << m.VN() << " vertices.";
 
@@ -113,6 +116,7 @@ int main(int argc, char *argv[])
     ComputeWedgeTexCoordStorageAttribute(m);
 
     GraphHandle graph = ComputeGraph(m, textureObject);
+    timings["Mesh preparation & Graph computation"] = t.TimeSinceLastCheck();
 
     std::map<RegionID, bool> flipped;
     for (auto& c : graph->charts)
@@ -129,6 +133,7 @@ int main(int argc, char *argv[])
     AlgoStateHandle state = InitializeState(graph, ap);
 
     GreedyOptimization(graph, state, ap);
+    timings["Greedy optimization"] = t.TimeSinceLastCheck();
     int vndupOut;
 
     std::string savename = args.outfile;
@@ -138,6 +143,7 @@ int main(int argc, char *argv[])
         savename.append(".obj");
 
     Finalize(graph, savename, &vndupOut);
+    timings["Finalize"] = t.TimeSinceLastCheck();
 
     double zeroResamplingFraction = 0;
 
@@ -157,6 +163,7 @@ int main(int argc, char *argv[])
             zeroResamplingMeshArea += zeroResamplingChartArea;
         }
     }
+    timings["Chart rotation"] = t.TimeSinceLastCheck();
     zeroResamplingFraction = zeroResamplingMeshArea / graph->Area3D();
 
     LOG_INFO << "[VALIDATION] Checking graph and mesh integrity post-optimization...";
@@ -208,11 +215,11 @@ int main(int argc, char *argv[])
 
     LOG_INFO << "Packing atlas of size " << chartsToPack.size();
 
-    Timer tp;
     std::vector<TextureSize> texszVec;
     int npacked = Pack(chartsToPack, textureObject, texszVec, ap);
+    timings["Packing"] = t.TimeSinceLastCheck();
 
-    LOG_INFO << "Packed " << npacked << " charts in " << tp.TimeElapsed() << " seconds";
+    LOG_INFO << "Packed " << npacked << " charts in " << timings["Packing"] << " seconds";
 
     LOG_INFO << "[DIAG] Packing function finished.";
     if (npacked < (int) chartsToPack.size()) {
@@ -236,14 +243,17 @@ int main(int argc, char *argv[])
     LOG_INFO << "Trimming texture...";
 
     TrimTexture(m, texszVec, false);
+    timings["Texture trimming"] = t.TimeSinceLastCheck();
 
     LOG_INFO << "Shifting charts...";
 
     IntegerShift(m, chartsToPack, texszVec, anchorMap, flipped);
+    timings["Chart shifting"] = t.TimeSinceLastCheck();
 
     LOG_INFO << "Rendering texture...";
 
     RenderTextureAndSave(savename, m, textureObject, texszVec, true, RenderMode::Linear);
+    timings["Texture rendering"] = t.TimeSinceLastCheck();
 
     double outputMP;
     {
@@ -270,7 +280,12 @@ int main(int argc, char *argv[])
 
     if (SaveMesh(savename.c_str(), m, {}, true) == false)
         LOG_ERR << "Model not saved correctly";
+    timings["Saving mesh"] = t.TimeSinceLastCheck();
 
+    LOG_INFO << "--- Timings ---";
+    for (const auto& timing : timings) {
+        LOG_INFO << timing.first << ": " << timing.second << "s";
+    }
     LOG_INFO << "Processing took " << t.TimeElapsed() << " seconds";
 
     return 0;

@@ -1,0 +1,3 @@
+[submodule "vcglib/libigl"]
+	path = vcglib/libigl
+	url = https://github.com/libigl/libigl.git

@@ -137,13 +137,6 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             float h = bbox.DimY() * packingScale;
             float diagonal = std::sqrt(w * w + h * h);
 
-            if (w > 2000.0f || h > 2000.0f) {
-                LOG_INFO << "[DIAG] Potentially large rasterization for chart " << outlineIndex_iter_batch[i]
-                         << ". Scaled dims: " << w << "x" << h
-                         << " (original UV bbox: " << bbox.DimX() << "x" << bbox.DimY() << ", area: " << bbox.Area() << ")"
-                         << ", diagonal: " << diagonal;
-            }
-
             if (diagonal > QIMAGE_MAX_DIM) {
                 LOG_WARN << "[DIAG] Skipping chart with original index " << outlineIndex_iter_batch[i]
                          << " because its scaled diagonal (" << diagonal
@@ -159,7 +152,6 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         if (outlines_iter.empty())
             continue;
 
-        // --- [DIAGNOSTIC] START: Identify Largest Chart ---
         if (!outlines_iter.empty()) {
             size_t largest_outline_idx = 0;
             double max_area = 0;
@@ -175,8 +167,6 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             LOG_INFO << "[DIAG] Largest chart in this packing batch is index " << outlineIndex_iter_batch[original_batch_idx]
                      << " with UV area " << max_area;
         }
-        // --- [DIAGNOSTIC] END ---
-
         const int MAX_SIZE = 20000;
         std::vector<vcg::Similarity2f> transforms;
         std::vector<int> polyToContainer;
@@ -193,11 +183,8 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             transforms.clear();
             polyToContainer.clear();
             LOG_INFO << "Packing " << outlines_iter.size() << " charts into grid of size " << containerVec[nc].X() << " " << containerVec[nc].Y() << " (Attempt " << packAttempts << ")";
-            LOG_INFO << "[DIAG] Memory usage BEFORE PackBestEffortAtScale:";
-            logging::LogMemoryUsage();
             n = RasterizationBasedPacker::PackBestEffortAtScale(outlines_iter, {containerVec[nc]}, transforms, polyToContainer, packingParams, packingScale);
-            LOG_INFO << "[DIAG] Packing attempt finished. Charts packed: " << n << ". Memory usage AFTER PackBestEffortAtScale:";
-            logging::LogMemoryUsage();
+            LOG_INFO << "[DIAG] Packing attempt finished. Charts packed: " << n << ".";
             if (n == 0) {
                 LOG_WARN << "[DIAG] Failed to pack any of the " << outlines_iter.size() << " charts in this batch.";
                 containerVec[nc].X() *= 1.1;

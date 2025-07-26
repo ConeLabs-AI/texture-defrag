@@ -6,6 +6,7 @@
 #include <vcg/math/matrix44.h>
 
 #include <Eigen/Core>
+#include <igl/triangle/triangulate.h>
 
 #include <QOpenGLContext>
 #include <QSurfaceFormat>
@@ -35,98 +36,37 @@ static const char *fs_text[] = {
     "}\n"
 };
 
-// Triangulates a simple polygon (without holes) using the ear-clipping algorithm.
-static void TriangulatePolygon(const std::vector<Point2f>& points, Eigen::MatrixXf& V, Eigen::MatrixXi& F)
+static bool TriangulatePolygon(const std::vector<Point2f>& points, Eigen::MatrixXf& V_out, Eigen::MatrixXi& F_out)
 {
-    size_t num_points = points.size();
-    if (num_points < 3) return;
+    if (points.size() < 3) return false;
 
-    V.resize(num_points, 2);
-    for(size_t i = 0; i < num_points; ++i) {
-        V(i, 0) = points[i].X();
-        V(i, 1) = points[i].Y();
+    Eigen::MatrixXd V_in(points.size(), 2);
+    Eigen::MatrixXi E_in(points.size(), 2);
+    for(size_t i = 0; i < points.size(); ++i) {
+        V_in(i, 0) = points[i].X();
+        V_in(i, 1) = points[i].Y();
+        E_in(i, 0) = i;
+        E_in(i, 1) = (i + 1) % points.size();
     }
 
-    std::vector<int> indices;
-    indices.reserve(num_points);
-    for(size_t i = 0; i < num_points; ++i) {
-        indices.push_back(i);
+    Eigen::MatrixXd V_igl;
+    Eigen::MatrixXi F_igl;
+    Eigen::MatrixXd H; // No holes
+
+    // 'p' enforces polygon boundaries. 'Y' prohibits Steiner points on the boundary.
+    // Using "-q30" for quality might be too slow, "-Q" for quiet is enough.
+    std::string flags = "pYQ";
+    igl::triangle::triangulate(V_in, E_in, H, flags, V_igl, F_igl);
+
+    if (F_igl.rows() == 0) {
+        LOG_WARN << "Triangulation resulted in 0 faces. The polygon may be degenerate.";
+        return false;
     }
 
-    std::vector<int> result_indices;
-    result_indices.reserve((num_points - 2) * 3);
+    V_out = V_igl.cast<float>();
+    F_out = F_igl;
 
-    auto cross_product_z = [](const Point2f& p1, const Point2f& p2, const Point2f& p3) {
-        return (p2.X() - p1.X()) * (p3.Y() - p1.Y()) - (p2.Y() - p1.Y()) * (p3.X() - p1.X());
-    };
-
-    auto is_inside_triangle = [&](const Point2f& p, const Point2f& a, const Point2f& b, const Point2f& c) {
-        return cross_product_z(a, b, p) >= 0 &&
-               cross_product_z(b, c, p) >= 0 &&
-               cross_product_z(c, a, p) >= 0;
-    };
-
-    int n = num_points;
-    int current_vertex_idx = 0;
-    int pass_counter = 0;
-    while (n > 2) {
-        if (pass_counter++ > n) {
-             LOG_WARN << "Triangulation failed, could not find an ear in a full pass. Polygon may be self-intersecting or degenerate.";
-             F.resize(0, 3);
-             return;
-        }
-
-        int prev_idx_in_list = (current_vertex_idx + n - 1) % n;
-        int next_idx_in_list = (current_vertex_idx + 1) % n;
-
-        int p_prev_i = indices[prev_idx_in_list];
-        int p_curr_i = indices[current_vertex_idx];
-        int p_next_i = indices[next_idx_in_list];
-
-        const Point2f& p_prev = points[p_prev_i];
-        const Point2f& p_curr = points[p_curr_i];
-        const Point2f& p_next = points[p_next_i];
-
-        bool is_ear = true;
-        if (cross_product_z(p_prev, p_curr, p_next) < 1e-9) {
-            is_ear = false;
-        } else {
-            for (int i = 0; i < n; ++i) {
-                int vertex_to_check_i = indices[i];
-                if (vertex_to_check_i == p_prev_i || vertex_to_check_i == p_curr_i || vertex_to_check_i == p_next_i) continue;
-                if (is_inside_triangle(points[vertex_to_check_i], p_prev, p_curr, p_next)) {
-                    is_ear = false;
-                    break;
-                }
-            }
-        }
-
-        if (is_ear) {
-            result_indices.push_back(p_prev_i);
-            result_indices.push_back(p_curr_i);
-            result_indices.push_back(p_next_i);
-
-            indices.erase(indices.begin() + current_vertex_idx);
-            n--;
-            pass_counter = 0;
-            if (current_vertex_idx >= n && n > 0) current_vertex_idx = 0;
-        } else {
-            current_vertex_idx = (current_vertex_idx + 1);
-            if (current_vertex_idx >= n) current_vertex_idx = 0;
-        }
-    }
-
-    if (result_indices.empty() && num_points >= 3) {
-        F.resize(0,3);
-        return;
-    }
-
-    F.resize(result_indices.size() / 3, 3);
-    for (size_t i = 0; i < result_indices.size() / 3; ++i) {
-        F(i, 0) = result_indices[i * 3 + 0];
-        F(i, 1) = result_indices[i * 3 + 1];
-        F(i, 2) = result_indices[i * 3 + 2];
-    }
+    return true;
 }
 
 void OpenGLOutline2Rasterizer::rasterize(RasterizedOutline2 &poly, float scaleFactor, int rast_i, int rotationNum, int gutterWidth)
@@ -176,10 +116,11 @@ void OpenGLOutline2Rasterizer::rasterize(RasterizedOutline2 &poly, float scaleFa
 
     if (sizeX <= 0 || sizeY <= 0) { LOG_WARN << "Skipping rasterization of degenerate chart."; return; }
 
-    Eigen::MatrixXf V_tri_uv, V_boundary_uv;
+    Eigen::MatrixXf V_tri_uv;
     Eigen::MatrixXi F_tri;
-    TriangulatePolygon(original_points, V_tri_uv, F_tri);
-    if (F_tri.rows() == 0) return;
+    if (!TriangulatePolygon(original_points, V_tri_uv, F_tri)) {
+        return; // Triangulation failed, skip this chart.
+    }
 
     Matrix44f scale, rot, trans, offset, proj;
     scale.SetScale(Point3f(scaleFactor, scaleFactor, 1.f));
@@ -247,6 +188,7 @@ void OpenGLOutline2Rasterizer::rasterize(RasterizedOutline2 &poly, float scaleFa
     std::vector<std::vector<int>> tetrisGrid(sizeY, std::vector<int>(sizeX));
     for (int y = 0; y < sizeY; ++y) {
         for (int x = 0; x < sizeX; ++x) {
+            // OpenGL renders with (0,0) at bottom-left, but we want top-left for the grid
             if (pixels[(y * sizeX) + x] > 0) {
                 tetrisGrid[sizeY - 1 - y][x] = 1;
             }

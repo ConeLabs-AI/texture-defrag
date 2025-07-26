@@ -49,7 +49,10 @@ static const char *fs_text[] = {
     "}\n"
 };
 
-static bool TriangulatePolygon(const std::vector<Point2f>& points, Eigen::MatrixXf& V_out, Eigen::MatrixXi& F_out)
+using RowMajorMatrixXf = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+using RowMajorMatrixXui = Eigen::Matrix<unsigned int, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+
+static bool TriangulatePolygon(const std::vector<Point2f>& points, RowMajorMatrixXf& V_out, RowMajorMatrixXui& F_out)
 {
     if (points.size() < 3) return false;
 
@@ -66,10 +69,8 @@ static bool TriangulatePolygon(const std::vector<Point2f>& points, Eigen::Matrix
 
     size_t n_triangles = indices.size() / 3;
     F_out.resize(n_triangles, 3);
-    for (size_t i = 0; i < n_triangles; ++i) {
-        F_out(i, 0) = indices[i * 3 + 0];
-        F_out(i, 1) = indices[i * 3 + 1];
-        F_out(i, 2) = indices[i * 3 + 2];
+    if (n_triangles > 0) {
+        memcpy(F_out.data(), indices.data(), indices.size() * sizeof(N));
     }
 
     V_out.resize(points.size(), 2);
@@ -128,8 +129,8 @@ void OpenGLOutline2Rasterizer::rasterize(RasterizedOutline2 &poly, float scaleFa
 
     if (sizeX <= 0 || sizeY <= 0) { LOG_WARN << "Skipping rasterization of degenerate chart."; return; }
 
-    Eigen::MatrixXf V_tri_uv;
-    Eigen::MatrixXi F_tri;
+    RowMajorMatrixXf V_tri_uv;
+    RowMajorMatrixXui F_tri;
     if (!TriangulatePolygon(original_points, V_tri_uv, F_tri)) {
         return; // Triangulation failed, skip this chart.
     }
@@ -160,7 +161,7 @@ void OpenGLOutline2Rasterizer::rasterize(RasterizedOutline2 &poly, float scaleFa
 
     glFuncs->glGenBuffers(1, &ebo_tri);
     glFuncs->glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo_tri);
-    glFuncs->glBufferData(GL_ELEMENT_ARRAY_BUFFER, F_tri.size() * sizeof(int), F_tri.data(), GL_STATIC_DRAW);
+    glFuncs->glBufferData(GL_ELEMENT_ARRAY_BUFFER, F_tri.size() * sizeof(unsigned int), F_tri.data(), GL_STATIC_DRAW);
 
     glFuncs->glGenBuffers(1, &vbo_boundary);
     glFuncs->glBindBuffer(GL_ARRAY_BUFFER, vbo_boundary);

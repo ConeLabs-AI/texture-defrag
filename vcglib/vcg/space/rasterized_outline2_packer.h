@@ -106,9 +106,7 @@ public:
         std::vector< std::vector<int> >& tetrisGrid = grids[rast_i];
 
         bool empty = true;
-        if (tetrisGrid.empty() || tetrisGrid[0].empty()) {
-            empty = true;
-        } else {
+        if (!tetrisGrid.empty()) {
             for (const auto& row : tetrisGrid) {
                 for (int cell : row) {
                     if (cell != 0) {

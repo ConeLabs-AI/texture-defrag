@@ -211,21 +211,9 @@ void OpenGLOutline2Rasterizer::rasterize(RasterizedOutline2 &poly, float scaleFa
             }
         }
     }
-    
+
     if (!gridHasPixels) {
-        // Cleanup and return if rasterization is empty
-        glFuncs->glUseProgram(0);
-        glFuncs->glBindFramebuffer(GL_FRAMEBUFFER, defaultFBO);
-        glFuncs->glDeleteProgram(program);
-        glFuncs->glDeleteBuffers(1, &vbo_tri);
-        glFuncs->glDeleteBuffers(1, &ebo_tri);
-        glFuncs->glDeleteBuffers(1, &vbo_boundary);
-        glFuncs->glDeleteVertexArrays(1, &vao);
-        glFuncs->glDeleteTextures(1, &renderTarget);
-        glFuncs->glDeleteFramebuffers(1, &fbo);
-        if (!contextAvailable) context.doneCurrent();
         LOG_WARN << "Rasterization resulted in an empty image for a chart. Skipping it.";
-        return;
     }
 
     // Cleanup
@@ -239,9 +227,20 @@ void OpenGLOutline2Rasterizer::rasterize(RasterizedOutline2 &poly, float scaleFa
     glFuncs->glDeleteTextures(1, &renderTarget);
     glFuncs->glDeleteFramebuffers(1, &fbo);
     if (!contextAvailable) context.doneCurrent();
-    
-    // Generate other 3 rotations by rotating the grid on CPU
+
     int rotationOffset = rotationNum / 4;
+    if (!gridHasPixels) {
+        for (int j = 0; j < 4; j++) {
+            int current_rast_i = rast_i + rotationOffset * j;
+            if (!poly.hasGrid(current_rast_i)) {
+                poly.getGrids(current_rast_i).clear();
+                poly.initFromGrid(current_rast_i);
+            }
+        }
+        return;
+    }
+
+    // Generate other 3 rotations by rotating the grid on CPU
     for (int j = 0; j < 4; j++) {
         if (j != 0) {
             tetrisGrid = rotateGridCWise(tetrisGrid);

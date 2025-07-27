@@ -199,15 +199,35 @@ void OpenGLOutline2Rasterizer::rasterize(RasterizedOutline2 &poly, float scaleFa
     glFuncs->glReadPixels(0, 0, sizeX, sizeY, GL_RED, GL_UNSIGNED_BYTE, pixels.data());
     
     std::vector<std::vector<int>> tetrisGrid(sizeY, std::vector<int>(sizeX));
+    bool gridHasPixels = false;
     for (int y = 0; y < sizeY; ++y) {
         for (int x = 0; x < sizeX; ++x) {
             // OpenGL renders with (0,0) at bottom-left, but we want top-left for the grid
             if (pixels[(y * sizeX) + x] > 0) {
                 tetrisGrid[sizeY - 1 - y][x] = 1;
+                gridHasPixels = true;
+            } else {
+                tetrisGrid[sizeY - 1 - y][x] = 0;
             }
         }
     }
     
+    if (!gridHasPixels) {
+        // Cleanup and return if rasterization is empty
+        glFuncs->glUseProgram(0);
+        glFuncs->glBindFramebuffer(GL_FRAMEBUFFER, defaultFBO);
+        glFuncs->glDeleteProgram(program);
+        glFuncs->glDeleteBuffers(1, &vbo_tri);
+        glFuncs->glDeleteBuffers(1, &ebo_tri);
+        glFuncs->glDeleteBuffers(1, &vbo_boundary);
+        glFuncs->glDeleteVertexArrays(1, &vao);
+        glFuncs->glDeleteTextures(1, &renderTarget);
+        glFuncs->glDeleteFramebuffers(1, &fbo);
+        if (!contextAvailable) context.doneCurrent();
+        LOG_WARN << "Rasterization resulted in an empty image for a chart. Skipping it.";
+        return;
+    }
+
     // Cleanup
     glFuncs->glUseProgram(0);
     glFuncs->glBindFramebuffer(GL_FRAMEBUFFER, defaultFBO);

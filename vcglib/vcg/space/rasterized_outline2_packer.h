@@ -104,6 +104,34 @@ public:
 
     void initFromGrid(int rast_i) {
         std::vector< std::vector<int> >& tetrisGrid = grids[rast_i];
+
+        bool empty = true;
+        if (tetrisGrid.empty() || tetrisGrid[0].empty()) {
+            empty = true;
+        } else {
+            for (const auto& row : tetrisGrid) {
+                for (int cell : row) {
+                    if (cell != 0) {
+                        empty = false;
+                        break;
+                    }
+                }
+                if (!empty) break;
+            }
+        }
+
+        if (empty) {
+            // This case can happen if the initial rasterization was empty.
+            // The rasterizer should skip it, but rotations might be called on an empty grid.
+            // Just initialize with empty/zero values to avoid crashing.
+            gw[rast_i] = 0;
+            gh[rast_i] = 0;
+            discreteAreas[rast_i] = 0;
+            // The vectors deltaY, bottom, etc. will remain empty, which is valid for an empty grid.
+            tetrisGrid.clear();
+            return;
+        }
+
         int gridWidth = tetrisGrid[0].size();
         int gridHeight = tetrisGrid.size();
 

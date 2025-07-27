@@ -215,14 +215,7 @@ void ARAP::ComputeRHS(Mesh& m, const std::vector<Eigen::Matrix2d>& rotations, co
             auto &f = m.face[fi];
             const Eigen::Matrix2d& Rf = rotations[fi];
 
-            Eigen::Vector2d t[3];
-
-            // TODO this should be computed once and stored in the object state
-            Eigen::Vector2d x_10, x_20;
-            LocalIsometry(tsa[f].P[1] - tsa[f].P[0], tsa[f].P[2] - tsa[f].P[0], x_10, x_20);
-            t[0] = Eigen::Vector2d::Zero();
-            t[1] = t[0] + x_10;
-            t[2] = t[0] + x_20;
+            const auto& t = local_frame_coords[fi];
 
             for (int i = 0; i < 3; ++i) {
                 Mesh::VertexPointer vi = f.V0(i);
@@ -356,6 +349,8 @@ ARAPSolveInfo ARAP::Solve()
     ARAPSolveInfo si = {0, 0, 0, false};
     std::vector<Cot> cotan = ComputeCotangentVector(m);
 
+    PrecomputeData();
+
     Eigen::SparseMatrix<double, Eigen::RowMajor> A;
     ComputeSystemMatrix(m, cotan, A);
 
@@ -456,6 +451,21 @@ ARAPSolveInfo ARAP::Solve()
     }
 
     return si;
+}
+
+void ARAP::PrecomputeData()
+{
+    local_frame_coords.resize(m.FN());
+    auto tsa = GetTargetShapeAttribute(m);
+    #pragma omp parallel for
+    for (int fi = 0; fi < m.FN(); ++fi) {
+        auto& f = m.face[fi];
+        Eigen::Vector2d x_10, x_20;
+        LocalIsometry(tsa[f].P[1] - tsa[f].P[0], tsa[f].P[2] - tsa[f].P[0], x_10, x_20);
+        local_frame_coords[fi][0] = Eigen::Vector2d::Zero();
+        local_frame_coords[fi][1] = x_10;
+        local_frame_coords[fi][2] = x_20;
+    }
 }
 
 

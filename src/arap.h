@@ -26,6 +26,8 @@
 
 #include <Eigen/Core>
 #include <Eigen/Sparse>
+#include <vector>
+#include <array>
 
 
 struct ARAPSolveInfo {
@@ -50,10 +52,13 @@ private:
     std::vector<int> fixed_i;
     std::vector<vcg::Point2d> fixed_pos;
 
+    std::vector<std::array<Eigen::Vector2d, 3>> local_frame_coords;
+
     int max_iter;
 
     void ComputeSystemMatrix(Mesh& m, const std::vector<Cot>& cotan, Eigen::SparseMatrix<double, Eigen::RowMajor>& L);
     void ComputeRHS(Mesh& m, const std::vector<Eigen::Matrix2d>& rotations, const std::vector<Cot>& cotan, Eigen::VectorXd& bu, Eigen::VectorXd& bv);
+    void PrecomputeData();
 
 public:
 

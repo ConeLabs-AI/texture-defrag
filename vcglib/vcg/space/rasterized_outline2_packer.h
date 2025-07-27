@@ -132,6 +132,12 @@ public:
             return;
         }
 
+        size_t max_w = 0;
+        for(const auto& row : tetrisGrid)
+            if(row.size() > max_w) max_w = row.size();
+        for(auto& row : tetrisGrid)
+            row.resize(max_w, 0);
+
         int gridWidth = tetrisGrid[0].size();
         int gridHeight = tetrisGrid.size();
 
@@ -958,112 +964,117 @@ public:
             // +++ Step 2: Parallel Placement Search +++
             PlacementResult bestOverallResult;
 
-            #pragma omp parallel
-            {
-                PlacementResult bestThreadResult; // Each thread has its own local best result
+            for (int rast_i = 0; rast_i < packingPar.rotationNum; rast_i++) {
+                if (!polyVec[i].hasGrid(rast_i) || polyVec[i].gridWidth(rast_i) <= 0) continue;
 
-                // Parallelize the search over all rotations. Use a dynamic schedule for better
-                // load balancing, as work per rotation can be highly variable.
-                #pragma omp for schedule(dynamic, 1)
-                for (int rast_i = 0; rast_i < packingPar.rotationNum; rast_i++) {
+                //try to fit the poly in all containers, in all valid positions
+                for (int grid_i = 0; grid_i < containerNum; grid_i++) {
+                    int maxCol = gridSizes[grid_i].X() - polyVec[i].gridWidth(rast_i);
+                    int maxRow = gridSizes[grid_i].Y() - polyVec[i].gridHeight(rast_i);
 
-                    //try to fit the poly in all containers, in all valid positions
-                    for (int grid_i = 0; grid_i < containerNum; grid_i++) {
-                        int maxCol = gridSizes[grid_i].X() - polyVec[i].gridWidth(rast_i);
-                        int maxRow = gridSizes[grid_i].Y() - polyVec[i].gridHeight(rast_i);
-
-                        //look for the best position, dropping from top
-                        for (int col = 0; col < maxCol; col++) {
-                            int currPolyY;
-                            // Check primary horizon
-                            currPolyY = packingFields[grid_i].dropY(polyVec[i],col, rast_i);
-                            if (currPolyY != INVALID_POSITION) {
-                                int currCost = packingFields[grid_i].getCostY(polyVec[i], Point2i(col, currPolyY), rast_i);
-                                if (packingPar.doubleHorizon && (packingPar.minmax == true))
-                                    currCost += packingFields[grid_i].getCostX(polyVec[i], Point2i(col, currPolyY), rast_i);
-                                if (currCost < bestThreadResult.cost) {
-                                    bestThreadResult.container = grid_i;
-                                    bestThreadResult.cost = currCost;
-                                    bestThreadResult.rastIndex = rast_i;
-                                    bestThreadResult.polyX = col;
-                                    bestThreadResult.polyY = currPolyY;
-                                    bestThreadResult.placedUsingSecondaryHorizon = false;
-                                }
-                            }
-                            // Check inner horizon
-                            if (packingPar.innerHorizon) {
-                                currPolyY = packingFields[grid_i].dropYInner(polyVec[i],col, rast_i);
+                    // --- Search by dropping from top ---
+                    if (maxCol > 0) {
+                        PlacementResult bestResultForDropY;
+                        #pragma omp parallel
+                        {
+                            PlacementResult bestThreadResult;
+                            #pragma omp for schedule(dynamic)
+                            for (int col = 0; col < maxCol; col++) {
+                                int currPolyY;
+                                // Check primary horizon
+                                currPolyY = packingFields[grid_i].dropY(polyVec[i],col, rast_i);
                                 if (currPolyY != INVALID_POSITION) {
                                     int currCost = packingFields[grid_i].getCostY(polyVec[i], Point2i(col, currPolyY), rast_i);
                                     if (packingPar.doubleHorizon && (packingPar.minmax == true))
                                         currCost += packingFields[grid_i].getCostX(polyVec[i], Point2i(col, currPolyY), rast_i);
                                     if (currCost < bestThreadResult.cost) {
-                                        bestThreadResult.container = grid_i;
-                                        bestThreadResult.cost = currCost;
-                                        bestThreadResult.rastIndex = rast_i;
-                                        bestThreadResult.polyX = col;
-                                        bestThreadResult.polyY = currPolyY;
-                                        bestThreadResult.placedUsingSecondaryHorizon = true;
+                                        bestThreadResult.container = grid_i; bestThreadResult.cost = currCost;
+                                        bestThreadResult.rastIndex = rast_i; bestThreadResult.polyX = col;
+                                        bestThreadResult.polyY = currPolyY; bestThreadResult.placedUsingSecondaryHorizon = false;
+                                    }
+                                }
+                                // Check inner horizon
+                                if (packingPar.innerHorizon) {
+                                    currPolyY = packingFields[grid_i].dropYInner(polyVec[i],col, rast_i);
+                                    if (currPolyY != INVALID_POSITION) {
+                                        int currCost = packingFields[grid_i].getCostY(polyVec[i], Point2i(col, currPolyY), rast_i);
+                                        if (packingPar.doubleHorizon && (packingPar.minmax == true))
+                                            currCost += packingFields[grid_i].getCostX(polyVec[i], Point2i(col, currPolyY), rast_i);
+                                        if (currCost < bestThreadResult.cost) {
+                                            bestThreadResult.container = grid_i; bestThreadResult.cost = currCost;
+                                            bestThreadResult.rastIndex = rast_i; bestThreadResult.polyX = col;
+                                            bestThreadResult.polyY = currPolyY; bestThreadResult.placedUsingSecondaryHorizon = true;
+                                        }
                                     }
                                 }
                             }
-                        }
-
-                        if (!packingPar.doubleHorizon)
-                            continue;
-                        
-                        //look for the best position, dropping from left
-                        for (int row = 0; row < maxRow; row++) {
-                            int currPolyX;
-                            // Check primary horizon
-                            currPolyX = packingFields[grid_i].dropX(polyVec[i],row, rast_i);
-                            if (currPolyX != INVALID_POSITION) {
-                                int currCost = packingFields[grid_i].getCostX(polyVec[i], Point2i(currPolyX, row), rast_i);
-                                if (packingPar.doubleHorizon && (packingPar.minmax == true))
-                                    currCost += packingFields[grid_i].getCostY(polyVec[i], Point2i(currPolyX, row), rast_i);
-                                if (currCost < bestThreadResult.cost) {
-                                    bestThreadResult.container = grid_i;
-                                    bestThreadResult.cost = currCost;
-                                    bestThreadResult.rastIndex = rast_i;
-                                    bestThreadResult.polyX = currPolyX;
-                                    bestThreadResult.polyY = row;
-                                    bestThreadResult.placedUsingSecondaryHorizon = false;
+                            #pragma omp critical
+                            {
+                                if(bestThreadResult.cost < bestResultForDropY.cost) {
+                                    bestResultForDropY = bestThreadResult;
                                 }
                             }
-                            // Check inner horizon
-                            if (packingPar.innerHorizon) {
-                                currPolyX = packingFields[grid_i].dropXInner(polyVec[i],row, rast_i);
+                        }
+                        if (bestResultForDropY.cost < bestOverallResult.cost) {
+                            bestOverallResult = bestResultForDropY;
+                        }
+                    }
+
+                    if (!packingPar.doubleHorizon)
+                        continue;
+                    
+                    // --- Search by dropping from left ---
+                    if (maxRow > 0) {
+                        PlacementResult bestResultForDropX;
+                        #pragma omp parallel
+                        {
+                            PlacementResult bestThreadResult;
+                            #pragma omp for schedule(dynamic)
+                            for (int row = 0; row < maxRow; row++) {
+                                int currPolyX;
+                                // Check primary horizon
+                                currPolyX = packingFields[grid_i].dropX(polyVec[i],row, rast_i);
                                 if (currPolyX != INVALID_POSITION) {
                                     int currCost = packingFields[grid_i].getCostX(polyVec[i], Point2i(currPolyX, row), rast_i);
                                     if (packingPar.doubleHorizon && (packingPar.minmax == true))
                                         currCost += packingFields[grid_i].getCostY(polyVec[i], Point2i(currPolyX, row), rast_i);
                                     if (currCost < bestThreadResult.cost) {
-                                        bestThreadResult.container = grid_i;
-                                        bestThreadResult.cost = currCost;
-                                        bestThreadResult.rastIndex = rast_i;
-                                        bestThreadResult.polyX = currPolyX;
-                                        bestThreadResult.polyY = row;
-                                        bestThreadResult.placedUsingSecondaryHorizon = true;
+                                        bestThreadResult.container = grid_i; bestThreadResult.cost = currCost;
+                                        bestThreadResult.rastIndex = rast_i; bestThreadResult.polyX = currPolyX;
+                                        bestThreadResult.polyY = row; bestThreadResult.placedUsingSecondaryHorizon = false;
+                                    }
+                                }
+                                // Check inner horizon
+                                if (packingPar.innerHorizon) {
+                                    currPolyX = packingFields[grid_i].dropXInner(polyVec[i],row, rast_i);
+                                    if (currPolyX != INVALID_POSITION) {
+                                        int currCost = packingFields[grid_i].getCostX(polyVec[i], Point2i(currPolyX, row), rast_i);
+                                        if (packingPar.doubleHorizon && (packingPar.minmax == true))
+                                            currCost += packingFields[grid_i].getCostY(polyVec[i], Point2i(currPolyX, row), rast_i);
+                                        if (currCost < bestThreadResult.cost) {
+                                            bestThreadResult.container = grid_i; bestThreadResult.cost = currCost;
+                                            bestThreadResult.rastIndex = rast_i; bestThreadResult.polyX = currPolyX;
+                                            bestThreadResult.polyY = row; bestThreadResult.placedUsingSecondaryHorizon = true;
+                                        }
                                     }
                                 }
                             }
+                            #pragma omp critical
+                            {
+                                if(bestThreadResult.cost < bestResultForDropX.cost) {
+                                    bestResultForDropX = bestThreadResult;
+                                }
+                            }
+                        }
+                        if (bestResultForDropX.cost < bestOverallResult.cost) {
+                            bestOverallResult = bestResultForDropX;
                         }
                     }
-                } // end of parallel for loop over rotations
-
-                // Reduce Step: Each thread compares its local best against the shared global best.
-                // The critical section ensures this comparison and update is thread-safe.
-                #pragma omp critical
-                {
-                    if (bestThreadResult.cost < bestOverallResult.cost) {
-                        bestOverallResult = bestThreadResult;
-                    }
                 }
-            } // end of parallel block
+            }
 
 
             // +++ Step 3: Sequential State Update +++
-            // This logic is the same, but now uses the 'bestOverallResult' from the parallel search.
             if (bestOverallResult.rastIndex == -1) {
                 if (bestEffort) {
                     polyToContainer[i] = -1;

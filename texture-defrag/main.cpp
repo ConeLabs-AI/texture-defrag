@@ -252,7 +252,7 @@ int main(int argc, char *argv[])
 
     LOG_INFO << "Rendering texture...";
 
-    RenderTextureAndSave(savename, m, textureObject, texszVec, true, RenderMode::Linear);
+    RenderTextureAndSave(savename, m, textureObject, texszVec, false, RenderMode::Linear);
     timings["Texture rendering"] = t.TimeSinceLastCheck();
 
     double outputMP;

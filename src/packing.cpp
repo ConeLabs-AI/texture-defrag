@@ -28,7 +28,6 @@
 
 #include <vcg/complex/algorithms/outline_support.h>
 #include <vcg/space/rasterized_outline2_packer.h>
-//#include <wrap/gl/opengl_outline2_rasterizer.h>
 #include <wrap/qt/outline2_rasterizer.h>
 // #include <wrap/qt/Outline2ToQImage.h>
 
@@ -66,7 +65,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         textureArea += textureObject->TextureWidth(i) * textureObject->TextureHeight(i);
     }
     double targetTextureArea = textureArea * params.resolutionScaling * params.resolutionScaling;
-    double packingScale = (targetTextureArea > 0) ? std::sqrt(packingArea / targetTextureArea) : 1.0;
+    double packingScale = (packingArea > 0) ? std::sqrt(targetTextureArea / packingArea) : 1.0;
 
     if (!std::isfinite(packingScale) || packingScale <= 0) {
         LOG_WARN << "[DIAG] Invalid packingScale computed: " << packingScale

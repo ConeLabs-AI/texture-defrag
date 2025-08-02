@@ -52,7 +52,7 @@ struct AlgoParameters {
     double expb                      = 1.0;
     double UVBorderLengthReduction   = 0.0;
     bool   ignoreOnReject            = false;
-    double resolutionScaling         = 2.0;
+    double resolutionScaling         = 1.0;
 };
 
 struct SeamData {

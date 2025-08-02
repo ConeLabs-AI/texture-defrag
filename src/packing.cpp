@@ -64,17 +64,18 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         packingArea += containerVec[i].X() * containerVec[i].Y();
         textureArea += textureObject->TextureWidth(i) * textureObject->TextureHeight(i);
     }
-    double targetTextureArea = textureArea * params.resolutionScaling * params.resolutionScaling;
-    double packingScale = (packingArea > 0) ? std::sqrt(targetTextureArea / packingArea) : 1.0;
+    // double targetTextureArea = textureArea * params.resolutionScaling * params.resolutionScaling;
+    // double packingScale = (packingArea > 0) ? std::sqrt(targetTextureArea / packingArea) : 1.0;
+    double packingScale = (textureArea > 0) ? std::sqrt(packingArea / (double)textureArea) : 1.0;
 
     if (!std::isfinite(packingScale) || packingScale <= 0) {
         LOG_WARN << "[DIAG] Invalid packingScale computed: " << packingScale
-                 << ". Resetting to 1.0. (packingArea=" << packingArea << ", targetTextureArea=" << targetTextureArea << ")";
+                 << ". Resetting to 1.0. (packingArea=" << packingArea << ", textureArea=" << textureArea << ")";
         packingScale = 1.0;
     }
 
     LOG_INFO << "[DIAG] Packing scale factor: " << packingScale
-             << " (packingArea=" << packingArea << ", targetTextureArea=" << targetTextureArea << ")";
+             << " (packingArea=" << packingArea << ", textureArea=" << textureArea << ")";
 
     RasterizationBasedPacker::Parameters packingParams;
     packingParams.costFunction = RasterizationBasedPacker::Parameters::LowestHorizon;

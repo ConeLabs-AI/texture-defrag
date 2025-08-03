@@ -61,7 +61,7 @@ void TextureObject::Bind(int i)
     if (texNameVec[i] == 0) {
         QImage img(texInfoVec[i].path.c_str());
         ensure(!img.isNull());
-        if ((img.format() != QImage::Format_RGB32) || (img.format() != QImage::Format_ARGB32)) {
+        if ((img.format() != QImage::Format_RGB32) && (img.format() != QImage::Format_ARGB32)) {
             QImage glimg = img.convertToFormat(QImage::Format_ARGB32);
             img = glimg;
         }

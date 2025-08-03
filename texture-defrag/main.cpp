@@ -60,6 +60,7 @@ struct Args {
     double t = 0.0;
     std::string infile = "";
     std::string outfile = "";
+    int r = 4;
     int l = 0;
 };
 
@@ -83,6 +84,7 @@ int main(int argc, char *argv[])
     ap.UVBorderLengthReduction = args.u;
     ap.offsetFactor = args.a;
     ap.timelimit = args.t;
+    ap.rotationNum = args.r;
 
     LOG_INIT(args.l);
 
@@ -305,6 +307,7 @@ void PrintArgsUsage(const char *binary) {
     std::cout << "-a  <val>      " << "Alpha parameter to control the UV optimization area size." << " (default: " << def.a << ")" << std::endl;
     std::cout << "-t  <val>      " << "Time-limit for the atlas clustering (in seconds)." << " (default: " << def.t << ")" << std::endl;
     std::cout << "-o  <val>      " << "Output mesh file. Supported formats are obj and ply." << " (default: out_MESHFILE" << ")" << std::endl;
+    std::cout << "-r  <val>      " << "Number of rotations to try (e.g., 4 for 0/90/180/270, 1 for no rotation). If > 1, must be multiple of 4." << " (default: " << def.r << ")" << std::endl;
     std::cout << "-l  <val>      " << "Logging level. 0 for minimal verbosity, 1 for verbose output, 2 for debug output." << " (default: " << def.l << ")" << std::endl;
 }
 
@@ -333,6 +336,7 @@ bool ParseOption(const std::string& option, const std::string& argument, Args *a
             case 'u': args->u = std::stod(argument); break;
             case 'a': args->a = std::stod(argument); break;
             case 't': args->t = std::stod(argument); break;
+            case 'r': args->r = std::stoi(argument); break;
             default:
                 std::cerr << "Unrecognized option " << option << std::endl << std::endl;
                 return false;

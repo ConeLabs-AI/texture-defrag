@@ -203,8 +203,9 @@ void QtOutline2Rasterizer::rasterize(RasterizedOutline2 &poly,
     }
 
     //create the 4 rasterizations (one every 90°) using the discrete representation grid we've just created
-    int rotationOffset = rotationNum/4;
-    for (int j = 0; j < 4; j++) {
+    int num_rotations_to_generate = (rotationNum >= 4) ? 4 : 1;
+    int rotationOffset = (rotationNum >= 4) ? rotationNum / 4 : 0;
+    for (int j = 0; j < num_rotations_to_generate; j++) {
         if (j != 0)  {
             tetrisGrid = rotateGridCWise(tetrisGrid);
         }

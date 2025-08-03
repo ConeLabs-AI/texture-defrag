@@ -48,7 +48,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         outlines.push_back(outline);
     }
 
-    int packingSize = 16384;
+    int packingSize = 8192;
     std::vector<std::pair<double,double>> trs = textureObject->ComputeRelativeSizes();
 
     std::vector<Point2i> containerVec;
@@ -80,10 +80,10 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     RasterizationBasedPacker::Parameters packingParams;
     packingParams.costFunction = RasterizationBasedPacker::Parameters::LowestHorizon;
     packingParams.doubleHorizon = false;
-    packingParams.innerHorizon = false;
+    packingParams.innerHorizon = true;
     //packingParams.permutations = false;
     packingParams.permutations = (charts.size() < 50);
-    packingParams.rotationNum = 4;
+    packingParams.rotationNum = params.rotationNum;
     packingParams.gutterWidth = 4;
     packingParams.minmax = false; // not used
 

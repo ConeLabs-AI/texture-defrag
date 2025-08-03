@@ -953,8 +953,9 @@ public:
             // +++ Step 1: Just-In-Time Rasterization (Memory Safe) +++
             // Rasterize the multiple rotations for *only the current chart* in parallel.
             polyVec[i].resetState(packingPar.rotationNum);
+            int num_base_rasterizations = (packingPar.rotationNum >= 4) ? packingPar.rotationNum/4 : packingPar.rotationNum;
             //#pragma omp parallel for schedule(dynamic)
-            for (int rast_i = 0; rast_i < packingPar.rotationNum/4; rast_i++) {
+            for (int rast_i = 0; rast_i < num_base_rasterizations; rast_i++) {
                 //create the rasterization (i.e. fills bottom/top/grids/internalWastedCells arrays)
                 RASTERIZER_TYPE::rasterize(polyVec[i], scaleFactor, rast_i, packingPar.rotationNum, packingPar.gutterWidth);
             }

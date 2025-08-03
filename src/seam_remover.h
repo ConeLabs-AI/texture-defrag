@@ -53,6 +53,7 @@ struct AlgoParameters {
     double UVBorderLengthReduction   = 0.0;
     bool   ignoreOnReject            = false;
     double resolutionScaling         = 1.0;
+    int    rotationNum               = 4;
 };
 
 struct SeamData {

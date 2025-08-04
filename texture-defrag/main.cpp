@@ -43,6 +43,8 @@
 #include <fstream>
 #include <map>
 
+#include <omp.h>
+
 #include <QApplication>
 #include <QImage>
 #include <QDir>
@@ -87,6 +89,14 @@ int main(int argc, char *argv[])
     ap.rotationNum = args.r;
 
     LOG_INIT(args.l);
+
+#ifdef _OPENMP
+    LOG_INFO << "OpenMP is enabled.";
+    LOG_INFO << "Number of available processors: " << omp_get_num_procs();
+    LOG_INFO << "Max threads: " << omp_get_max_threads();
+#else
+    LOG_INFO << "OpenMP is not enabled.";
+#endif
 
     Mesh m;
     TextureObjectHandle textureObject;

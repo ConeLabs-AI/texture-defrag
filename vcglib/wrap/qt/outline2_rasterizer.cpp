@@ -14,8 +14,8 @@ void QtOutline2Rasterizer::rasterize(RasterizedOutline2 &poly,
                                  int rotationNum,
                                  int gutterWidth)
 {
-
-    gutterWidth *= 2; // since the brush is centered on the outline multiply the given value by 2
+    // since the brush is centered on the outline, a gutter of N pixels requires a pen of 2*N width
+    gutterWidth *= 2;
 
     float rotRad = M_PI*2.0f*float(rast_i) / float(rotationNum);
 
@@ -30,175 +30,83 @@ void QtOutline2Rasterizer::rasterize(RasterizedOutline2 &poly,
 
     //create the polygon to print it
     QVector<QPointF> points;
-    vector<Point2f> newpoints = poly.getPoints();
-    for (size_t i = 0; i < newpoints.size(); i++) {
-        points.push_back(QPointF(newpoints[i].X(), newpoints[i].Y()));
+    points.reserve(pointvec.size());
+    for (const auto& p : poly.getPoints()) {
+        points.push_back(QPointF(p.X(), p.Y()));
     }
 
     // Compute the raster space size by rounding up the scaled bounding box size
-    // and adding the gutter width.
-    int sizeX = (int)ceil(bb.DimX()*scale);
-    int sizeY = (int)ceil(bb.DimY()*scale);
+    // and adding the gutter width. A small safety buffer prevents clipping.
     int safetyBuffer = 2;
-    sizeX += (gutterWidth + safetyBuffer);
-    sizeY += (gutterWidth + safetyBuffer);
+    int sizeX = (int)ceil(bb.DimX()*scale) + gutterWidth + safetyBuffer;
+    int sizeY = (int)ceil(bb.DimY()*scale) + gutterWidth + safetyBuffer;
 
-    QImage img(sizeX,sizeY,QImage::Format_RGB32);
-    QColor backgroundColor(Qt::transparent);
-    img.fill(backgroundColor);
+    // Use a 1-byte-per-pixel format, which is 4x smaller and faster to process.
+    QImage img(sizeX, sizeY, QImage::Format_Alpha8);
+    img.fill(0); // Transparent background
 
-    ///SETUP OF DRAWING PROCEDURE
     QPainter painter;
     painter.begin(&img);
-    {
-        QBrush br;
-        br.setStyle(Qt::SolidPattern);
-        br.setColor(Qt::yellow);
-
-        QPen qp;
-        qp.setWidthF(0);
-        qp.setWidth(gutterWidth);
-        qp.setCosmetic(true);
-        qp.setColor(Qt::yellow);
-        qp.setJoinStyle(Qt::MiterJoin);
-        qp.setMiterLimit(0);
-
-        painter.setBrush(br);
-        painter.setPen(qp);
-
-        painter.resetTransform();
-        painter.translate(QPointF(-(bb.min.X()*scale) + (gutterWidth + safetyBuffer)/2.0f, -(bb.min.Y()*scale) + (gutterWidth + safetyBuffer)/2.0f));
-        painter.rotate(math::ToDeg(rotRad));
-        painter.scale(scale,scale);
-
-        painter.drawPolygon(QPolygonF(points));
-    }
+    painter.setRenderHint(QPainter::Antialiasing, false);
+ 
+    // Fill the interior of the polygon
+    painter.setBrush(QBrush(Qt::white, Qt::SolidPattern));
+ 
+    // Draw the boundary with a thick pen to create the gutter
+    QPen qp(Qt::white);
+    qp.setWidth(gutterWidth);
+    qp.setCosmetic(false); // Use physical width, not a 1px cosmetic pen
+    qp.setJoinStyle(Qt::MiterJoin);
+    painter.setPen(qp);
+ 
+    // Setup transformation
+    painter.resetTransform();
+    painter.translate(QPointF(-(bb.min.X()*scale) + (gutterWidth + safetyBuffer)/2.0f, -(bb.min.Y()*scale) + (gutterWidth + safetyBuffer)/2.0f));
+    painter.rotate(math::ToDeg(rotRad));
+    painter.scale(scale,scale);
+ 
+    // A single draw call for efficiency
+    painter.drawPolygon(QPolygonF(points));
+ 
     painter.end();
-
-    // workaround/hack to avoid ``disappearing'' primitives: use a cosmetic pen to
-    // draw the poly boundary.
-    // The proper way to do this would be to use conservative reasterization, which
-    // Qt doesn't seem to support
-    std::vector<QPointF> lines;
-    for (int i = 1; i < points.size(); ++i) {
-        lines.push_back(points[i-1]);
-        lines.push_back(points[i]);
-    }
-    lines.push_back(points.back());
-    lines.push_back(points.front());
-
-    painter.begin(&img);
-    {
-        QBrush br;
-        br.setStyle(Qt::SolidPattern);
-        br.setColor(Qt::yellow);
-
-        QPen qp;
-        qp.setWidthF(0);
-        qp.setWidth(std::max(1, gutterWidth));
-        qp.setCosmetic(true);
-        qp.setColor(Qt::yellow);
-
-        painter.setBrush(br);
-        painter.setPen(qp);
-
-        painter.resetTransform();
-        painter.translate(QPointF(-(bb.min.X()*scale) + (gutterWidth + safetyBuffer)/2.0f, -(bb.min.Y()*scale) + (gutterWidth + safetyBuffer)/2.0f));
-        painter.rotate(math::ToDeg(rotRad));
-        painter.scale(scale,scale);
-
-        //painter.drawPoints(QPolygonF(points));
-        painter.drawLines(lines.data(), lines.size()/2);
-    }
-    painter.end();
-
-    // Cropping
-
-    /*
-    // Slower version
-    int minX = img.width();
-    int minY = img.height();
-    int maxX = -1;
-    int maxY = -1;
-
+ 
+    // --- Cropping ---
+    // Optimized to find bounds and perform a single copy
+    int minX = img.width(), minY = img.height(), maxX = -1, maxY = -1;
     for (int i = 0; i < img.height(); ++i) {
-        const QRgb *line = reinterpret_cast<const QRgb*>(img.scanLine(i));
+        const uchar *line = img.constScanLine(i);
+        bool hasPixel = false;
         for (int j = 0; j < img.width(); ++j) {
-            if (line[j] != backgroundColor.rgb()) {
+            if (line[j] != 0) {
                 if (j < minX) minX = j;
                 if (j > maxX) maxX = j;
-                if (i < minY) minY = i;
-                if (i > maxY) maxY = i;
+                hasPixel = true;
             }
         }
-    }
-    */
-
-    int minX = img.width();
-    int minY = img.height();
-    int maxX = 0;
-    int maxY = 0;
-
-    for (int i = 0; i < img.height(); ++i) {
-        const QRgb *line = reinterpret_cast<const QRgb*>(img.scanLine(i));
-        for (int j = 0; j < img.width(); ++j) {
-            if (line[j] != backgroundColor.rgb()) {
-                minY = i;
-                break;
-            }
+        if (hasPixel) {
+            if (i < minY) minY = i;
+            if (i > maxY) maxY = i;
         }
-        if (minY < img.height()) break;
     }
-
-    for (int i = img.height() - 1; i >= 0; --i) {
-        const QRgb *line = reinterpret_cast<const QRgb*>(img.scanLine(i));
-        for (int j = 0; j < img.width(); ++j) {
-            if (line[j] != backgroundColor.rgb()) {
-                maxY = i;
-                break;
-            }
+ 
+    if (maxX < minX) { // Empty rasterization
+        int num_rotations_to_generate = (rotationNum >= 4) ? 4 : 1;
+        int rotationOffset = (rotationNum >= 4) ? rotationNum / 4 : 0;
+        for (int j = 0; j < num_rotations_to_generate; j++) {
+            poly.getGrids(rast_i + rotationOffset*j).clear();
+            poly.initFromGrid(rast_i + rotationOffset*j);
         }
-        if (maxY > 0) break;
+        return;
     }
+ 
+    img = img.copy(minX, minY, (maxX - minX) + 1, (maxY - minY) + 1);
 
-    for (int i = minY; i <= maxY; ++i) {
-        const QRgb *line = reinterpret_cast<const QRgb*>(img.scanLine(i));
-        for (int j = 0; j < minX; ++j)
-            if (line[j] != backgroundColor.rgb() && j < minX) {
-                minX = j;
-                break;
-            }
-        for (int j = img.width() - 1; j >= maxX; --j)
-            if (line[j] != backgroundColor.rgb() && j > maxX) {
-                maxX = j;
-                break;
-            }
-    }
-
-    assert (minX <= maxX && minY <= maxY);
-
-    int imgW = (maxX - minX) + 1;
-    int imgH = (maxY - minY) + 1;
-
-    {
-        QImage imgcp = img.copy(0, 0, img.width(), img.height());
-        img = imgcp.copy(minX, minY, imgW, imgH);
-    }
-
-    //create the first grid, which will then be rotated 3 times.
-    //we will reuse this grid to create the rasterizations corresponding to this one rotated by 90/180/270°
-    vector<vector<int> > tetrisGrid;
-    QRgb yellow = QColor(Qt::yellow).rgb();
-    tetrisGrid.resize(img.height());
-    for (int k = 0; k < img.height(); k++) {
-        tetrisGrid[k].resize(img.width(), 0);
-    }
+    // --- Grid Creation ---
+    vector<vector<uint8_t>> tetrisGrid(img.height(), vector<uint8_t>(img.width()));
     for (int y = 0; y < img.height(); y++) {
-        const uchar* line = img.scanLine(y);
+        const uchar* line = img.constScanLine(y);
         for(int x = 0; x < img.width(); ++x) {
-            if (((QRgb*)line)[x] == yellow) {
-                tetrisGrid[y][x] = 1;
-            }
+            tetrisGrid[y][x] = (line[x] != 0) ? 1 : 0;
         }
     }
 
@@ -217,10 +125,10 @@ void QtOutline2Rasterizer::rasterize(RasterizedOutline2 &poly,
     }
 }
 
-// rotates the grid 90 degree clockwise (by simple swap)
-// used to lower the cost of rasterization.
-vector<vector<int> > QtOutline2Rasterizer::rotateGridCWise(vector< vector<int> >& inGrid) {
-    vector<vector<int> > outGrid(inGrid[0].size());
+ // rotates the grid 90 degree clockwise (by simple swap)
+ // used to lower the cost of rasterization.
+vector<vector<uint8_t> > QtOutline2Rasterizer::rotateGridCWise(vector< vector<uint8_t> >& inGrid) {
+    vector<vector<uint8_t> > outGrid(inGrid[0].size());
     for (size_t i = 0; i < inGrid[0].size(); i++) {
         outGrid[i].reserve(inGrid.size());
         for (size_t j = 0; j < inGrid.size(); j++) {

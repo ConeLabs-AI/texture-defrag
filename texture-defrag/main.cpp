@@ -51,7 +51,6 @@
 #include <QFileInfo>
 #include <QString>
 
-
 struct Args {
     double m = 2.0;
     double b = 0.2;
@@ -394,4 +393,3 @@ Args ParseArgs(int argc, char *argv[])
 
     return args;
 }
-

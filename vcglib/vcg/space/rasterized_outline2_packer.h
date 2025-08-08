@@ -26,7 +26,11 @@
 
 #include <vcg/space/rect_packer.h>
 #include <vcg/complex/algorithms/outline_support.h>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
+#include <cstdint>
+#include <set>
 
 namespace vcg
 {
@@ -37,7 +41,7 @@ class RasterizedOutline2
 private:
     //the grid is the "bounding grid" of the polygon, which is returned by the rasterization process
     //this is a vector of "bounding grids", there is one for each rasterization (different rotation or whatever)
-    std::vector < std::vector< std::vector<int> > > grids;
+    std::vector < std::vector< std::vector<uint8_t> > > grids;
 
     std::vector<int> gw;
     std::vector<int> gh;
@@ -72,7 +76,7 @@ public:
 
     std::vector<Point2f>&  getPoints()           { return points; }
     const std::vector<Point2f>&  getPointsConst() const{ return points; }
-    std::vector< std::vector<int> >& getGrids(int rast_i)  { return grids[rast_i]; }
+    std::vector< std::vector<uint8_t> >& getGrids(int rast_i)  { return grids[rast_i]; }
 
     //get top/bottom/left/right vectors of the i-th rasterization
     std::vector<int>& getDeltaY(int i) { return deltaY[i]; }
@@ -103,12 +107,12 @@ public:
     }
 
     void initFromGrid(int rast_i) {
-        std::vector< std::vector<int> >& tetrisGrid = grids[rast_i];
+        std::vector< std::vector<uint8_t> >& tetrisGrid = grids[rast_i];
 
         bool empty = true;
         if (!tetrisGrid.empty()) {
             for (const auto& row : tetrisGrid) {
-                for (int cell : row) {
+                for (uint8_t cell : row) {
                     if (cell != 0) {
                         empty = false;
                         break;
@@ -141,6 +145,12 @@ public:
 
         gw[rast_i] = gridWidth;
         gh[rast_i] = gridHeight;
+
+        // Avoid reallocations
+        bottom[rast_i].reserve(gridWidth);
+        deltaY[rast_i].reserve(gridWidth);
+        left[rast_i].reserve(gridHeight);
+        deltaX[rast_i].reserve(gridHeight);
 
         //compute bottom,
         //where bottom[i] = empty cells from the bottom in the column i
@@ -333,6 +343,10 @@ public:
       std::vector<int> mInnerLeftHorizon;
       std::vector<int> mInnerLeftExtent;
 
+      // Skyline event points (indices where the horizon changes)
+      std::set<int> mBottomEvents;
+      std::set<int> mLeftEvents;
+
       //the size of the packing grid
       vcg::Point2i mSize;
 
@@ -353,11 +367,17 @@ public:
 
           params = par;
           mSize = Point2i(size.X(), size.Y());
+
+          mBottomEvents.insert(0);
+          mLeftEvents.insert(0);
       }
 
       std::vector<int>& bottomHorizon() { return mBottomHorizon; }
       std::vector<int>& leftHorizon() { return mLeftHorizon; }
       vcg::Point2i& size() { return mSize; }
+
+      const std::set<int>& bottomEvents() const { return mBottomEvents; }
+      const std::set<int>& leftEvents() const { return mLeftEvents; }
 
       //returns the score relative to the left horizon of that poly in that particular position, taking into account the choosen algo
       int getCostX(RasterizedOutline2& poly, Point2i pos, int rast_i) {
@@ -586,6 +606,16 @@ public:
           return score;
       }
 
+      void updateEvents(std::set<int>& events, const std::vector<int>& horizon, int i, int max_i) {
+          if (i <= 0 || i >= max_i) return;
+          bool isEvent = (horizon[i] != horizon[i-1]);
+          if (isEvent) {
+              events.insert(i);
+          } else {
+              events.erase(i);
+          }
+      }
+
       //updates the horizons according to the chosen position
       void placePoly(RasterizedOutline2& poly, Point2i pos, int rast_i) {
 
@@ -640,6 +670,13 @@ public:
 
           }
 
+          int x_start_b = pos.X();
+          int w = poly.gridWidth(rast_i);
+          for (int x = x_start_b; x <= x_start_b + w; ++x) {
+              updateEvents(mBottomEvents, mBottomHorizon, x, mSize.X());
+          }
+
+
           //update left horizon
           for (int i = 0; i < poly.gridHeight(rast_i); i++) {
               int tmpHor = pos.X() + left[i] + deltaX[i];
@@ -672,6 +709,12 @@ public:
                       mInnerLeftExtent[pos.Y() + i] = 0;
                   }
               }
+          }
+
+          int y_start_l = pos.Y();
+          int h = poly.gridHeight(rast_i);
+          for (int y = y_start_l; y <= y_start_l + h; ++y) {
+              updateEvents(mLeftEvents, mLeftHorizon, y, mSize.Y());
           }
       }
   };
@@ -971,49 +1014,92 @@ public:
                     int maxCol = gridSizes[grid_i].X() - polyVec[i].gridWidth(rast_i);
                     int maxRow = gridSizes[grid_i].Y() - polyVec[i].gridHeight(rast_i);
 
+                    const int PARALLEL_THRESHOLD = 512;
+
                     // --- Search by dropping from top ---
-                    if (maxCol > 0) {
+                    if (maxCol >= 0) {
                         PlacementResult bestResultForDropY;
-                        #pragma omp parallel
-                        {
-                            PlacementResult bestThreadResult;
-                            #pragma omp for schedule(dynamic)
-                            for (int col = 0; col < maxCol; col++) {
-                                int currPolyY;
-                                // Check primary horizon
-                                currPolyY = packingFields[grid_i].dropY(polyVec[i],col, rast_i);
+                        auto evaluate_drop_y = [&](int col, PlacementResult& bestResult) {
+                            int currPolyY;
+                            // Check primary horizon
+                            currPolyY = packingFields[grid_i].dropY(polyVec[i],col, rast_i);
+                            if (currPolyY != INVALID_POSITION) {
+                                int currCost = packingFields[grid_i].getCostY(polyVec[i], Point2i(col, currPolyY), rast_i);
+                                if (packingPar.doubleHorizon && (packingPar.minmax == true))
+                                    currCost += packingFields[grid_i].getCostX(polyVec[i], Point2i(col, currPolyY), rast_i);
+                                if (currCost < bestResult.cost) {
+                                    bestResult.container = grid_i; bestResult.cost = currCost;
+                                    bestResult.rastIndex = rast_i; bestResult.polyX = col;
+                                    bestResult.polyY = currPolyY; bestResult.placedUsingSecondaryHorizon = false;
+                                }
+                            }
+                            // Check inner horizon
+                            if (packingPar.innerHorizon) {
+                                currPolyY = packingFields[grid_i].dropYInner(polyVec[i],col, rast_i);
                                 if (currPolyY != INVALID_POSITION) {
                                     int currCost = packingFields[grid_i].getCostY(polyVec[i], Point2i(col, currPolyY), rast_i);
                                     if (packingPar.doubleHorizon && (packingPar.minmax == true))
                                         currCost += packingFields[grid_i].getCostX(polyVec[i], Point2i(col, currPolyY), rast_i);
-                                    if (currCost < bestThreadResult.cost) {
-                                        bestThreadResult.container = grid_i; bestThreadResult.cost = currCost;
-                                        bestThreadResult.rastIndex = rast_i; bestThreadResult.polyX = col;
-                                        bestThreadResult.polyY = currPolyY; bestThreadResult.placedUsingSecondaryHorizon = false;
-                                    }
-                                }
-                                // Check inner horizon
-                                if (packingPar.innerHorizon) {
-                                    currPolyY = packingFields[grid_i].dropYInner(polyVec[i],col, rast_i);
-                                    if (currPolyY != INVALID_POSITION) {
-                                        int currCost = packingFields[grid_i].getCostY(polyVec[i], Point2i(col, currPolyY), rast_i);
-                                        if (packingPar.doubleHorizon && (packingPar.minmax == true))
-                                            currCost += packingFields[grid_i].getCostX(polyVec[i], Point2i(col, currPolyY), rast_i);
-                                        if (currCost < bestThreadResult.cost) {
-                                            bestThreadResult.container = grid_i; bestThreadResult.cost = currCost;
-                                            bestThreadResult.rastIndex = rast_i; bestThreadResult.polyX = col;
-                                            bestThreadResult.polyY = currPolyY; bestThreadResult.placedUsingSecondaryHorizon = true;
-                                        }
+                                    if (currCost < bestResult.cost) {
+                                        bestResult.container = grid_i; bestResult.cost = currCost;
+                                        bestResult.rastIndex = rast_i; bestResult.polyX = col;
+                                        bestResult.polyY = currPolyY; bestResult.placedUsingSecondaryHorizon = true;
                                     }
                                 }
                             }
-                            #pragma omp critical
-                            {
-                                if(bestThreadResult.cost < bestResultForDropY.cost) {
-                                    bestResultForDropY = bestThreadResult;
-                                }
+                        };
+
+                        std::set<int> candidateColsSet;
+                        candidateColsSet.insert(0);
+                        if (maxCol >= 0) candidateColsSet.insert(maxCol);
+
+                        const auto& events = packingFields[grid_i].bottomEvents();
+                        int poly_w = polyVec[i].gridWidth(rast_i);
+                        for (int e : events) {
+                            candidateColsSet.insert(e);
+                            candidateColsSet.insert(e - 1);
+                            candidateColsSet.insert(e + 1);
+                            candidateColsSet.insert(e - poly_w);
+                            candidateColsSet.insert(e - poly_w + 1);
+                            candidateColsSet.insert(e - poly_w - 1);
+                        }
+
+                        if ((int)candidateColsSet.size() < 32 && maxCol > 0) {
+                             int step = std::max(1, maxCol / 32);
+                             for (int col = 0; col <= maxCol; col += step) {
+                                candidateColsSet.insert(col);
                             }
                         }
+
+                        std::vector<int> candidateCols;
+                        candidateCols.reserve(candidateColsSet.size());
+                        for (int col : candidateColsSet) {
+                            if (col >= 0 && col <= maxCol) {
+                                candidateCols.push_back(col);
+                            }
+                        }
+
+                        if ((int)candidateCols.size() > PARALLEL_THRESHOLD) {
+                            #pragma omp parallel
+                            {
+                                PlacementResult bestThreadResult;
+                                #pragma omp for schedule(dynamic, 64)
+                                for (size_t k = 0; k < candidateCols.size(); ++k) {
+                                    evaluate_drop_y(candidateCols[k], bestThreadResult);
+                                }
+                                #pragma omp critical
+                                {
+                                    if(bestThreadResult.cost < bestResultForDropY.cost) {
+                                        bestResultForDropY = bestThreadResult;
+                                    }
+                                }
+                            }
+                        } else {
+                            for (int col : candidateCols) {
+                                evaluate_drop_y(col, bestResultForDropY);
+                            }
+                        }
+
                         if (bestResultForDropY.cost < bestOverallResult.cost) {
                             bestOverallResult = bestResultForDropY;
                         }
@@ -1023,48 +1109,89 @@ public:
                         continue;
                     
                     // --- Search by dropping from left ---
-                    if (maxRow > 0) {
+                    if (maxRow >= 0) {
                         PlacementResult bestResultForDropX;
-                        #pragma omp parallel
-                        {
-                            PlacementResult bestThreadResult;
-                            #pragma omp for schedule(dynamic)
-                            for (int row = 0; row < maxRow; row++) {
-                                int currPolyX;
-                                // Check primary horizon
-                                currPolyX = packingFields[grid_i].dropX(polyVec[i],row, rast_i);
+                        auto evaluate_drop_x = [&](int row, PlacementResult& bestResult) {
+                            int currPolyX;
+                            // Check primary horizon
+                            currPolyX = packingFields[grid_i].dropX(polyVec[i],row, rast_i);
+                            if (currPolyX != INVALID_POSITION) {
+                                int currCost = packingFields[grid_i].getCostX(polyVec[i], Point2i(currPolyX, row), rast_i);
+                                if (packingPar.doubleHorizon && (packingPar.minmax == true))
+                                    currCost += packingFields[grid_i].getCostY(polyVec[i], Point2i(currPolyX, row), rast_i);
+                                if (currCost < bestResult.cost) {
+                                    bestResult.container = grid_i; bestResult.cost = currCost;
+                                    bestResult.rastIndex = rast_i; bestResult.polyX = currPolyX;
+                                    bestResult.polyY = row; bestResult.placedUsingSecondaryHorizon = false;
+                                }
+                            }
+                            // Check inner horizon
+                            if (packingPar.innerHorizon) {
+                                currPolyX = packingFields[grid_i].dropXInner(polyVec[i],row, rast_i);
                                 if (currPolyX != INVALID_POSITION) {
                                     int currCost = packingFields[grid_i].getCostX(polyVec[i], Point2i(currPolyX, row), rast_i);
                                     if (packingPar.doubleHorizon && (packingPar.minmax == true))
                                         currCost += packingFields[grid_i].getCostY(polyVec[i], Point2i(currPolyX, row), rast_i);
-                                    if (currCost < bestThreadResult.cost) {
-                                        bestThreadResult.container = grid_i; bestThreadResult.cost = currCost;
-                                        bestThreadResult.rastIndex = rast_i; bestThreadResult.polyX = currPolyX;
-                                        bestThreadResult.polyY = row; bestThreadResult.placedUsingSecondaryHorizon = false;
-                                    }
-                                }
-                                // Check inner horizon
-                                if (packingPar.innerHorizon) {
-                                    currPolyX = packingFields[grid_i].dropXInner(polyVec[i],row, rast_i);
-                                    if (currPolyX != INVALID_POSITION) {
-                                        int currCost = packingFields[grid_i].getCostX(polyVec[i], Point2i(currPolyX, row), rast_i);
-                                        if (packingPar.doubleHorizon && (packingPar.minmax == true))
-                                            currCost += packingFields[grid_i].getCostY(polyVec[i], Point2i(currPolyX, row), rast_i);
-                                        if (currCost < bestThreadResult.cost) {
-                                            bestThreadResult.container = grid_i; bestThreadResult.cost = currCost;
-                                            bestThreadResult.rastIndex = rast_i; bestThreadResult.polyX = currPolyX;
-                                            bestThreadResult.polyY = row; bestThreadResult.placedUsingSecondaryHorizon = true;
-                                        }
+                                    if (currCost < bestResult.cost) {
+                                        bestResult.container = grid_i; bestResult.cost = currCost;
+                                        bestResult.rastIndex = rast_i; bestResult.polyX = currPolyX;
+                                        bestResult.polyY = row; bestResult.placedUsingSecondaryHorizon = true;
                                     }
                                 }
                             }
-                            #pragma omp critical
-                            {
-                                if(bestThreadResult.cost < bestResultForDropX.cost) {
-                                    bestResultForDropX = bestThreadResult;
-                                }
+                        };
+
+                        std::set<int> candidateRowsSet;
+                        candidateRowsSet.insert(0);
+                        if (maxRow >= 0) candidateRowsSet.insert(maxRow);
+
+                        const auto& events = packingFields[grid_i].leftEvents();
+                        int poly_h = polyVec[i].gridHeight(rast_i);
+                        for (int e : events) {
+                            candidateRowsSet.insert(e);
+                            candidateRowsSet.insert(e - 1);
+                            candidateRowsSet.insert(e + 1);
+                            candidateRowsSet.insert(e - poly_h);
+                            candidateRowsSet.insert(e - poly_h + 1);
+                            candidateRowsSet.insert(e - poly_h - 1);
+                        }
+
+                        if ((int)candidateRowsSet.size() < 32 && maxRow > 0) {
+                             int step = std::max(1, maxRow / 32);
+                             for (int row = 0; row <= maxRow; row += step) {
+                                candidateRowsSet.insert(row);
                             }
                         }
+
+                        std::vector<int> candidateRows;
+                        candidateRows.reserve(candidateRowsSet.size());
+                        for (int row : candidateRowsSet) {
+                            if (row >= 0 && row <= maxRow) {
+                                candidateRows.push_back(row);
+                            }
+                        }
+
+                        if ((int)candidateRows.size() > PARALLEL_THRESHOLD) {
+                            #pragma omp parallel
+                            {
+                                PlacementResult bestThreadResult;
+                                #pragma omp for schedule(dynamic, 64)
+                                for (size_t k = 0; k < candidateRows.size(); ++k) {
+                                    evaluate_drop_x(candidateRows[k], bestThreadResult);
+                                }
+                                #pragma omp critical
+                                {
+                                    if(bestThreadResult.cost < bestResultForDropX.cost) {
+                                        bestResultForDropX = bestThreadResult;
+                                    }
+                                }
+                            }
+                        } else {
+                            for (int row : candidateRows) {
+                                evaluate_drop_x(row, bestResultForDropX);
+                            }
+                        }
+
                         if (bestResultForDropX.cost < bestOverallResult.cost) {
                             bestOverallResult = bestResultForDropX;
                         }

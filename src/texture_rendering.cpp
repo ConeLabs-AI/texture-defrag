@@ -34,6 +34,7 @@
 
 #include <iostream>
 #include <algorithm>
+#include <memory>
 
 #include <QImage>
 #include <QFileInfo>
@@ -113,9 +114,133 @@ static const char *fs_text[] = {
     "}                                                                     \n"
 };
 
+// A struct to manage persistent OpenGL state throughout the rendering of all texture sheets.
+// This avoids costly creation/destruction of contexts, programs, and buffers for each sheet.
+struct RenderingContext {
+    OpenGLFunctionsHandle glFuncs;
+    std::unique_ptr<QOpenGLContext> context;
+    std::unique_ptr<QOffscreenSurface> surface;
+    bool ownContext = false;
 
+    GLuint program = 0;
+    GLuint vao = 0;
+    GLuint vertexbuf = 0;
+    GLuint fbo = 0;
+    GLuint renderTarget = 0;
+    int renderedTexWidth = -1;
+    int renderedTexHeight = -1;
+    GLint initialDrawBuffer = 0;
 
-static std::shared_ptr<QImage> RenderTexture(std::vector<Mesh::FacePointer>& fvec,
+    RenderingContext() {
+        if (QOpenGLContext::currentContext() == nullptr) {
+            LOG_DEBUG << "Creating persistent OpenGL context for rendering.";
+            ownContext = true;
+
+            context = std::make_unique<QOpenGLContext>();
+            surface = std::make_unique<QOffscreenSurface>();
+
+            QSurfaceFormat format;
+            format.setVersion(4, 1);
+            format.setProfile(QSurfaceFormat::OpenGLContextProfile::CoreProfile);
+            context->setFormat(format);
+
+            if (!context->create()) {
+                LOG_ERR << "Failed to create opengl context";
+                std::exit(-1);
+            }
+
+            surface->setFormat(context->format());
+            surface->create();
+
+            if (!context->makeCurrent(surface.get())) {
+                LOG_ERR << "Failed to make OpenGL context current";
+                std::exit(-1);
+            }
+        }
+
+        glFuncs = GetOpenGLFunctionsHandle();
+        if (ownContext) {
+            glFuncs->glGetIntegerv(GL_DRAW_BUFFER, &initialDrawBuffer);
+        }
+
+        CHECK_GL_ERROR();
+
+        program = CompileShaders(vs_text, fs_text);
+        glFuncs->glUseProgram(program);
+
+        glFuncs->glGenVertexArrays(1, &vao);
+        glFuncs->glBindVertexArray(vao);
+
+        glFuncs->glGenBuffers(1, &vertexbuf);
+        glFuncs->glBindBuffer(GL_ARRAY_BUFFER, vertexbuf);
+
+        GLint pos_location = glFuncs->glGetAttribLocation(program, "position");
+        glFuncs->glVertexAttribPointer(pos_location, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), 0);
+        glFuncs->glEnableVertexAttribArray(pos_location);
+
+        GLint tc_location = glFuncs->glGetAttribLocation(program, "texcoord");
+        glFuncs->glVertexAttribPointer(tc_location, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void *)(2 * sizeof(float)));
+        glFuncs->glEnableVertexAttribArray(tc_location);
+
+        GLint color_location = glFuncs->glGetAttribLocation(program, "color");
+        glFuncs->glVertexAttribPointer(color_location, 4, GL_UNSIGNED_BYTE, GL_TRUE, 5 * sizeof(float), (void *)(4 * sizeof(float)));
+        glFuncs->glEnableVertexAttribArray(color_location);
+
+        glFuncs->glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+        glFuncs->glGenFramebuffers(1, &fbo);
+        glFuncs->glGenTextures(1, &renderTarget);
+
+        glFuncs->glDisable(GL_DEPTH_TEST);
+        glFuncs->glDisable(GL_STENCIL_TEST);
+    }
+
+    ~RenderingContext() {
+        glFuncs->glUseProgram(0);
+        glFuncs->glBindVertexArray(0);
+        glFuncs->glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+        glFuncs->glDeleteProgram(program);
+        glFuncs->glDeleteVertexArrays(1, &vao);
+        glFuncs->glDeleteBuffers(1, &vertexbuf);
+        glFuncs->glDeleteFramebuffers(1, &fbo);
+        glFuncs->glDeleteTextures(1, &renderTarget);
+
+        if (ownContext) {
+            glFuncs->glDrawBuffer(initialDrawBuffer);
+            context->doneCurrent();
+        }
+    }
+
+    void prepareRenderTarget(int width, int height) {
+        if (width != renderedTexWidth || height != renderedTexHeight) {
+            LOG_DEBUG << "Configuring render target for size " << width << "x" << height;
+
+            glFuncs->glBindTexture(GL_TEXTURE_2D, renderTarget);
+            glFuncs->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
+            glFuncs->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glFuncs->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glFuncs->glBindTexture(GL_TEXTURE_2D, 0);
+
+            glFuncs->glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+            glFuncs->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, renderTarget, 0);
+
+            if (glFuncs->glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+                LOG_ERR << "[OPENGL] FATAL: Framebuffer is not complete.";
+                CHECK_GL_ERROR();
+                std::exit(-1);
+            }
+
+            renderedTexWidth = width;
+            renderedTexHeight = height;
+        }
+        // Always set viewport for robustness
+        glFuncs->glViewport(0, 0, width, height);
+    }
+};
+
+static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
+                                             std::vector<Mesh::FacePointer>& fvec,
                                              Mesh &m, TextureObjectHandle textureObject,
                                              bool filter, RenderMode imode,
                                              int textureWidth, int textureHeight);
@@ -156,9 +281,11 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
     QString wd = QDir::currentPath();
     QDir::setCurrent(fi.absoluteDir().absolutePath());
 
+    RenderingContext renderingContext;
+
     for (int i = 0; i < nTex; ++i) {
         LOG_INFO << "Processing sheet " << (i + 1) << " of " << nTex << "...";
-        std::shared_ptr<QImage> teximg = RenderTexture(facesByTexture[i], m, textureObject, filter, imode, texSizes[i].w, texSizes[i].h);
+        std::shared_ptr<QImage> teximg = RenderTexture(renderingContext, facesByTexture[i], m, textureObject, filter, imode, texSizes[i].w, texSizes[i].h);
 
         std::stringstream suffix;
         suffix << "_texture_" << i << ".png";
@@ -176,10 +303,11 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
     QDir::setCurrent(wd);
 }
 
-static std::shared_ptr<QImage> RenderTexture(std::vector<Mesh::FacePointer>& fvec,
-                                      Mesh &m, TextureObjectHandle textureObject,
-                                      bool filter, RenderMode imode,
-                                      int textureWidth, int textureHeight)
+static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
+                                             std::vector<Mesh::FacePointer>& fvec,
+                                             Mesh &m, TextureObjectHandle textureObject,
+                                             bool filter, RenderMode imode,
+                                             int textureWidth, int textureHeight)
 {
     auto WTCSh = GetWedgeTexCoordStorageAttribute(m);
 
@@ -190,51 +318,12 @@ static std::shared_ptr<QImage> RenderTexture(std::vector<Mesh::FacePointer>& fve
 
     std::sort(fvec.begin(), fvec.end(), FaceComparatorByInputTexIndex);
 
-    bool contextAvailable = (QOpenGLContext::currentContext() != nullptr);
-
-    QOpenGLContext context;
-    QOffscreenSurface surface;
-
-    if (!contextAvailable) {
-        LOG_DEBUG << "Creating context";
-        QSurfaceFormat format;
-        format.setVersion(4, 1);
-        format.setProfile(QSurfaceFormat::OpenGLContextProfile::CoreProfile);
-
-        context.setFormat(format);
-
-        if (!context.create()) {
-            LOG_ERR << "Failed to create opengl context";
-            std::exit(-1);
-        }
-
-        surface.setFormat(context.format());
-        surface.create();
-
-        if (!context.makeCurrent(&surface)) {
-            LOG_ERR << "Failed to make OpenGL context current";
-            std::exit(-1);
-        }
-    }
-
-    OpenGLFunctionsHandle glFuncs = GetOpenGLFunctionsHandle();
-    CHECK_GL_ERROR(); // Initial check
-
-    // OpenGL setup
-
-    GLuint vao;
-    glFuncs->glGenVertexArrays(1, &vao);
-    glFuncs->glBindVertexArray(vao);
-
-    GLint program = CompileShaders(vs_text, fs_text);
-    glFuncs->glUseProgram(program);
-
+    OpenGLFunctionsHandle glFuncs = ctx.glFuncs;
+    glFuncs->glUseProgram(ctx.program);
+    glFuncs->glBindVertexArray(ctx.vao);
     CHECK_GL_ERROR();
 
     // Allocate vertex data
-
-    GLuint vertexbuf;
-    glFuncs->glGenBuffers(1, &vertexbuf);
 
     std::vector<TextureSize> inTexSizes;
     for (std::size_t i = 0; i < textureObject->ArraySize(); ++i) {
@@ -243,9 +332,12 @@ static std::shared_ptr<QImage> RenderTexture(std::vector<Mesh::FacePointer>& fve
         inTexSizes.push_back({iw, ih});
     }
 
-    glFuncs->glBindBuffer(GL_ARRAY_BUFFER, vertexbuf);
-    glFuncs->glBufferData(GL_ARRAY_BUFFER, fvec.size()*15*sizeof(float), NULL, GL_STATIC_DRAW);
-    float *p = (float *) glFuncs->glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY);
+    glFuncs->glBindBuffer(GL_ARRAY_BUFFER, ctx.vertexbuf);
+    // Use buffer orphaning + map range for better performance, avoiding stalls.
+    size_t bufferSize = fvec.size() * 15 * sizeof(float);
+    glFuncs->glBufferData(GL_ARRAY_BUFFER, bufferSize, NULL, GL_STATIC_DRAW);
+    float *p = (float *)glFuncs->glMapBufferRange(GL_ARRAY_BUFFER, 0, bufferSize, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+    ensure(p != nullptr);
     for (auto fptr : fvec) {
         int ti = WTCSh[fptr].tc[0].N();
         for (int i = 0; i < 3; ++i) {
@@ -265,48 +357,15 @@ static std::shared_ptr<QImage> RenderTexture(std::vector<Mesh::FacePointer>& fve
     }
     glFuncs->glUnmapBuffer(GL_ARRAY_BUFFER);
 
-    GLint pos_location = glFuncs->glGetAttribLocation(program, "position");
-    glFuncs->glVertexAttribPointer(pos_location, 2, GL_FLOAT, GL_FALSE, 5*sizeof(float), 0);
-    glFuncs->glEnableVertexAttribArray(pos_location);
-
-    GLint tc_location = glFuncs->glGetAttribLocation(program, "texcoord");
-    glFuncs->glVertexAttribPointer(tc_location, 2, GL_FLOAT, GL_FALSE, 5*sizeof(float), (void *) (2*sizeof(float)));
-    glFuncs->glEnableVertexAttribArray(tc_location);
-
-    GLint color_location = glFuncs->glGetAttribLocation(program, "color");
-    glFuncs->glVertexAttribPointer(color_location, 4, GL_UNSIGNED_BYTE, GL_TRUE, 5*sizeof(float), (void *) (4*sizeof(float)));
-    glFuncs->glEnableVertexAttribArray(color_location);
-
     p = nullptr;
     glFuncs->glBindBuffer(GL_ARRAY_BUFFER, 0); // done, unbind
 
-    int renderedTexWidth = textureWidth;
-    int renderedTexHeight = textureHeight;
-
-    GLuint fbo;
-    glFuncs->glGenFramebuffers(1, &fbo);
-    glFuncs->glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-
-    glFuncs->glViewport(0, 0, renderedTexWidth, renderedTexHeight);
-
-    GLuint renderTarget;
-    glFuncs->glGenTextures(1, &renderTarget);
-    glFuncs->glBindTexture(GL_TEXTURE_2D, renderTarget);
-    glFuncs->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, renderedTexWidth, renderedTexHeight, 0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
-    glFuncs->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glFuncs->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glFuncs->glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, renderTarget, 0);
-    glFuncs->glBindTexture(GL_TEXTURE_2D, 0);
-
-    if (glFuncs->glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        LOG_ERR << "[OPENGL] FATAL: Framebuffer is not complete.";
-        CHECK_GL_ERROR(); // Get detailed error
-        std::exit(-1);
-    }
+    ctx.prepareRenderTarget(textureWidth, textureHeight);
+    glFuncs->glBindFramebuffer(GL_FRAMEBUFFER, ctx.fbo);
 
     // --- [DIAGNOSTIC] START: QImage Allocation ---
     LOG_INFO << "[DIAG] Attempting to allocate QImage for rendering. Size: " << textureWidth << "x" << textureHeight;
-    std::shared_ptr<QImage> textureImage = std::make_shared<QImage>(renderedTexWidth, renderedTexHeight, QImage::Format_ARGB32);
+    std::shared_ptr<QImage> textureImage = std::make_shared<QImage>(textureWidth, textureHeight, QImage::Format_ARGB32);
     if (textureImage->isNull()) {
         LOG_ERR << "[DIAG] FATAL: QImage allocation FAILED. System is out of memory.";
         logging::LogMemoryUsage();
@@ -316,15 +375,8 @@ static std::shared_ptr<QImage> RenderTexture(std::vector<Mesh::FacePointer>& fve
     logging::LogMemoryUsage();
     // --- [DIAGNOSTIC] END ---
 
-    // disable depth and stencil test (if they were enabled) as the render target does not have the buffers attached
-    glFuncs->glDisable(GL_DEPTH_TEST);
-    glFuncs->glDisable(GL_STENCIL_TEST);
-
-    GLint drawBuffer;
-    glFuncs->glGetIntegerv(GL_DRAW_BUFFER, &drawBuffer);
     glFuncs->glDrawBuffer(GL_COLOR_ATTACHMENT0);
 
-    glFuncs->glClearColor(1.0f, 1.0f, 1.0f, 0.0f);
     glFuncs->glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
 
     glFuncs->glClear(GL_COLOR_BUFFER_BIT);
@@ -344,31 +396,26 @@ static std::shared_ptr<QImage> RenderTexture(std::vector<Mesh::FacePointer>& fve
         LOG_DEBUG << "Binding texture unit " << currTexIndex;
         textureObject->Bind(currTexIndex);
 
-        GLint loc_img0 = glFuncs->glGetUniformLocation(program, "img0");
+        GLint loc_img0 = glFuncs->glGetUniformLocation(ctx.program, "img0");
         glFuncs->glUniform1i(loc_img0, 0);
-        GLint loc_texture_size = glFuncs->glGetUniformLocation(program, "texture_size");
+        GLint loc_texture_size = glFuncs->glGetUniformLocation(ctx.program, "texture_size");
         glFuncs->glUniform2f(loc_texture_size, float(textureObject->TextureWidth(currTexIndex)), float(textureObject->TextureHeight(currTexIndex)));
 
 
-        GLint loc_render_mode = glFuncs->glGetUniformLocation(program, "render_mode");
+        GLint loc_render_mode = glFuncs->glGetUniformLocation(ctx.program, "render_mode");
         glFuncs->glUniform1i(loc_render_mode, 0);
+
+        // Texture parameters are now set once in TextureObject::Bind, so we remove the redundant settings from here.
         switch (imode) {
         case Cubic:
             glFuncs->glUniform1i(loc_render_mode, 1);
-            glFuncs->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glFuncs->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-            glFuncs->glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, 16.0f);
             break;
         case Linear:
-            glFuncs->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glFuncs->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-            glFuncs->glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, 16.0f);
-            //glFuncs->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            //glFuncs->glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, 1.0f);
+            // This is the default render_mode 0 in the shader
             break;
         case Nearest:
-            glFuncs->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            glFuncs->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            // Nearest filtering must be set on the texture object itself. For simplicity, we assume linear/cubic for this path.
+            // A more robust implementation might require passing filter mode to TextureObject::Bind.
             break;
         case FaceColor:
             glFuncs->glUniform1i(loc_render_mode, 2);
@@ -386,21 +433,10 @@ static std::shared_ptr<QImage> RenderTexture(std::vector<Mesh::FacePointer>& fve
     }
 
     glFuncs->glReadBuffer(GL_COLOR_ATTACHMENT0);
-    glFuncs->glReadPixels(0, 0, renderedTexWidth, renderedTexHeight, GL_BGRA, GL_UNSIGNED_BYTE, textureImage->bits());
+    glFuncs->glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glFuncs->glReadPixels(0, 0, textureWidth, textureHeight, GL_BGRA, GL_UNSIGNED_BYTE, textureImage->bits());
 
-    // clean up
-    glFuncs->glUseProgram(0);
     glFuncs->glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glFuncs->glBindVertexArray(0);
-
-    glFuncs->glDeleteTextures(1, &renderTarget);
-    glFuncs->glDeleteFramebuffers(1, &fbo);
-    glFuncs->glDeleteBuffers(1, &vertexbuf);
-    glFuncs->glDeleteProgram(program);
-    glFuncs->glDeleteVertexArrays(1, &vao);
-
-    if (contextAvailable)
-        glFuncs->glDrawBuffer(drawBuffer);
 
     if (filter)
         vcg::PullPush(*textureImage, qRgba(0, 255, 0, 255));

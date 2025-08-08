@@ -25,6 +25,11 @@
 #include "gl_utils.h"
 
 #include <cmath>
+#include <algorithm>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include <QImageReader>
 #include <QImage>
@@ -69,17 +74,18 @@ void TextureObject::Bind(int i)
 
         Mirror(img);
         glFuncs->glBindTexture(GL_TEXTURE_2D, texNameVec[i]);
-        int miplevels = std::log2((float) img.width());
-        int width = img.width();
-        int height = img.height();
-        for (int m = 0; m < miplevels; m++) {
-            glFuncs->glTexImage2D(GL_TEXTURE_2D, m, GL_RGBA8, width, height, 0, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
-            width = std::max(1, (width / 2));
-            height = std::max(1, (height / 2));
-        }
-        //glFuncs->glTexStorage2D(GL_TEXTURE_2D, miplevels, GL_RGBA8, img.width(), img.height());
-        glFuncs->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, img.width(), img.height(), GL_BGRA, GL_UNSIGNED_BYTE, img.constBits());
+        glFuncs->glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+
+        glFuncs->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, img.width(), img.height(), 0, GL_BGRA, GL_UNSIGNED_BYTE, img.constBits());
         glFuncs->glGenerateMipmap(GL_TEXTURE_2D);
+
+        glFuncs->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glFuncs->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        if (QOpenGLContext::currentContext()->hasExtension("GL_EXT_texture_filter_anisotropic")) {
+            GLfloat maxAniso = 0.0f;
+            glFuncs->glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &maxAniso);
+            glFuncs->glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, std::min(16.0f, maxAniso));
+        }
         CHECK_GL_ERROR();
     }
     else {
@@ -168,13 +174,15 @@ std::vector<std::pair<double, double>> TextureObject::ComputeRelativeSizes()
 
 void Mirror(QImage& img)
 {
-    int i = 0;
-    while (i < (img.height() / 2)) {
+    const int height = img.height();
+    const int width = img.width();
+
+#ifdef _OPENMP
+    #pragma omp parallel for
+#endif
+    for (int i = 0; i < height / 2; ++i) {
         QRgb *line0 = (QRgb *) img.scanLine(i);
-        QRgb *line1 = (QRgb *) img.scanLine(img.height() - 1 - i);
-        i++;
-        for (int j = 0; j < img.width(); ++j)
-            std::swap(line0[j], line1[j]);
+        QRgb *line1 = (QRgb *) img.scanLine(height - 1 - i);
+        std::swap_ranges(line0, line0 + width, line1);
     }
 }
-

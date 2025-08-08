@@ -1,6 +1,9 @@
 #ifndef QTPOLYRASTERIZER_H
 #define QTPOLYRASTERIZER_H
 
+#include <cstdint>
+#include <vector>
+
 #include <QImage>
 //#include <QSvgGenerator>
 #include <QPainter>
@@ -18,6 +21,6 @@ public:
                           float scaleFactor,
                           int rast_i, int rotationNum, int gutterWidth);
 
-    static std::vector<std::vector<int> > rotateGridCWise(std::vector< std::vector<int> >& inGrid);
+    static std::vector<std::vector<uint8_t> > rotateGridCWise(std::vector< std::vector<uint8_t> >& inGrid);
 };
 #endif // QTPOLYRASTERIZER_H

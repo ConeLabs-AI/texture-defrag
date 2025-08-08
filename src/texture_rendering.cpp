@@ -136,8 +136,8 @@ struct RenderingContext {
             LOG_DEBUG << "Creating persistent OpenGL context for rendering.";
             ownContext = true;
 
-            context = std::make_unique<QOpenGLContext>();
-            surface = std::make_unique<QOffscreenSurface>();
+            context.reset(new QOpenGLContext());
+            surface.reset(new QOffscreenSurface());
 
             QSurfaceFormat format;
             format.setVersion(4, 1);

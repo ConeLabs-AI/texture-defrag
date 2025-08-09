@@ -27,6 +27,12 @@
 #include "mesh_attribute.h"
 
 #include <vcg/complex/algorithms/outline_support.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#include <cstdint>
+#include <set>
+#include <chrono>
 #include <vcg/space/rasterized_outline2_packer.h>
 #include <wrap/qt/outline2_rasterizer.h>
 // #include <wrap/qt/Outline2ToQImage.h>
@@ -185,6 +191,13 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             LOG_INFO << "Packing " << outlines_iter.size() << " charts into grid of size " << containerVec[nc].X() << " " << containerVec[nc].Y() << " (Attempt " << packAttempts << ")";
             n = RasterizationBasedPacker::PackBestEffortAtScale(outlines_iter, {containerVec[nc]}, transforms, polyToContainer, packingParams, packingScale);
             LOG_INFO << "[DIAG] Packing attempt finished. Charts packed: " << n << ".";
+            const auto& prof = RasterizationBasedPacker::LastProfile();
+            LOG_INFO << "[PACK-PROF] polys=" << prof.polys_considered
+                     << " placed=" << prof.placed_count << " not_placed=" << prof.not_placed_count
+                     << " rasterize=" << prof.rasterize_s << "s (" << prof.rasterize_calls << " calls)"
+                     << " candY(b/e)=" << prof.candidateY_build_s << "/" << prof.evaluate_drop_y_s << "s cols=" << prof.candidateY_cols_evaluated
+                     << " candX(b/e)=" << prof.candidateX_build_s << "/" << prof.evaluate_drop_x_s << "s rows=" << prof.candidateX_rows_evaluated
+                     << " place=" << prof.place_s << "s trans=" << prof.transform_s << "s total=" << prof.total_s << "s";
             if (n == 0) {
                 LOG_WARN << "[DIAG] Failed to pack any of the " << outlines_iter.size() << " charts in this batch.";
                 containerVec[nc].X() *= 1.1;

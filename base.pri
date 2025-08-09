@@ -19,6 +19,7 @@ INCLUDEPATH += $$PWD/src $$VCGPATH $$VCGPATH/eigenlib
 unix|mingw-g++ {
     # For GCC and Clang on Unix-like systems (including MinGW-g++)
     QMAKE_CXXFLAGS += -fopenmp
+    QMAKE_CXXFLAGS += -march=native
     LIBS += -fopenmp
     QMAKE_CXXFLAGS_RELEASE -= -O
     QMAKE_CXXFLAGS_RELEASE -= -O1

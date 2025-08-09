@@ -266,6 +266,16 @@ class RasterizedOutline2Packer
 
 public:
 
+    struct ProfileData {
+        double rasterize_s = 0, candidateY_build_s = 0, evaluate_drop_y_s = 0;
+        double candidateX_build_s = 0, evaluate_drop_x_s = 0;
+        double place_s = 0, transform_s = 0, total_s = 0;
+        int polys_considered = 0, placed_count = 0, not_placed_count = 0;
+        int rasterize_calls = 0;
+        int64_t candidateY_cols_evaluated = 0;
+        int64_t candidateX_rows_evaluated = 0;
+    };
+
   class Parameters
   {
   public:
@@ -974,8 +984,9 @@ public:
                             const std::vector<int>& perm,
                             bool bestEffort = false)
     {
-        using Clock = std::chrono::steady_clock;
-        auto total_start = Clock::now();
+        m_last_profile = ProfileData{}; // Reset profile data
+        auto total_start = std::chrono::high_resolution_clock::now();
+        m_last_profile.polys_considered = polyVec.size();
 
         int containerNum = containerSizes.size();
 
@@ -999,10 +1010,10 @@ public:
 
             int i = perm[currPoly];
 
-            lastProfile.polys_considered++;
+            m_last_profile.polys_considered++;
 
             // +++ Step 1: Just-In-Time Rasterization (Memory Safe) +++
-            auto t_r0 = Clock::now();
+            auto rast_start = std::chrono::high_resolution_clock::now();
             // Rasterize the multiple rotations for *only the current chart* in parallel.
             polyVec[i].resetState(packingPar.rotationNum);
             int num_base_rasterizations = (packingPar.rotationNum >= 4) ? packingPar.rotationNum/4 : packingPar.rotationNum;
@@ -1010,10 +1021,10 @@ public:
             for (int rast_i = 0; rast_i < num_base_rasterizations; rast_i++) {
                 //create the rasterization (i.e. fills bottom/top/grids/internalWastedCells arrays)
                 RASTERIZER_TYPE::rasterize(polyVec[i], scaleFactor, rast_i, packingPar.rotationNum, packingPar.gutterWidth);
+                m_last_profile.rasterize_calls++;
             }
-            auto t_r1 = Clock::now();
-            lastProfile.rasterize_s += std::chrono::duration<double>(t_r1 - t_r0).count();
-            lastProfile.rasterize_calls += num_base_rasterizations;
+            auto rast_end = std::chrono::high_resolution_clock::now();
+            m_last_profile.rasterize_s += std::chrono::duration<double>(rast_end - rast_start).count();
 
             // +++ Step 2: Parallel Placement Search +++
             PlacementResult bestOverallResult;
@@ -1031,6 +1042,7 @@ public:
                     // --- Search by dropping from top ---
                     if (maxCol >= 0) {
                         PlacementResult bestResultForDropY;
+                        auto candY_start = std::chrono::high_resolution_clock::now();
                         auto evaluate_drop_y = [&](int col, PlacementResult& bestResult) {
                             int currPolyY;
                             // Check primary horizon
@@ -1062,7 +1074,6 @@ public:
                         };
 
                         std::set<int> candidateColsSet;
-                        auto t_build_y0 = Clock::now();
                         candidateColsSet.insert(0);
                         if (maxCol >= 0) candidateColsSet.insert(maxCol);
 
@@ -1091,11 +1102,13 @@ public:
                                 candidateCols.push_back(col);
                             }
                         }
-                        auto t_build_y1 = Clock::now();
-                        lastProfile.candidateY_build_s += std::chrono::duration<double>(t_build_y1 - t_build_y0).count();
-                        lastProfile.candidateY_cols_evaluated += (long long)candidateCols.size();
 
-                        auto t_eval_y0 = Clock::now();
+                        auto candY_end = std::chrono::high_resolution_clock::now();
+                        m_last_profile.candidateY_build_s += std::chrono::duration<double>(candY_end - candY_start).count();
+
+                        auto evalY_start = std::chrono::high_resolution_clock::now();
+                        m_last_profile.candidateY_cols_evaluated += candidateCols.size();
+
                         if ((int)candidateCols.size() > PARALLEL_THRESHOLD) {
                             #pragma omp parallel
                             {
@@ -1116,8 +1129,8 @@ public:
                                 evaluate_drop_y(col, bestResultForDropY);
                             }
                         }
-                        auto t_eval_y1 = Clock::now();
-                        lastProfile.evaluate_drop_y_s += std::chrono::duration<double>(t_eval_y1 - t_eval_y0).count();
+                        auto evalY_end = std::chrono::high_resolution_clock::now();
+                        m_last_profile.evaluate_drop_y_s += std::chrono::duration<double>(evalY_end - evalY_start).count();
 
                         if (bestResultForDropY.cost < bestOverallResult.cost) {
                             bestOverallResult = bestResultForDropY;
@@ -1130,6 +1143,7 @@ public:
                     // --- Search by dropping from left ---
                     if (maxRow >= 0) {
                         PlacementResult bestResultForDropX;
+                        auto candX_start = std::chrono::high_resolution_clock::now();
                         auto evaluate_drop_x = [&](int row, PlacementResult& bestResult) {
                             int currPolyX;
                             // Check primary horizon
@@ -1161,7 +1175,6 @@ public:
                         };
 
                         std::set<int> candidateRowsSet;
-                        auto t_build_x0 = Clock::now();
                         candidateRowsSet.insert(0);
                         if (maxRow >= 0) candidateRowsSet.insert(maxRow);
 
@@ -1190,11 +1203,13 @@ public:
                                 candidateRows.push_back(row);
                             }
                         }
-                        auto t_build_x1 = Clock::now();
-                        lastProfile.candidateX_build_s += std::chrono::duration<double>(t_build_x1 - t_build_x0).count();
-                        lastProfile.candidateX_rows_evaluated += (long long)candidateRows.size();
 
-                        auto t_eval_x0 = Clock::now();
+                        auto candX_end = std::chrono::high_resolution_clock::now();
+                        m_last_profile.candidateX_build_s += std::chrono::duration<double>(candX_end - candX_start).count();
+
+                        auto evalX_start = std::chrono::high_resolution_clock::now();
+                        m_last_profile.candidateX_rows_evaluated += candidateRows.size();
+
                         if ((int)candidateRows.size() > PARALLEL_THRESHOLD) {
                             #pragma omp parallel
                             {
@@ -1215,8 +1230,8 @@ public:
                                 evaluate_drop_x(row, bestResultForDropX);
                             }
                         }
-                        auto t_eval_x1 = Clock::now();
-                        lastProfile.evaluate_drop_x_s += std::chrono::duration<double>(t_eval_x1 - t_eval_x0).count();
+                        auto evalX_end = std::chrono::high_resolution_clock::now();
+                        m_last_profile.evaluate_drop_x_s += std::chrono::duration<double>(evalX_end - evalX_start).count();
 
                         if (bestResultForDropX.cost < bestOverallResult.cost) {
                             bestOverallResult = bestResultForDropX;
@@ -1228,25 +1243,25 @@ public:
 
             // +++ Step 3: Sequential State Update +++
             if (bestOverallResult.rastIndex == -1) {
-                lastProfile.not_placed_count++;
+                m_last_profile.not_placed_count++;
                 if (bestEffort) {
                     polyToContainer[i] = -1;
                     trVec[i] = {};
                 } else {
-                    auto total_end = Clock::now();
-                    lastProfile.total_s = std::chrono::duration<double>(total_end - total_start).count();
+                    auto total_end = std::chrono::high_resolution_clock::now();
+                    m_last_profile.total_s = std::chrono::duration<double>(total_end - total_start).count();
                     return false;
                 }
             } else {
-                lastProfile.placed_count++;
+                m_last_profile.placed_count++;
                 // Place the polygon, which updates the horizons in the 'packingFields' object.
-                auto t_place0 = Clock::now();
+                auto place_start = std::chrono::high_resolution_clock::now();
                 packingFields[bestOverallResult.container].placePoly(polyVec[i], Point2i(bestOverallResult.polyX, bestOverallResult.polyY), bestOverallResult.rastIndex);
-                auto t_place1 = Clock::now();
-                lastProfile.place_s += std::chrono::duration<double>(t_place1 - t_place0).count();
+                auto place_end = std::chrono::high_resolution_clock::now();
+                m_last_profile.place_s += std::chrono::duration<double>(place_end - place_start).count();
 
                 // Create the final similarity transform for this chart.
-                auto t_trans0 = Clock::now();
+                auto trans_start = std::chrono::high_resolution_clock::now();
                 float angleRad = float(bestOverallResult.rastIndex)*(M_PI*2.0)/float(packingPar.rotationNum);
                 Box2f bb;
                 std::vector<Point2f> points = polyVec[i].getPoints();
@@ -1275,45 +1290,23 @@ public:
                                        imgHeight - topPolyYInImgCoords - scaledBBMinY + offsetY);
                 trVec[i].rotRad = angleRad;
                 trVec[i].sca = scaleFactor;
-                auto t_trans1 = Clock::now();
-                lastProfile.transform_s += std::chrono::duration<double>(t_trans1 - t_trans0).count();
+                auto trans_end = std::chrono::high_resolution_clock::now();
+                m_last_profile.transform_s += std::chrono::duration<double>(trans_end - trans_start).count();
             }
         }
 
-        auto total_end = Clock::now();
-        lastProfile.total_s = std::chrono::duration<double>(total_end - total_start).count();
+        auto total_end = std::chrono::high_resolution_clock::now();
+        m_last_profile.total_s = std::chrono::duration<double>(total_end - total_start).count();
         return true;
     }
 
-    struct ProfileStats {
-        double total_s = 0.0;
-        double rasterize_s = 0.0;
-        long long rasterize_calls = 0;
-
-        double candidateY_build_s = 0.0;
-        long long candidateY_cols_evaluated = 0;
-        double evaluate_drop_y_s = 0.0;
-
-        double candidateX_build_s = 0.0;
-        long long candidateX_rows_evaluated = 0;
-        double evaluate_drop_x_s = 0.0;
-
-        double place_s = 0.0;
-        double transform_s = 0.0;
-
-        size_t polys_considered = 0;
-        size_t placed_count = 0;
-        size_t not_placed_count = 0;
-    };
-
-    inline static thread_local ProfileStats lastProfile;
-
-    static void ResetProfile() { lastProfile = ProfileStats{}; }
-
-    static const ProfileStats& LastProfile() { return lastProfile; }
+private:
+    static ProfileData m_last_profile;
 
 }; // end class
 
+template<class S, class R>
+typename RasterizedOutline2Packer<S,R>::ProfileData RasterizedOutline2Packer<S,R>::m_last_profile;
 
 
 } // end namespace vcg

@@ -22,5 +22,9 @@ public:
                           int rast_i, int rotationNum, int gutterWidth);
 
     static std::vector<std::vector<uint8_t> > rotateGridCWise(std::vector< std::vector<uint8_t> >& inGrid);
+
+    // Cache control (thread-safe)
+    static void setCacheMaxBytes(std::size_t bytes);
+    static void clearCache();
 };
 #endif // QTPOLYRASTERIZER_H

@@ -37,6 +37,10 @@
 #include <wrap/qt/outline2_rasterizer.h>
 // #include <wrap/qt/Outline2ToQImage.h>
 
+#include <algorithm>
+#include <numeric>
+#include <cmath>
+
 typedef vcg::RasterizedOutline2Packer<float, QtOutline2Rasterizer> RasterizationBasedPacker;
 
 
@@ -52,6 +56,12 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         // Save the outline of the parameterization for this portion of the mesh
         Outline2f outline = ExtractOutline2f(*c);
         outlines.push_back(outline);
+    }
+
+    // Precompute per-chart absolute UV area
+    std::vector<double> chartAreas(outlines.size(), 0.0);
+    for (size_t i = 0; i < outlines.size(); ++i) {
+        chartAreas[i] = std::abs(vcg::tri::OutlineUtil<float>::Outline2Area(outlines[i]));
     }
 
     int packingSize = 16384;
@@ -83,6 +93,9 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     LOG_INFO << "[DIAG] Packing scale factor: " << packingScale
              << " (packingArea=" << packingArea << ", textureArea=" << textureArea << ")";
 
+    // Configure the rasterizer cache (bounded memory)
+    QtOutline2Rasterizer::setCacheMaxBytes((size_t)15ULL << 30);
+
     RasterizationBasedPacker::Parameters packingParams;
     packingParams.costFunction = RasterizationBasedPacker::Parameters::LowestHorizon;
     packingParams.doubleHorizon = false;
@@ -99,42 +112,82 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
 
     std::vector<vcg::Similarity2f> packingTransforms(outlines.size(), vcg::Similarity2f{});
 
+    auto selectSubset = [&](const std::vector<unsigned>& eligible,
+                            double targetUVArea) -> std::vector<unsigned> {
+        if (eligible.empty()) return {};
+        // Sort eligible by area desc
+        std::vector<unsigned> sorted = eligible;
+        std::sort(sorted.begin(), sorted.end(), [&](unsigned a, unsigned b){
+            return chartAreas[a] > chartAreas[b];
+        });
+
+        // Edge case: if top chart alone exceeds target, still include it
+        const int K = std::min<int>(16, std::max<int>(4, (int)std::sqrt((double)sorted.size())));
+        std::vector<std::vector<unsigned>> bins(K);
+        // Partition into K equal-count bins, preserving order
+        for (size_t i = 0; i < sorted.size(); ++i) {
+            bins[i * K / sorted.size()].push_back(sorted[i]);
+        }
+
+        // Round-robin pick to keep uniform area/size representation until ~targetUVArea
+        std::vector<size_t> pos(K, 0);
+        std::vector<unsigned> selected;
+        selected.reserve(sorted.size());
+        double accum = 0.0;
+        bool any = true;
+        while (accum < targetUVArea && any) {
+            any = false;
+            for (int b = 0; b < K && accum < targetUVArea; ++b) {
+                if (pos[b] < bins[b].size()) {
+                    unsigned idx = bins[b][pos[b]++];
+                    selected.push_back(idx);
+                    accum += chartAreas[idx];
+                    any = true;
+                }
+            }
+        }
+        if (selected.empty() && !sorted.empty()) {
+            // at least one
+            selected.push_back(sorted[0]);
+        }
+        return selected;
+    };
+
     unsigned nc = 0; // current container index
     while (totPacked < (int) charts.size()) {
         if (nc >= containerVec.size())
             containerVec.push_back(vcg::Point2i(packingSize, packingSize));
 
-        std::vector<unsigned> outlineIndex_iter_batch;
-        std::vector<Outline2f> outlines_iter_batch;
+        // Build list of yet-unpacked chart indices
+        std::vector<unsigned> pending;
         for (unsigned i = 0; i < containerIndices.size(); ++i) {
             if (containerIndices[i] == -1) {
-                outlineIndex_iter_batch.push_back(i);
-                outlines_iter_batch.push_back(outlines[i]);
+                pending.push_back(i);
             }
         }
 
-        if (outlineIndex_iter_batch.empty())
+        if (pending.empty())
             break;
 
         const float QIMAGE_MAX_DIM = 32766.0f; // QImage limit is 32767
-        std::vector<Outline2f> outlines_iter;
-        std::vector<unsigned> map_to_batch; // map from outlines_iter to outlines_iter_batch
+        std::vector<unsigned> eligible;
+        eligible.reserve(pending.size());
 
-        for(size_t i = 0; i < outlines_iter_batch.size(); ++i) {
-            if (outlines_iter_batch[i].empty()) {
-                LOG_WARN << "[DIAG] Skipping empty outline for original chart index " << outlineIndex_iter_batch[i];
-                containerIndices[outlineIndex_iter_batch[i]] = -2; // Mark as skipped
+        for(unsigned origIdx : pending) {
+            if (outlines[origIdx].empty()) {
+                LOG_WARN << "[DIAG] Skipping empty outline for original chart index " << origIdx;
+                containerIndices[origIdx] = -2; // Mark as skipped
                 totPacked++;
                 continue;
             }
 
             vcg::Box2f bbox;
-            for(const auto& p : outlines_iter_batch[i]) bbox.Add(p);
+            for(const auto& p : outlines[origIdx]) bbox.Add(p);
 
             if (!std::isfinite(bbox.DimX()) || !std::isfinite(bbox.DimY()) || bbox.DimX() < 0 || bbox.DimY() < 0) {
-                LOG_WARN << "[DIAG] Skipping chart with original index " << outlineIndex_iter_batch[i]
+                LOG_WARN << "[DIAG] Skipping chart with original index " << origIdx
                          << " due to invalid/non-finite UV bounding box. This chart will not be packed.";
-                containerIndices[outlineIndex_iter_batch[i]] = -4; // Mark as skipped due to invalid bbox
+                containerIndices[origIdx] = -4; // Mark as skipped due to invalid bbox
                 totPacked++;
                 continue;
             }
@@ -144,16 +197,36 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             float diagonal = std::sqrt(w * w + h * h);
 
             if (diagonal > QIMAGE_MAX_DIM) {
-                LOG_WARN << "[DIAG] Skipping chart with original index " << outlineIndex_iter_batch[i]
+                LOG_WARN << "[DIAG] Skipping chart with original index " << origIdx
                          << " because its scaled diagonal (" << diagonal
                          << ") exceeds QImage limits. This chart will not be packed.";
-                containerIndices[outlineIndex_iter_batch[i]] = -3; // Mark as skipped due to size
+                containerIndices[origIdx] = -3; // Mark as skipped due to size
                 totPacked++;
                 continue;
             }
-            outlines_iter.push_back(outlines_iter_batch[i]);
-            map_to_batch.push_back(i);
+            eligible.push_back(origIdx);
         }
+
+        if (eligible.empty()) {
+            if (totPacked < (int) charts.size()) continue;
+            else break;
+        }
+
+        // Target subset with total UV area ~= 5x current grid area (convert to UV by dividing scale^2)
+        double gridArea = double(containerVec[nc].X()) * double(containerVec[nc].Y());
+        double targetUVArea = 5.0 * (gridArea / (packingScale * packingScale));
+
+        std::vector<unsigned> selectedIdx = selectSubset(eligible, targetUVArea);
+        // Prepare outlines list for the selected subset
+        std::vector<Outline2f> outlines_iter;
+        outlines_iter.reserve(selectedIdx.size());
+        for (unsigned idx : selectedIdx) outlines_iter.push_back(outlines[idx]);
+
+        LOG_INFO << "[DIAG] Subset selection: pending=" << pending.size()
+                 << ", eligible=" << eligible.size()
+                 << ", selected=" << outlines_iter.size()
+                 << ", targetUVArea≈" << targetUVArea
+                 << ", grid=" << containerVec[nc].X() << "x" << containerVec[nc].Y();
 
         if (outlines_iter.empty())
             continue;
@@ -169,9 +242,9 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
                     largest_outline_idx = i;
                 }
             }
-            size_t original_batch_idx = map_to_batch[largest_outline_idx];
-            LOG_INFO << "[DIAG] Largest chart in this packing batch is index " << outlineIndex_iter_batch[original_batch_idx]
-                     << " with UV area " << max_area;
+            size_t original_batch_idx = selectedIdx[largest_outline_idx];
+            LOG_INFO << "[DIAG] Largest chart in this packing batch is index " << original_batch_idx
+                     << " with UV area " << chartAreas[original_batch_idx];
         }
         const int MAX_SIZE = 20000;
         std::vector<vcg::Similarity2f> transforms;
@@ -198,14 +271,14 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
                      << " candY(b/e)=" << prof.candidateY_build_s << "/" << prof.evaluate_drop_y_s << "s cols=" << prof.candidateY_cols_evaluated
                      << " candX(b/e)=" << prof.candidateX_build_s << "/" << prof.evaluate_drop_x_s << "s rows=" << prof.candidateX_rows_evaluated
                      << " place=" << prof.place_s << "s trans=" << prof.transform_s << "s total=" << prof.total_s << "s";
-            if (n == 0) {
+            if (n == 0 && !outlines_iter.empty()) {
                 LOG_WARN << "[DIAG] Failed to pack any of the " << outlines_iter.size() << " charts in this batch.";
                 containerVec[nc].X() *= 1.1;
                 containerVec[nc].Y() *= 1.1;
             }
-        } while (n == 0 && containerVec[nc].X() <= MAX_SIZE && containerVec[nc].Y() <= MAX_SIZE);
+        } while (n == 0 && !outlines_iter.empty() && containerVec[nc].X() <= MAX_SIZE && containerVec[nc].Y() <= MAX_SIZE);
 
-        totPacked += n;
+        if (n > 0) totPacked += n;
 
         if (n == 0) // no charts were packed, stop
             break;
@@ -215,8 +288,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             for (unsigned i = 0; i < outlines_iter.size(); ++i) {
                 if (polyToContainer[i] != -1) {
                     ensure(polyToContainer[i] == 0); // We only use a single container
-                    int batchInd = map_to_batch[i];
-                    int outlineInd = outlineIndex_iter_batch[batchInd];
+                    int outlineInd = selectedIdx[i];
                     ensure(containerIndices[outlineInd] == -1);
                     containerIndices[outlineInd] = nc;
                     packingTransforms[outlineInd] = transforms[i];

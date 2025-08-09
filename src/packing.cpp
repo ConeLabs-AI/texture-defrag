@@ -354,57 +354,61 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
                      << " for chart " << ci << " (BB: " << bb.DimX() << "x" << bb.DimY() << ")";
             
             // Pack just this single chart into its dedicated container
-            std::vector<std::vector<vcg::Point2d>> singleOutlineVec;
-            singleOutlineVec.push_back(outline);
-            
-            std::vector<vcg::Similarity2d> singleTrVec;
+            std::vector<std::vector<vcg::Point2f>> singleOutlineVec;
+            singleOutlineVec.emplace_back();
+            singleOutlineVec.back().reserve(outline.size());
+            for (const auto &p : outline) {
+                singleOutlineVec.back().push_back(vcg::Point2f(static_cast<float>(p.X()), static_cast<float>(p.Y())));
+            }
+ 
+            std::vector<vcg::Similarity2f> singleTrVec;
             std::vector<int> singlePolyToContainer;
-            
-            // Try to pack at scale 1.0 first
-            bool packSuccess = Packer::PackAtFixedScale(
-                singleOutlineVec,
-                {containerSize},
-                singleTrVec,
-                singlePolyToContainer,
-                rpack_params,
-                1.0
-            );
-            
-            // If it fails at scale 1.0, try with decreasing scales
-            float scale = 1.0;
-            while (!packSuccess && scale > 0.1) {
-                scale *= 0.9;
-                packSuccess = Packer::PackAtFixedScale(
-                    singleOutlineVec,
-                    {containerSize},
-                    singleTrVec,
-                    singlePolyToContainer,
-                    rpack_params,
-                    scale
-                );
-            }
-            
-            if (packSuccess && !singlePolyToContainer.empty() && singlePolyToContainer[0] != -1) {
-                // Successfully packed the chart
-                containerIndices[ci] = nc; // Assign to the current container index
-                packingTransforms[ci] = singleTrVec[0];
-                
-                // Create a new texture/atlas for this chart
-                TextureSize tsz;
-                tsz.sizeX = requiredWidth;
-                tsz.sizeY = requiredHeight;
-                texszVec.push_back(tsz);
-                containerVec.push_back(containerSize); // Add the container to the list
-                nc++; // Increment container count for next individual container
-                
-                totPacked++;
-                
-                LOG_INFO << "[DIAG] Successfully packed chart " << ci << " into individual container " << (nc-1) << " with scale: " << scale;
-            } else {
-                LOG_ERR << "[DIAG] Failed to pack chart " << ci << " even in individual container";
-            }
-        }
-    }
+ 
+             // Try to pack at scale 1.0 first
+             bool packSuccess = Packer::PackAtFixedScale(
+                 singleOutlineVec,
+                 {containerSize},
+                 singleTrVec,
+                 singlePolyToContainer,
+                 rpack_params,
+                 1.0
+             );
+ 
+             // If it fails at scale 1.0, try with decreasing scales
+             float scale = 1.0;
+             while (!packSuccess && scale > 0.1) {
+                 scale *= 0.9;
+                 packSuccess = Packer::PackAtFixedScale(
+                     singleOutlineVec,
+                     {containerSize},
+                     singleTrVec,
+                     singlePolyToContainer,
+                     rpack_params,
+                     scale
+                 );
+             }
+ 
+             if (packSuccess && !singlePolyToContainer.empty() && singlePolyToContainer[0] != -1) {
+                 // Successfully packed the chart
+                 containerIndices[ci] = nc; // Assign to the current container index
+                 packingTransforms[ci] = singleTrVec[0];
+ 
+                 // Create a new texture/atlas for this chart
+                 TextureSize tsz;
+                 tsz.w = requiredWidth;
+                 tsz.h = requiredHeight;
+                 texszVec.push_back(tsz);
+                 containerVec.push_back(containerSize); // Add the container to the list
+                 nc++; // Increment container count for next individual container
+ 
+                 totPacked++;
+ 
+                 LOG_INFO << "[DIAG] Successfully packed chart " << ci << " into individual container " << (nc-1) << " with scale: " << scale;
+             } else {
+                 LOG_ERR << "[DIAG] Failed to pack chart " << ci << " even in individual container";
+             }
+         }
+     }
 
     for (unsigned i = 0; i < charts.size(); ++i) {
         for (auto fptr : charts[i]->fpVec) {

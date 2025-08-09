@@ -14,6 +14,9 @@ QT = core gui svg
 
 INCLUDEPATH += $$PWD/src $$VCGPATH $$VCGPATH/eigenlib
 
+DEFINES += EIGEN_DONT_ALIGN_STATICALLY
+DEFINES += EIGEN_MAX_STATIC_ALIGN_BYTES=0
+
 #### PLATFORM SPECIFIC #########################################################
 
 unix|mingw-g++ {

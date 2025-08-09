@@ -9,6 +9,7 @@
 #include <mutex>
 #include <cmath>
 #include <memory>
+#include <chrono>
 
 using namespace vcg;
 using namespace std;
@@ -58,6 +59,10 @@ static size_t g_cacheCurrBytes = 0;
 static std::list<CacheKey> g_lru;
 static std::unordered_map<CacheKey, pair<std::list<CacheKey>::iterator, CacheValue>, CacheKeyHash> g_cache;
 
+// Stats
+static std::mutex g_statsMtx;
+static QtOutline2Rasterizer::CacheStats g_stats; // guarded by g_statsMtx
+
 inline uint32_t quantizeScale(float s) {
     double q = std::round(double(s) * 1e5);
     if (q < 0) q = 0;
@@ -98,6 +103,9 @@ inline void lruInsert(const CacheKey& key, CacheValue val) {
         if (oit != g_cache.end()) {
             g_cacheCurrBytes -= oit->second.second.bytes;
             g_cache.erase(oit);
+            // Track evictions
+            std::lock_guard<std::mutex> lkStats(g_statsMtx);
+            g_stats.evictions++;
         }
         g_lru.pop_back();
     }
@@ -113,6 +121,10 @@ void QtOutline2Rasterizer::setCacheMaxBytes(std::size_t bytes) {
         if (oit != g_cache.end()) {
             g_cacheCurrBytes -= oit->second.second.bytes;
             g_cache.erase(oit);
+            {
+                std::lock_guard<std::mutex> lkStats(g_statsMtx);
+                g_stats.evictions++;
+            }
         }
         g_lru.pop_back();
     }
@@ -125,18 +137,40 @@ void QtOutline2Rasterizer::clearCache() {
     g_cacheCurrBytes = 0;
 }
 
+QtOutline2Rasterizer::CacheStats QtOutline2Rasterizer::statsSnapshot(bool resetCounters) {
+    std::lock_guard<std::mutex> lkStats(g_statsMtx);
+    CacheStats out = g_stats;
+    // fill current/max bytes safely
+    {
+        std::lock_guard<std::mutex> lkCache(g_cacheMtx);
+        out.bytesCurrent = g_cacheCurrBytes;
+        out.bytesMax = g_cacheMaxBytes;
+    }
+    if (resetCounters) {
+        g_stats = CacheStats{};
+        // keep current/max bytes in snapshot; reset struct starts counters/timers at zero
+    }
+    return out;
+}
+
 void QtOutline2Rasterizer::rasterize(RasterizedOutline2 &poly,
                                  float scale,
                                  int rast_i,
                                  int rotationNum,
                                  int gutterWidth)
 {
+    auto t_total_start = std::chrono::high_resolution_clock::now();
+    {
+        std::lock_guard<std::mutex> lkStats(g_statsMtx);
+        g_stats.calls++;
+    }
     // since the brush is centered on the outline, a gutter of N pixels requires a pen of 2*N width
     int effectiveGutter = gutterWidth * 2;
     float rotRad = M_PI*2.0f*float(rast_i) / float(rotationNum);
 
     vector<vector<uint8_t>> tetrisGrid;
     {
+        auto t_lookup_start = std::chrono::high_resolution_clock::now();
         CacheKey key;
         key.pointsHash = hashPoints(poly.getPointsConst());
         key.scaleQ = quantizeScale(scale);
@@ -151,11 +185,24 @@ void QtOutline2Rasterizer::rasterize(RasterizedOutline2 &poly,
             if (it != g_cache.end()) {
                 hit = true;
                 lruTouch(key);
+                auto t_hit_copy_start = std::chrono::high_resolution_clock::now();
                 tetrisGrid = *it->second.second.baseGrid; // Deep copy
+                auto t_hit_copy_end = std::chrono::high_resolution_clock::now();
+                {
+                    std::lock_guard<std::mutex> lkStats(g_statsMtx);
+                    g_stats.hits++;
+                    g_stats.t_hit_copy_s += std::chrono::duration<double>(t_hit_copy_end - t_hit_copy_start).count();
+                }
             }
+        }
+        auto t_lookup_end = std::chrono::high_resolution_clock::now();
+        {
+            std::lock_guard<std::mutex> lkStats(g_statsMtx);
+            g_stats.t_lookup_s += std::chrono::duration<double>(t_lookup_end - t_lookup_start).count();
         }
 
         if (!hit) {
+            auto t_miss_start = std::chrono::high_resolution_clock::now();
             // Cache miss, do the rasterization
             Box2f bb;
             vector<Point2f> pointvec = poly.getPoints();
@@ -240,9 +287,19 @@ void QtOutline2Rasterizer::rasterize(RasterizedOutline2 &poly,
                     }
                     val.bytes = bytes;
                     lruInsert(key, std::move(val));
+                    {
+                        std::lock_guard<std::mutex> lkStats(g_statsMtx);
+                        g_stats.inserts++;
+                    }
                 } else {
                      lruTouch(key);
                 }
+            }
+            auto t_miss_end = std::chrono::high_resolution_clock::now();
+            {
+                std::lock_guard<std::mutex> lkStats(g_statsMtx);
+                g_stats.misses++;
+                g_stats.t_miss_raster_s += std::chrono::duration<double>(t_miss_end - t_miss_start).count();
             }
         }
     }
@@ -250,9 +307,24 @@ void QtOutline2Rasterizer::rasterize(RasterizedOutline2 &poly,
     if (tetrisGrid.empty()) { // Handle empty rasterization
         int num_rotations_to_generate = (rotationNum >= 4) ? 4 : 1;
         int rotationOffset = (rotationNum >= 4) ? rotationNum / 4 : 0;
+        auto t_rot_start = std::chrono::high_resolution_clock::now();
         for (int j = 0; j < num_rotations_to_generate; j++) {
             poly.getGrids(rast_i + rotationOffset*j).clear();
             poly.initFromGrid(rast_i + rotationOffset*j);
+        }
+        auto t_rot_end = std::chrono::high_resolution_clock::now();
+        {
+            std::lock_guard<std::mutex> lkStats(g_statsMtx);
+            g_stats.t_rotate_s += std::chrono::duration<double>(t_rot_end - t_rot_start).count();
+        }
+        auto t_total_end = std::chrono::high_resolution_clock::now();
+        {
+            std::lock_guard<std::mutex> lkStats(g_statsMtx);
+            g_stats.t_total_s += std::chrono::duration<double>(t_total_end - t_total_start).count();
+            // keep bytesCurrent/max fresh
+            std::lock_guard<std::mutex> lkCache(g_cacheMtx);
+            g_stats.bytesCurrent = g_cacheCurrBytes;
+            g_stats.bytesMax = g_cacheMaxBytes;
         }
         return;
     }
@@ -260,6 +332,7 @@ void QtOutline2Rasterizer::rasterize(RasterizedOutline2 &poly,
     // Process the grid (from cache or new) to create 90 degree rotations
     int num_rotations_to_generate = (rotationNum >= 4) ? 4 : 1;
     int rotationOffset = (rotationNum >= 4) ? rotationNum / 4 : 0;
+    auto t_rot_start = std::chrono::high_resolution_clock::now();
     for (int j = 0; j < num_rotations_to_generate; j++) {
         if (j != 0)  {
             tetrisGrid = rotateGridCWise(tetrisGrid);
@@ -269,6 +342,21 @@ void QtOutline2Rasterizer::rasterize(RasterizedOutline2 &poly,
 
         //initializes bottom/left/deltaX/deltaY vectors of the poly, for the current rasterization
         poly.initFromGrid(rast_i + rotationOffset*j);
+    }
+    auto t_rot_end = std::chrono::high_resolution_clock::now();
+    {
+        std::lock_guard<std::mutex> lkStats(g_statsMtx);
+        g_stats.t_rotate_s += std::chrono::duration<double>(t_rot_end - t_rot_start).count();
+    }
+
+    auto t_total_end = std::chrono::high_resolution_clock::now();
+    {
+        std::lock_guard<std::mutex> lkStats(g_statsMtx);
+        g_stats.t_total_s += std::chrono::duration<double>(t_total_end - t_total_start).count();
+        // keep bytesCurrent/max fresh
+        std::lock_guard<std::mutex> lkCache(g_cacheMtx);
+        g_stats.bytesCurrent = g_cacheCurrBytes;
+        g_stats.bytesMax = g_cacheMaxBytes;
     }
 }
 

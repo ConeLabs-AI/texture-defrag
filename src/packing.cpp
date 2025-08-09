@@ -46,6 +46,9 @@ typedef vcg::RasterizedOutline2Packer<float, QtOutline2Rasterizer> Rasterization
 
 int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObject, std::vector<TextureSize>& texszVec, const struct AlgoParameters& params)
 {
+    using Packer = RasterizedOutline2Packer<float, QtOutline2Rasterizer>;
+    auto rpack_params = Packer::Parameters();
+    
     // Pack the atlas
 
     texszVec.clear();
@@ -96,15 +99,14 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     // Configure the rasterizer cache (bounded memory)
     QtOutline2Rasterizer::setCacheMaxBytes((size_t)15ULL << 30);
 
-    RasterizationBasedPacker::Parameters packingParams;
-    packingParams.costFunction = RasterizationBasedPacker::Parameters::LowestHorizon;
-    packingParams.doubleHorizon = false;
-    packingParams.innerHorizon = false;
-    //packingParams.permutations = false;
-    packingParams.permutations = (charts.size() < 50);
-    packingParams.rotationNum = params.rotationNum;
-    packingParams.gutterWidth = 4;
-    packingParams.minmax = false; // not used
+    rpack_params.costFunction = Packer::Parameters::LowestHorizon;
+    rpack_params.doubleHorizon = false;
+    rpack_params.innerHorizon = true;
+    //rpack_params.permutations = false;
+    rpack_params.permutations = (charts.size() < 50);
+    rpack_params.rotationNum = params.rotationNum;
+    rpack_params.gutterWidth = 4;
+    rpack_params.minmax = false; // not used
 
     int totPacked = 0;
 
@@ -212,9 +214,9 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             else break;
         }
 
-        // Target subset with total UV area ~= 5x current grid area (convert to UV by dividing scale^2)
+        // Target subset with total UV area ~= 7.5x current grid area (convert to UV by dividing scale^2)
         double gridArea = double(containerVec[nc].X()) * double(containerVec[nc].Y());
-        double targetUVArea = 5.0 * (gridArea / (packingScale * packingScale));
+        double targetUVArea = 7.5 * (gridArea / (packingScale * packingScale));
 
         std::vector<unsigned> selectedIdx = selectSubset(eligible, targetUVArea);
         // Prepare outlines list for the selected subset
@@ -262,7 +264,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             transforms.clear();
             polyToContainer.clear();
             LOG_INFO << "Packing " << outlines_iter.size() << " charts into grid of size " << containerVec[nc].X() << " " << containerVec[nc].Y() << " (Attempt " << packAttempts << ")";
-            n = RasterizationBasedPacker::PackBestEffortAtScale(outlines_iter, {containerVec[nc]}, transforms, polyToContainer, packingParams, packingScale);
+            n = RasterizationBasedPacker::PackBestEffortAtScale(outlines_iter, {containerVec[nc]}, transforms, polyToContainer, rpack_params, packingScale);
             LOG_INFO << "[DIAG] Packing attempt finished. Charts packed: " << n << ".";
             const auto& prof = RasterizationBasedPacker::LastProfile();
             LOG_INFO << "[PACK-PROF] polys=" << prof.polys_considered
@@ -296,6 +298,112 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             }
         }
         nc++;
+    }
+
+    // Helper function to round up to nearest power of two
+    auto roundUpToPowerOfTwo = [](int v) -> int {
+        v--;
+        v |= v >> 1;
+        v |= v >> 2;
+        v |= v >> 4;
+        v |= v >> 8;
+        v |= v >> 16;
+        v++;
+        return v;
+    };
+    
+    // Handle any remaining unpacked charts by giving them individual containers
+    std::vector<unsigned> remainingUnpacked;
+    for (unsigned ci = 0; ci < charts.size(); ++ci) {
+        if (containerIndices[ci] == -1) {
+            remainingUnpacked.push_back(ci);
+        }
+    }
+    
+    if (!remainingUnpacked.empty()) {
+        LOG_INFO << "[DIAG] Creating individual containers for " << remainingUnpacked.size() << " unpacked charts.";
+        
+        for (unsigned ci : remainingUnpacked) {
+            ChartHandle chartptr = charts[ci];
+            auto outline = ExtractOutline2d(*chartptr);
+            
+            // Compute bounding box of the outline
+            vcg::Box2d bb;
+            for (const auto& p : outline) {
+                bb.Add(p);
+            }
+            
+            // Calculate container size based on bounding box
+            int padding = 8; // 8 pixel padding
+            int requiredWidth = (int)std::ceil(bb.DimX()) + padding;
+            int requiredHeight = (int)std::ceil(bb.DimY()) + padding;
+            
+            // Round up to nearest power of two
+            requiredWidth = roundUpToPowerOfTwo(requiredWidth);
+            requiredHeight = roundUpToPowerOfTwo(requiredHeight);
+            
+            // Respect QImage's 32767 pixel limit
+            const int MAX_QIMAGE_SIZE = 32767;
+            requiredWidth = std::min(requiredWidth, MAX_QIMAGE_SIZE);
+            requiredHeight = std::min(requiredHeight, MAX_QIMAGE_SIZE);
+            
+            // Create a new container for this chart
+            vcg::Point2i containerSize(requiredWidth, requiredHeight);
+            
+            LOG_INFO << "[DIAG] Creating container " << requiredWidth << "x" << requiredHeight 
+                     << " for chart " << ci << " (BB: " << bb.DimX() << "x" << bb.DimY() << ")";
+            
+            // Pack just this single chart into its dedicated container
+            std::vector<std::vector<vcg::Point2d>> singleOutlineVec;
+            singleOutlineVec.push_back(outline);
+            
+            std::vector<vcg::Similarity2d> singleTrVec;
+            std::vector<int> singlePolyToContainer;
+            
+            // Try to pack at scale 1.0 first
+            bool packSuccess = Packer::PackAtFixedScale(
+                singleOutlineVec,
+                {containerSize},
+                singleTrVec,
+                singlePolyToContainer,
+                rpack_params,
+                1.0
+            );
+            
+            // If it fails at scale 1.0, try with decreasing scales
+            float scale = 1.0;
+            while (!packSuccess && scale > 0.1) {
+                scale *= 0.9;
+                packSuccess = Packer::PackAtFixedScale(
+                    singleOutlineVec,
+                    {containerSize},
+                    singleTrVec,
+                    singlePolyToContainer,
+                    rpack_params,
+                    scale
+                );
+            }
+            
+            if (packSuccess && !singlePolyToContainer.empty() && singlePolyToContainer[0] != -1) {
+                // Successfully packed the chart
+                containerIndices[ci] = nc; // Assign to the current container index
+                packingTransforms[ci] = singleTrVec[0];
+                
+                // Create a new texture/atlas for this chart
+                TextureSize tsz;
+                tsz.sizeX = requiredWidth;
+                tsz.sizeY = requiredHeight;
+                texszVec.push_back(tsz);
+                containerVec.push_back(containerSize); // Add the container to the list
+                nc++; // Increment container count for next individual container
+                
+                totPacked++;
+                
+                LOG_INFO << "[DIAG] Successfully packed chart " << ci << " into individual container " << (nc-1) << " with scale: " << scale;
+            } else {
+                LOG_ERR << "[DIAG] Failed to pack chart " << ci << " even in individual container";
+            }
+        }
     }
 
     for (unsigned i = 0; i < charts.size(); ++i) {

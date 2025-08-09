@@ -276,6 +276,9 @@ public:
         int64_t candidateX_rows_evaluated = 0;
     };
 
+    static void ResetProfile() { m_last_profile = ProfileData{}; }
+    static const ProfileData& LastProfile() { return m_last_profile; }
+
   class Parameters
   {
   public:
@@ -941,7 +944,7 @@ public:
             polyVec[i].setPoints(outline2Vec[i]);
         }
 
-        ResetProfile();
+        RasterizedOutline2Packer::ResetProfile();
 
         polyToContainer.resize(outline2Vec.size(), -1);
 
@@ -984,7 +987,7 @@ public:
                             const std::vector<int>& perm,
                             bool bestEffort = false)
     {
-        m_last_profile = ProfileData{}; // Reset profile data
+        RasterizedOutline2Packer::ResetProfile();
         auto total_start = std::chrono::high_resolution_clock::now();
         m_last_profile.polys_considered = polyVec.size();
 

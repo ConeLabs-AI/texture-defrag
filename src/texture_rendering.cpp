@@ -36,6 +36,11 @@
 #include <algorithm>
 #include <memory>
 
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+
 #include <QImage>
 #include <QFileInfo>
 #include <QDir>
@@ -61,7 +66,7 @@ static const char *vs_text[] = {
     "    uv = texcoord;                                          \n"
     "    fcolor = color;                                         \n"
     "    //if (uv.s < 0) uv = vec2(0.0, 0.0);                    \n"
-    "    vec2 p = 2.0 * position - vec2(1.0, 1.0);               \n"
+    "    vec2 p = vec2(2.0 * position.x - 1.0, 1.0 - 2.0 * position.y);\n"
     "    gl_Position = vec4(p, 0.5, 1.0);                        \n"
     "}                                                           \n"
 };
@@ -131,6 +136,11 @@ struct RenderingContext {
     int renderedTexHeight = -1;
     GLint initialDrawBuffer = 0;
 
+    // Cached uniform locations
+    GLint loc_img0 = -1;
+    GLint loc_texture_size = -1;
+    GLint loc_render_mode = -1;
+
     RenderingContext() {
         if (QOpenGLContext::currentContext() == nullptr) {
             LOG_DEBUG << "Creating persistent OpenGL context for rendering.";
@@ -188,6 +198,11 @@ struct RenderingContext {
 
         glFuncs->glBindBuffer(GL_ARRAY_BUFFER, 0);
 
+        // Cache uniform locations
+        loc_img0 = glFuncs->glGetUniformLocation(program, "img0");
+        loc_texture_size = glFuncs->glGetUniformLocation(program, "texture_size");
+        loc_render_mode = glFuncs->glGetUniformLocation(program, "render_mode");
+
         glFuncs->glGenFramebuffers(1, &fbo);
         glFuncs->glGenTextures(1, &renderTarget);
 
@@ -239,6 +254,62 @@ struct RenderingContext {
     }
 };
 
+// Simple background saving queue to overlap PNG compression with rendering
+class ImageSaveQueue {
+public:
+    explicit ImageSaveQueue(int maxInFlight = 2) : maxInFlight(maxInFlight) {
+        worker = std::thread([this]() { this->run(); });
+    }
+    ~ImageSaveQueue() {
+        finish();
+    }
+    void enqueue(QImage image, const QString& absolutePath, int quality) {
+        std::unique_lock<std::mutex> lock(mutex);
+        notFull.wait(lock, [this]() { return stop || queue.size() < static_cast<size_t>(maxInFlight); });
+        if (stop) return;
+        queue.push(Task{std::move(image), absolutePath, quality});
+        notEmpty.notify_one();
+    }
+    void finish() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+        }
+        notEmpty.notify_all();
+        notFull.notify_all();
+        if (worker.joinable()) worker.join();
+    }
+private:
+    struct Task {
+        QImage image;
+        QString path;
+        int quality;
+    };
+    void run() {
+        for (;;) {
+            Task task;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                notEmpty.wait(lock, [this]() { return stop || !queue.empty(); });
+                if (stop && queue.empty()) break;
+                task = std::move(queue.front());
+                queue.pop();
+                notFull.notify_one();
+            }
+            if (!task.image.save(task.path, "png", task.quality)) {
+                LOG_ERR << "Error saving texture file " << task.path.toStdString();
+            }
+        }
+    }
+    std::thread worker;
+    std::mutex mutex;
+    std::condition_variable notEmpty;
+    std::condition_variable notFull;
+    std::queue<Task> queue;
+    int maxInFlight = 2;
+    bool stop = false;
+};
+
 static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
                                              std::vector<Mesh::FacePointer>& fvec,
                                              Mesh &m, TextureObjectHandle textureObject,
@@ -282,6 +353,7 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
     QDir::setCurrent(fi.absoluteDir().absolutePath());
 
     RenderingContext renderingContext;
+    ImageSaveQueue saveQueue(2);
 
     for (int i = 0; i < nTex; ++i) {
         LOG_INFO << "Processing sheet " << (i + 1) << " of " << nTex << "...";
@@ -294,12 +366,13 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
 
         QFileInfo texFI(texturePath.c_str());
         m.textures.push_back(texFI.fileName().toStdString());
-
-        if (teximg->save(texturePath.c_str(), "png", 66) == false) {
-            LOG_ERR << "Error saving texture file " << texturePath;
-        }
+        const QString absPath = texFI.absoluteFilePath();
+        // Enqueue save to overlap compression with next sheet rendering
+        saveQueue.enqueue(*teximg, absPath, 90);
     }
 
+    // Ensure all pending saves are complete before restoring working directory
+    saveQueue.finish();
     QDir::setCurrent(wd);
 }
 
@@ -333,9 +406,9 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
     }
 
     glFuncs->glBindBuffer(GL_ARRAY_BUFFER, ctx.vertexbuf);
-    // Use buffer orphaning + map range for better performance, avoiding stalls.
+    // Use streaming usage hint and buffer orphaning + map range to reduce stalls.
     size_t bufferSize = fvec.size() * 15 * sizeof(float);
-    glFuncs->glBufferData(GL_ARRAY_BUFFER, bufferSize, NULL, GL_STATIC_DRAW);
+    glFuncs->glBufferData(GL_ARRAY_BUFFER, bufferSize, NULL, GL_STREAM_DRAW);
     float *p = (float *)glFuncs->glMapBufferRange(GL_ARRAY_BUFFER, 0, bufferSize, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
     ensure(p != nullptr);
     for (auto fptr : fvec) {
@@ -396,19 +469,16 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
         LOG_DEBUG << "Binding texture unit " << currTexIndex;
         textureObject->Bind(currTexIndex);
 
-        GLint loc_img0 = glFuncs->glGetUniformLocation(ctx.program, "img0");
-        glFuncs->glUniform1i(loc_img0, 0);
-        GLint loc_texture_size = glFuncs->glGetUniformLocation(ctx.program, "texture_size");
-        glFuncs->glUniform2f(loc_texture_size, float(textureObject->TextureWidth(currTexIndex)), float(textureObject->TextureHeight(currTexIndex)));
+        glFuncs->glUniform1i(ctx.loc_img0, 0);
+        glFuncs->glUniform2f(ctx.loc_texture_size, float(textureObject->TextureWidth(currTexIndex)), float(textureObject->TextureHeight(currTexIndex)));
 
 
-        GLint loc_render_mode = glFuncs->glGetUniformLocation(ctx.program, "render_mode");
-        glFuncs->glUniform1i(loc_render_mode, 0);
+        glFuncs->glUniform1i(ctx.loc_render_mode, 0);
 
         // Texture parameters are now set once in TextureObject::Bind, so we remove the redundant settings from here.
         switch (imode) {
         case Cubic:
-            glFuncs->glUniform1i(loc_render_mode, 1);
+            glFuncs->glUniform1i(ctx.loc_render_mode, 1);
             break;
         case Linear:
             // This is the default render_mode 0 in the shader
@@ -418,7 +488,7 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
             // A more robust implementation might require passing filter mode to TextureObject::Bind.
             break;
         case FaceColor:
-            glFuncs->glUniform1i(loc_render_mode, 2);
+            glFuncs->glUniform1i(ctx.loc_render_mode, 2);
             break;
         default:
             ensure(0 && "Should never happen");
@@ -426,8 +496,6 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
 
         glFuncs->glDrawArrays(GL_TRIANGLES, baseIndex, count);
         CHECK_GL_ERROR();
-
-        textureObject->Release(currTexIndex);
 
         fbase = fcurr;
     }
@@ -440,7 +508,5 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
 
     if (filter)
         vcg::PullPush(*textureImage, qRgba(0, 255, 0, 255));
-
-    Mirror(*textureImage);
     return textureImage;
 }

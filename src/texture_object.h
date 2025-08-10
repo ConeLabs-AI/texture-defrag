@@ -26,6 +26,8 @@
 #include <memory>
 #include <cstdint>
 #include <string>
+#include <list>
+#include <unordered_map>
 
 class QImage;
 class TextureObject;
@@ -75,6 +77,25 @@ struct TextureObject {
     double GetResolutionInMegaPixels();
 
     std::vector<std::pair<double, double>> ComputeRelativeSizes();
+
+    // Cache budget configuration (in GB/bytes)
+    void SetCacheBudgetGB(double gigabytes);
+    double GetCacheBudgetGB() const;
+    void SetCacheBudgetBytes(uint64_t bytes);
+    uint64_t GetCacheBudgetBytes() const;
+    uint64_t GetCurrentCacheBytes() const;
+
+private:
+    // LRU cache of GPU textures by index
+    void EvictIfNeeded(uint64_t bytesToAdd);
+    void TouchLRU(std::size_t idx);
+    void RemoveFromLRU(std::size_t idx);
+
+    uint64_t cacheBudgetBytes_ = 0;      // GPU memory budget for cached textures
+    uint64_t currentCacheBytes_ = 0;     // Currently used GPU memory by cached textures
+    std::vector<uint64_t> texBytesVec_;  // Tracked bytes per texture index
+    std::list<std::size_t> lruList_;     // Most-recently-used at front, LRU at back
+    std::unordered_map<std::size_t, std::list<std::size_t>::iterator> lruMap_;
 };
 
 /* Vertically mirrors a QImage in-place, useful to match the OpenGL convention

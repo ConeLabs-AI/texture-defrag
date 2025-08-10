@@ -37,6 +37,8 @@
 
 TextureObject::TextureObject()
 {
+    SetCacheBudgetGB(8.0);
+    LOG_INFO << "Texture GPU cache budget set to " << GetCacheBudgetGB() << " GB (default)";
 }
 
 TextureObject::~TextureObject()
@@ -54,6 +56,7 @@ bool TextureObject::AddImage(std::string path)
         tii.size = { qir.size().width(), qir.size().height() };
         texInfoVec.push_back(tii);
         texNameVec.push_back(0);
+        texBytesVec_.push_back(0);
         return true;
     } else return false;
 }
@@ -70,6 +73,11 @@ void TextureObject::Bind(int i)
             QImage glimg = img.convertToFormat(QImage::Format_ARGB32);
             img = glimg;
         }
+
+        // Before allocating, ensure we have space within the GPU cache budget
+        const uint64_t bytesNeeded = static_cast<uint64_t>(img.width()) * static_cast<uint64_t>(img.height()) * 4ull;
+        EvictIfNeeded(bytesNeeded);
+
         glFuncs->glGenTextures(1, &texNameVec[i]);
 
         Mirror(img);
@@ -77,19 +85,18 @@ void TextureObject::Bind(int i)
         glFuncs->glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
 
         glFuncs->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, img.width(), img.height(), 0, GL_BGRA, GL_UNSIGNED_BYTE, img.constBits());
-        glFuncs->glGenerateMipmap(GL_TEXTURE_2D);
-
-        glFuncs->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glFuncs->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glFuncs->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        if (QOpenGLContext::currentContext()->hasExtension("GL_EXT_texture_filter_anisotropic")) {
-            GLfloat maxAniso = 0.0f;
-            glFuncs->glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &maxAniso);
-            glFuncs->glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, std::min(16.0f, maxAniso));
-        }
         CHECK_GL_ERROR();
+
+        // Track memory usage and LRU
+        texBytesVec_[i] = bytesNeeded;
+        currentCacheBytes_ += bytesNeeded;
+        TouchLRU(i);
     }
     else {
         glFuncs->glBindTexture(GL_TEXTURE_2D, texNameVec[i]);
+        TouchLRU(i);
         CHECK_GL_ERROR();
     }
 }
@@ -101,6 +108,12 @@ void TextureObject::Release(int i)
         OpenGLFunctionsHandle glFuncs = GetOpenGLFunctionsHandle();
         glFuncs->glDeleteTextures(1, &texNameVec[i]);
         texNameVec[i] = 0;
+        // Update memory tracking and LRU map
+        if (texBytesVec_.size() > static_cast<size_t>(i)) {
+            currentCacheBytes_ -= texBytesVec_[i];
+            texBytesVec_[i] = 0;
+        }
+        RemoveFromLRU(i);
     }
 }
 
@@ -184,5 +197,74 @@ void Mirror(QImage& img)
         QRgb *line0 = (QRgb *) img.scanLine(i);
         QRgb *line1 = (QRgb *) img.scanLine(height - 1 - i);
         std::swap_ranges(line0, line0 + width, line1);
+    }
+}
+
+void TextureObject::SetCacheBudgetGB(double gigabytes)
+{
+    if (gigabytes <= 0) {
+        cacheBudgetBytes_ = 0;
+    } else {
+        cacheBudgetBytes_ = static_cast<uint64_t>(gigabytes * 1024.0 * 1024.0 * 1024.0);
+    }
+}
+
+double TextureObject::GetCacheBudgetGB() const
+{
+    return static_cast<double>(cacheBudgetBytes_) / (1024.0 * 1024.0 * 1024.0);
+}
+
+void TextureObject::SetCacheBudgetBytes(uint64_t bytes)
+{
+    cacheBudgetBytes_ = bytes;
+}
+
+uint64_t TextureObject::GetCacheBudgetBytes() const
+{
+    return cacheBudgetBytes_;
+}
+
+uint64_t TextureObject::GetCurrentCacheBytes() const
+{
+    return currentCacheBytes_;
+}
+
+void TextureObject::EvictIfNeeded(uint64_t bytesToAdd)
+{
+    if (cacheBudgetBytes_ == 0) return; // unlimited
+    // Evict while exceeding budget
+    while (currentCacheBytes_ + bytesToAdd > cacheBudgetBytes_) {
+        if (lruList_.empty()) break;
+        std::size_t victim = lruList_.back();
+        lruList_.pop_back();
+        lruMap_.erase(victim);
+        if (victim < texNameVec.size() && texNameVec[victim] != 0) {
+            OpenGLFunctionsHandle glFuncs = GetOpenGLFunctionsHandle();
+            glFuncs->glDeleteTextures(1, &texNameVec[victim]);
+            texNameVec[victim] = 0;
+            if (victim < texBytesVec_.size()) {
+                currentCacheBytes_ -= texBytesVec_[victim];
+                texBytesVec_[victim] = 0;
+            }
+        }
+    }
+}
+
+void TextureObject::TouchLRU(std::size_t idx)
+{
+    auto it = lruMap_.find(idx);
+    if (it != lruMap_.end()) {
+        lruList_.erase(it->second);
+    }
+    lruList_.push_front(idx);
+    lruMap_[idx] = lruList_.begin();
+}
+
+void TextureObject::RemoveFromLRU(std::size_t idx)
+{
+    auto it = lruMap_.find(idx);
+    if (it != lruMap_.end()) {
+        lruList_.erase(it->second);
+        lruMap_.erase(it);
     }
 }

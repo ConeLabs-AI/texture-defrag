@@ -63,6 +63,7 @@ struct Args {
     std::string outfile = "";
     int r = 4;
     int l = 0;
+    double c = 8.0; // texture GPU cache budget in GB
 };
 
 void PrintArgsUsage(const char *binary);
@@ -109,6 +110,12 @@ int main(int argc, char *argv[])
         std::exit(-1);
     }
     timings["Load mesh"] = t.TimeSinceLastCheck();
+
+    // Configure GPU texture cache budget
+    if (textureObject) {
+        textureObject->SetCacheBudgetGB(args.c);
+        LOG_INFO << "Texture GPU cache budget configured to " << args.c << " GB";
+    }
 
     LOG_INFO << "[DIAG] Input mesh loaded: " << m.FN() << " faces, " << m.VN() << " vertices.";
 
@@ -318,6 +325,7 @@ void PrintArgsUsage(const char *binary) {
     std::cout << "-o  <val>      " << "Output mesh file. Supported formats are obj and ply." << " (default: out_MESHFILE" << ")" << std::endl;
     std::cout << "-r  <val>      " << "Number of rotations to try (e.g., 4 for 0/90/180/270, 1 for no rotation). If > 1, must be multiple of 4." << " (default: " << def.r << ")" << std::endl;
     std::cout << "-l  <val>      " << "Logging level. 0 for minimal verbosity, 1 for verbose output, 2 for debug output." << " (default: " << def.l << ")" << std::endl;
+    std::cout << "-c  <val>      " << "Texture GPU cache budget in GB. Set 0 for unlimited." << " (default: " << def.c << ")" << std::endl;
 }
 
 bool ParseOption(const std::string& option, const std::string& argument, Args *args)
@@ -346,12 +354,13 @@ bool ParseOption(const std::string& option, const std::string& argument, Args *a
             case 'a': args->a = std::stod(argument); break;
             case 't': args->t = std::stod(argument); break;
             case 'r': args->r = std::stoi(argument); break;
+            case 'c': args->c = std::stod(argument); break;
             default:
                 std::cerr << "Unrecognized option " << option << std::endl << std::endl;
                 return false;
         }
     } catch (const std::exception& e) {
-        std::cerr << "Error while parsing option `" << option << " " << argument << "`: " << e.what() << std::endl << std::endl;;
+        std::cerr << "Error while parsing option `" << option << " " << argument << "`"; std::cerr << ": " << e.what() << std::endl << std::endl;;
         return false;
     }
     return true;

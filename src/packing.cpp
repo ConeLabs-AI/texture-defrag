@@ -101,7 +101,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
 
     rpack_params.costFunction = Packer::Parameters::LowestHorizon;
     rpack_params.doubleHorizon = false;
-    rpack_params.innerHorizon = true;
+    rpack_params.innerHorizon = false;
     //rpack_params.permutations = false;
     rpack_params.permutations = (charts.size() < 50);
     rpack_params.rotationNum = params.rotationNum;

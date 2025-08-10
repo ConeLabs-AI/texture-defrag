@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <random>
 
 typedef vcg::RasterizedOutline2Packer<float, QtOutline2Rasterizer> RasterizationBasedPacker;
 
@@ -123,41 +124,28 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     auto selectSubset = [&](const std::vector<unsigned>& eligible,
                             double targetUVArea) -> std::vector<unsigned> {
         if (eligible.empty()) return {};
-        // Sort eligible by area desc
-        std::vector<unsigned> sorted = eligible;
-        std::sort(sorted.begin(), sorted.end(), [&](unsigned a, unsigned b){
+
+        // Randomly shuffle eligible charts to obtain a representative subset
+        std::vector<unsigned> indices = eligible;
+        static thread_local std::mt19937 rng(std::random_device{}());
+        std::shuffle(indices.begin(), indices.end(), rng);
+
+        std::vector<unsigned> selected;
+        selected.reserve(indices.size());
+        double accum = 0.0;
+        for (unsigned idx : indices) {
+            if (accum >= targetUVArea) break;
+            selected.push_back(idx);
+            accum += chartAreas[idx];
+        }
+        if (selected.empty() && !indices.empty()) {
+            selected.push_back(indices[0]);
+        }
+
+        // Ensure the final subset is sorted by size (area) for packing
+        std::sort(selected.begin(), selected.end(), [&](unsigned a, unsigned b){
             return chartAreas[a] > chartAreas[b];
         });
-
-        // Edge case: if top chart alone exceeds target, still include it
-        const int K = std::min<int>(16, std::max<int>(4, (int)std::sqrt((double)sorted.size())));
-        std::vector<std::vector<unsigned>> bins(K);
-        // Partition into K equal-count bins, preserving order
-        for (size_t i = 0; i < sorted.size(); ++i) {
-            bins[i * K / sorted.size()].push_back(sorted[i]);
-        }
-
-        // Round-robin pick to keep uniform area/size representation until ~targetUVArea
-        std::vector<size_t> pos(K, 0);
-        std::vector<unsigned> selected;
-        selected.reserve(sorted.size());
-        double accum = 0.0;
-        bool any = true;
-        while (accum < targetUVArea && any) {
-            any = false;
-            for (int b = 0; b < K && accum < targetUVArea; ++b) {
-                if (pos[b] < bins[b].size()) {
-                    unsigned idx = bins[b][pos[b]++];
-                    selected.push_back(idx);
-                    accum += chartAreas[idx];
-                    any = true;
-                }
-            }
-        }
-        if (selected.empty() && !sorted.empty()) {
-            // at least one
-            selected.push_back(sorted[0]);
-        }
         return selected;
     };
 

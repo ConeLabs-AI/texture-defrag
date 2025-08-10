@@ -78,6 +78,16 @@ struct TextureObject {
 
     std::vector<std::pair<double, double>> ComputeRelativeSizes();
 
+    // GPU texture cache stats API
+    struct CacheStats {
+        uint64_t hits = 0;
+        uint64_t misses = 0;
+        uint64_t evictions = 0;
+        uint64_t bytesEvicted = 0;
+    };
+    void ResetCacheStats();
+    CacheStats GetCacheStats() const;
+
     // Cache budget configuration (in GB/bytes)
     void SetCacheBudgetGB(double gigabytes);
     double GetCacheBudgetGB() const;
@@ -96,6 +106,12 @@ private:
     std::vector<uint64_t> texBytesVec_;  // Tracked bytes per texture index
     std::list<std::size_t> lruList_;     // Most-recently-used at front, LRU at back
     std::unordered_map<std::size_t, std::list<std::size_t>::iterator> lruMap_;
+
+    // Cache stats counters
+    uint64_t cacheHits_ = 0;
+    uint64_t cacheMisses_ = 0;
+    uint64_t cacheEvictions_ = 0;
+    uint64_t bytesEvicted_ = 0;
 };
 
 /* Vertically mirrors a QImage in-place, useful to match the OpenGL convention

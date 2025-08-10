@@ -64,6 +64,7 @@ struct Args {
     int r = 4;
     int l = 0;
     double c = 8.0; // texture GPU cache budget in GB
+    double p = 8.0; // packing rasterization cache budget in GB
 };
 
 void PrintArgsUsage(const char *binary);
@@ -115,6 +116,15 @@ int main(int argc, char *argv[])
     if (textureObject) {
         textureObject->SetCacheBudgetGB(args.c);
         LOG_INFO << "Texture GPU cache budget configured to " << args.c << " GB";
+    }
+
+    // Configure packing rasterization cache budget
+    {
+        std::size_t rasterCacheBytes = (args.p <= 0.0)
+            ? 0
+            : static_cast<std::size_t>(args.p * 1024.0 * 1024.0 * 1024.0);
+        SetRasterizerCacheMaxBytes(rasterCacheBytes);
+        LOG_INFO << "Packing rasterization cache budget configured to " << args.p << " GB";
     }
 
     LOG_INFO << "[DIAG] Input mesh loaded: " << m.FN() << " faces, " << m.VN() << " vertices.";
@@ -326,6 +336,7 @@ void PrintArgsUsage(const char *binary) {
     std::cout << "-r  <val>      " << "Number of rotations to try (e.g., 4 for 0/90/180/270, 1 for no rotation). If > 1, must be multiple of 4." << " (default: " << def.r << ")" << std::endl;
     std::cout << "-l  <val>      " << "Logging level. 0 for minimal verbosity, 1 for verbose output, 2 for debug output." << " (default: " << def.l << ")" << std::endl;
     std::cout << "-c  <val>      " << "Texture GPU cache budget in GB. Set 0 for unlimited." << " (default: " << def.c << ")" << std::endl;
+    std::cout << "-p  <val>      " << "Packing rasterization cache budget in GB. Set 0 for unlimited." << " (default: " << def.p << ")" << std::endl;
 }
 
 bool ParseOption(const std::string& option, const std::string& argument, Args *args)
@@ -355,6 +366,7 @@ bool ParseOption(const std::string& option, const std::string& argument, Args *a
             case 't': args->t = std::stod(argument); break;
             case 'r': args->r = std::stoi(argument); break;
             case 'c': args->c = std::stod(argument); break;
+            case 'p': args->p = std::stod(argument); break;
             default:
                 std::cerr << "Unrecognized option " << option << std::endl << std::endl;
                 return false;

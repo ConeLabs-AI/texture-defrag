@@ -43,11 +43,19 @@
 
 typedef vcg::RasterizedOutline2Packer<float, QtOutline2Rasterizer> RasterizationBasedPacker;
 
+void SetRasterizerCacheMaxBytes(std::size_t bytes)
+{
+    QtOutline2Rasterizer::setCacheMaxBytes(bytes);
+}
+
 
 int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObject, std::vector<TextureSize>& texszVec, const struct AlgoParameters& params)
 {
     using Packer = RasterizedOutline2Packer<float, QtOutline2Rasterizer>;
     auto rpack_params = Packer::Parameters();
+    
+    // Reset rasterizer cache stats for this packing run
+    QtOutline2Rasterizer::statsSnapshot(true);
     
     // Pack the atlas
 
@@ -96,8 +104,6 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     LOG_INFO << "[DIAG] Packing scale factor: " << packingScale
              << " (packingArea=" << packingArea << ", textureArea=" << textureArea << ")";
 
-    // Configure the rasterizer cache (bounded memory)
-    QtOutline2Rasterizer::setCacheMaxBytes((size_t)15ULL << 30);
 
     rpack_params.costFunction = Packer::Parameters::LowestHorizon;
     rpack_params.doubleHorizon = false;
@@ -214,9 +220,9 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             else break;
         }
 
-        // Target subset with total UV area ~= 7.5x current grid area (convert to UV by dividing scale^2)
+        // Target subset with total UV area ~= 5x current grid area (convert to UV by dividing scale^2)
         double gridArea = double(containerVec[nc].X()) * double(containerVec[nc].Y());
-        double targetUVArea = 7.5 * (gridArea / (packingScale * packingScale));
+        double targetUVArea = 5 * (gridArea / (packingScale * packingScale));
 
         std::vector<unsigned> selectedIdx = selectSubset(eligible, targetUVArea);
         // Prepare outlines list for the selected subset
@@ -439,6 +445,20 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
 
     for (auto c : charts)
         c->ParameterizationChanged();
+
+    // Log rasterizer cache stats for this packing pass
+    {
+        auto s = QtOutline2Rasterizer::statsSnapshot(false);
+        long long lookups = static_cast<long long>(s.hits) + static_cast<long long>(s.misses);
+        double hitRate = (lookups > 0) ? (double(s.hits) / double(lookups)) : 0.0;
+        LOG_INFO << "[PACK-CACHE] lookups=" << lookups
+                 << " hits=" << s.hits
+                 << " misses=" << s.misses
+                 << " hitRate=" << hitRate
+                 << " inserts=" << s.inserts
+                 << " evictions=" << s.evictions
+                 << " bytes=" << s.bytesCurrent << "/" << s.bytesMax;
+    }
 
     return totPacked;
 }

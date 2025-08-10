@@ -341,6 +341,9 @@ int FacesByTextureIndex(Mesh& m, std::vector<std::vector<Mesh::FacePointer>>& fv
 void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObjectHandle textureObject, const std::vector<TextureSize> &texSizes,
                                                    bool filter, RenderMode imode)
 {
+    // Reset GPU texture cache stats for this rendering pass
+    if (textureObject) textureObject->ResetCacheStats();
+
     std::vector<std::vector<Mesh::FacePointer>> facesByTexture;
     int nTex = FacesByTextureIndex(m, facesByTexture);
 
@@ -352,12 +355,24 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
     QString wd = QDir::currentPath();
     QDir::setCurrent(fi.absoluteDir().absolutePath());
 
+    auto t_total_start = std::chrono::high_resolution_clock::now();
+    double t_total_render_s = 0.0;
+    double t_total_readpixels_s = 0.0;
+    double t_total_savequeue_enqueue_s = 0.0;
+    double t_total_png_save_s = 0.0; // captured by queue
+    int64_t total_pixels_rendered = 0;
+
     RenderingContext renderingContext;
     ImageSaveQueue saveQueue(2);
 
     for (int i = 0; i < nTex; ++i) {
         LOG_INFO << "Processing sheet " << (i + 1) << " of " << nTex << "...";
+        auto t_render_start = std::chrono::high_resolution_clock::now();
         std::shared_ptr<QImage> teximg = RenderTexture(renderingContext, facesByTexture[i], m, textureObject, filter, imode, texSizes[i].w, texSizes[i].h);
+        auto t_render_end = std::chrono::high_resolution_clock::now();
+        double t_render_s = std::chrono::duration<double>(t_render_end - t_render_start).count();
+        t_total_render_s += t_render_s;
+        total_pixels_rendered += int64_t(texSizes[i].w) * int64_t(texSizes[i].h);
 
         std::stringstream suffix;
         suffix << "_texture_" << i << ".png";
@@ -368,12 +383,44 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
         m.textures.push_back(texFI.fileName().toStdString());
         const QString absPath = texFI.absoluteFilePath();
         // Enqueue save to overlap compression with next sheet rendering
+        auto t_enqueue_start = std::chrono::high_resolution_clock::now();
         saveQueue.enqueue(*teximg, absPath, 90);
+        auto t_enqueue_end = std::chrono::high_resolution_clock::now();
+        t_total_savequeue_enqueue_s += std::chrono::duration<double>(t_enqueue_end - t_enqueue_start).count();
     }
 
     // Ensure all pending saves are complete before restoring working directory
+    auto t_save_finish_start = std::chrono::high_resolution_clock::now();
     saveQueue.finish();
+    auto t_save_finish_end = std::chrono::high_resolution_clock::now();
+    t_total_png_save_s += std::chrono::duration<double>(t_save_finish_end - t_save_finish_start).count();
     QDir::setCurrent(wd);
+
+    auto t_total_end = std::chrono::high_resolution_clock::now();
+    double t_total_s = std::chrono::duration<double>(t_total_end - t_total_start).count();
+
+    // Log performance summary
+    LOG_INFO << "[RENDER-STATS] sheets=" << nTex
+             << " pixels=" << total_pixels_rendered
+             << " total_s=" << t_total_s
+             << " render_s=" << t_total_render_s
+             << " enqueue_s=" << t_total_savequeue_enqueue_s
+             << " save_finish_s=" << t_total_png_save_s;
+
+    // Log GPU texture cache stats
+    if (textureObject) {
+        auto cs = textureObject->GetCacheStats();
+        uint64_t lookups = cs.hits + cs.misses;
+        double hitRate = lookups ? double(cs.hits) / double(lookups) : 0.0;
+        LOG_INFO << "[TEX-CACHE] lookups=" << lookups
+                 << " hits=" << cs.hits
+                 << " misses=" << cs.misses
+                 << " hitRate=" << hitRate
+                 << " evictions=" << cs.evictions
+                 << " bytesEvicted=" << cs.bytesEvicted
+                 << " bytesInUse=" << textureObject->GetCurrentCacheBytes()
+                 << "/budget=" << textureObject->GetCacheBudgetBytes();
+    }
 }
 
 static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
@@ -405,6 +452,7 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
         inTexSizes.push_back({iw, ih});
     }
 
+    auto t_vbo_start = std::chrono::high_resolution_clock::now();
     glFuncs->glBindBuffer(GL_ARRAY_BUFFER, ctx.vertexbuf);
     // Use streaming usage hint and buffer orphaning + map range to reduce stalls.
     size_t bufferSize = fvec.size() * 15 * sizeof(float);
@@ -432,6 +480,8 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
 
     p = nullptr;
     glFuncs->glBindBuffer(GL_ARRAY_BUFFER, 0); // done, unbind
+    auto t_vbo_end = std::chrono::high_resolution_clock::now();
+    double t_vbo_s = std::chrono::duration<double>(t_vbo_end - t_vbo_start).count();
 
     ctx.prepareRenderTarget(textureWidth, textureHeight);
     glFuncs->glBindFramebuffer(GL_FRAMEBUFFER, ctx.fbo);
@@ -454,6 +504,7 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
 
     glFuncs->glClear(GL_COLOR_BUFFER_BIT);
 
+    auto t_draw_start = std::chrono::high_resolution_clock::now();
     auto f0 = fvec.begin();
     auto fbase = f0;
     while (fbase != fvec.end()) {
@@ -499,14 +550,24 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
 
         fbase = fcurr;
     }
+    auto t_draw_end = std::chrono::high_resolution_clock::now();
+    double t_draw_s = std::chrono::duration<double>(t_draw_end - t_draw_start).count();
 
     glFuncs->glReadBuffer(GL_COLOR_ATTACHMENT0);
     glFuncs->glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    auto t_read_start = std::chrono::high_resolution_clock::now();
     glFuncs->glReadPixels(0, 0, textureWidth, textureHeight, GL_BGRA, GL_UNSIGNED_BYTE, textureImage->bits());
+    auto t_read_end = std::chrono::high_resolution_clock::now();
+    double t_read_s = std::chrono::duration<double>(t_read_end - t_read_start).count();
 
     glFuncs->glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     if (filter)
         vcg::PullPush(*textureImage, qRgba(0, 255, 0, 255));
+
+    LOG_INFO << "[RENDER-PROFILE] vbo_s=" << t_vbo_s
+             << " draw_s=" << t_draw_s
+             << " readPixels_s=" << t_read_s
+             << " image=" << textureWidth << "x" << textureHeight;
     return textureImage;
 }

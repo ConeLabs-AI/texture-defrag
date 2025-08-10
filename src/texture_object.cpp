@@ -39,6 +39,7 @@ TextureObject::TextureObject()
 {
     SetCacheBudgetGB(8.0);
     LOG_INFO << "Texture GPU cache budget set to " << GetCacheBudgetGB() << " GB (default)";
+    ResetCacheStats();
 }
 
 TextureObject::~TextureObject()
@@ -67,6 +68,7 @@ void TextureObject::Bind(int i)
     ensure(i >= 0 && i < (int) texInfoVec.size());
     // load texture from qimage on first use
     if (texNameVec[i] == 0) {
+        cacheMisses_++;
         QImage img(texInfoVec[i].path.c_str());
         ensure(!img.isNull());
         if ((img.format() != QImage::Format_RGB32) && (img.format() != QImage::Format_ARGB32)) {
@@ -95,6 +97,7 @@ void TextureObject::Bind(int i)
         TouchLRU(i);
     }
     else {
+        cacheHits_++;
         glFuncs->glBindTexture(GL_TEXTURE_2D, texNameVec[i]);
         TouchLRU(i);
         CHECK_GL_ERROR();
@@ -243,6 +246,8 @@ void TextureObject::EvictIfNeeded(uint64_t bytesToAdd)
             glFuncs->glDeleteTextures(1, &texNameVec[victim]);
             texNameVec[victim] = 0;
             if (victim < texBytesVec_.size()) {
+                cacheEvictions_++;
+                bytesEvicted_ += texBytesVec_[victim];
                 currentCacheBytes_ -= texBytesVec_[victim];
                 texBytesVec_[victim] = 0;
             }
@@ -267,4 +272,20 @@ void TextureObject::RemoveFromLRU(std::size_t idx)
         lruList_.erase(it->second);
         lruMap_.erase(it);
     }
+}
+
+void TextureObject::ResetCacheStats() {
+    cacheHits_ = 0;
+    cacheMisses_ = 0;
+    cacheEvictions_ = 0;
+    bytesEvicted_ = 0;
+}
+
+TextureObject::CacheStats TextureObject::GetCacheStats() const {
+    CacheStats s;
+    s.hits = cacheHits_;
+    s.misses = cacheMisses_;
+    s.evictions = cacheEvictions_;
+    s.bytesEvicted = bytesEvicted_;
+    return s;
 }

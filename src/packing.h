@@ -27,6 +27,7 @@
 
 #include <vector>
 #include <map>
+#include <cstddef>
 
 
 /* Pack the texture atlas encoded in the graph. Assumes the segmentation
@@ -50,5 +51,7 @@ void IntegerShift(Mesh& m,
                   const std::map<ChartHandle, int>& anchorMap,
                   const std::map<RegionID, bool>& flippedInput);
 
+// Configure the packing rasterizer cache maximum size in bytes
+void SetRasterizerCacheMaxBytes(std::size_t bytes);
 
 #endif // PACKING_H

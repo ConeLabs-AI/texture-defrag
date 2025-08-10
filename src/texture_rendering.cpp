@@ -50,6 +50,8 @@
 #include <QSurfaceFormat>
 #include <QOffscreenSurface>
 
+#include <chrono>
+#include <limits>
 
 
 static const char *vs_text[] = {
@@ -265,9 +267,13 @@ public:
     }
     void enqueue(QImage image, const QString& absolutePath, int quality) {
         std::unique_lock<std::mutex> lock(mutex);
+        auto t_wait_start = std::chrono::high_resolution_clock::now();
         notFull.wait(lock, [this]() { return stop || queue.size() < static_cast<size_t>(maxInFlight); });
+        auto t_wait_end = std::chrono::high_resolution_clock::now();
+        totalEnqueueWaitS += std::chrono::duration<double>(t_wait_end - t_wait_start).count();
         if (stop) return;
         queue.push(Task{std::move(image), absolutePath, quality});
+        tasksEnqueued++;
         notEmpty.notify_one();
     }
     void finish() {
@@ -278,6 +284,34 @@ public:
         notEmpty.notify_all();
         notFull.notify_all();
         if (worker.joinable()) worker.join();
+    }
+    struct SaveStats {
+        int enqueued = 0;
+        int saved = 0;
+        double totalSaveS = 0.0;
+        double minSaveS = std::numeric_limits<double>::infinity();
+        double maxSaveS = 0.0;
+        double totalEnqueueWaitS = 0.0;
+    };
+    SaveStats statsSnapshot() {
+        std::lock_guard<std::mutex> lock(mutex);
+        SaveStats s;
+        s.enqueued = tasksEnqueued;
+        s.saved = tasksSaved;
+        s.totalSaveS = totalSaveS;
+        s.minSaveS = (tasksSaved > 0) ? minSaveS : 0.0;
+        s.maxSaveS = maxSaveS;
+        s.totalEnqueueWaitS = totalEnqueueWaitS;
+        return s;
+    }
+    void resetStats() {
+        std::lock_guard<std::mutex> lock(mutex);
+        tasksEnqueued = 0;
+        tasksSaved = 0;
+        totalSaveS = 0.0;
+        minSaveS = std::numeric_limits<double>::infinity();
+        maxSaveS = 0.0;
+        totalEnqueueWaitS = 0.0;
     }
 private:
     struct Task {
@@ -296,7 +330,18 @@ private:
                 queue.pop();
                 notFull.notify_one();
             }
-            if (!task.image.save(task.path, "png", task.quality)) {
+            auto t_save_start = std::chrono::high_resolution_clock::now();
+            bool ok = task.image.save(task.path, "png", task.quality);
+            auto t_save_end = std::chrono::high_resolution_clock::now();
+            double t_save_s = std::chrono::duration<double>(t_save_end - t_save_start).count();
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                tasksSaved++;
+                totalSaveS += t_save_s;
+                if (t_save_s > maxSaveS) maxSaveS = t_save_s;
+                if (t_save_s < minSaveS) minSaveS = t_save_s;
+            }
+            if (!ok) {
                 LOG_ERR << "Error saving texture file " << task.path.toStdString();
             }
         }
@@ -308,6 +353,13 @@ private:
     std::queue<Task> queue;
     int maxInFlight = 2;
     bool stop = false;
+    // Stats
+    int tasksEnqueued = 0;
+    int tasksSaved = 0;
+    double totalSaveS = 0.0;
+    double minSaveS = std::numeric_limits<double>::infinity();
+    double maxSaveS = 0.0;
+    double totalEnqueueWaitS = 0.0;
 };
 
 static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
@@ -357,13 +409,14 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
 
     auto t_total_start = std::chrono::high_resolution_clock::now();
     double t_total_render_s = 0.0;
-    double t_total_readpixels_s = 0.0;
     double t_total_savequeue_enqueue_s = 0.0;
     double t_total_png_save_s = 0.0; // captured by queue
+    double t_save_wait_s = 0.0;      // time waiting in finish()
     int64_t total_pixels_rendered = 0;
 
     RenderingContext renderingContext;
     ImageSaveQueue saveQueue(2);
+    saveQueue.resetStats();
 
     for (int i = 0; i < nTex; ++i) {
         LOG_INFO << "Processing sheet " << (i + 1) << " of " << nTex << "...";
@@ -393,8 +446,12 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
     auto t_save_finish_start = std::chrono::high_resolution_clock::now();
     saveQueue.finish();
     auto t_save_finish_end = std::chrono::high_resolution_clock::now();
-    t_total_png_save_s += std::chrono::duration<double>(t_save_finish_end - t_save_finish_start).count();
+    t_save_wait_s += std::chrono::duration<double>(t_save_finish_end - t_save_finish_start).count();
     QDir::setCurrent(wd);
+
+    // Snapshot queue save stats
+    auto saveStats = saveQueue.statsSnapshot();
+    t_total_png_save_s = saveStats.totalSaveS;
 
     auto t_total_end = std::chrono::high_resolution_clock::now();
     double t_total_s = std::chrono::duration<double>(t_total_end - t_total_start).count();
@@ -405,7 +462,11 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
              << " total_s=" << t_total_s
              << " render_s=" << t_total_render_s
              << " enqueue_s=" << t_total_savequeue_enqueue_s
-             << " save_finish_s=" << t_total_png_save_s;
+             << " save_wait_s=" << t_save_wait_s
+             << " png_save_s=" << t_total_png_save_s
+             << " png_min_s=" << saveStats.minSaveS
+             << " png_max_s=" << saveStats.maxSaveS
+             << " png_saved=" << saveStats.saved;
 
     // Log GPU texture cache stats
     if (textureObject) {

@@ -64,6 +64,8 @@ struct TextureObject {
 
     /* Releases the texture i, without unbinding it if it is bound */
     void Release(int i);
+    /* Releases all textures */
+    void ReleaseAll();
 
     int TextureWidth(std::size_t i);
     int TextureHeight(std::size_t i);

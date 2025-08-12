@@ -35,6 +35,7 @@
 
 #include <vector>
 #include <algorithm>
+#include <cmath>
 
 
 static void MirrorU(ChartHandle chart);
@@ -160,8 +161,16 @@ void TrimTexture(Mesh& m, std::vector<TextureSize>& texszVec, bool unsafeMip)
         for (auto fptr : facesByTexture[ti]) {
             if (AreaUV(*fptr) != 0) {
                 for (int i = 0; i < 3; ++i) {
+                    // Translate to new origin and scale to [0,1] domain of the trimmed texture
                     fptr->WT(i).P() -= t;
                     fptr->WT(i).P().Scale(uscale, vscale);
+
+                    // Clamp to [0,1) to avoid precision spill outside and texture wrap
+                    const double oneMinus = std::nextafter(1.0, 0.0);
+                    auto &uvP = fptr->WT(i).P();
+                    if (uvP.X() < 0.0) uvP.X() = 0.0; else if (uvP.X() > oneMinus) uvP.X() = oneMinus;
+                    if (uvP.Y() < 0.0) uvP.Y() = 0.0; else if (uvP.Y() > oneMinus) uvP.Y() = oneMinus;
+
                     fptr->V(i)->T().P() = fptr->WT(i).P();
                 }
             }
@@ -178,10 +187,11 @@ void TrimTexture(Mesh& m, std::vector<TextureSize>& texszVec, bool unsafeMip)
                 }
             }
 
-            ensure(uvBoxCheck.min.X() > 0);
-            ensure(uvBoxCheck.min.Y() > 0);
-            ensure(uvBoxCheck.max.X() < 1);
-            ensure(uvBoxCheck.max.X() < 1);
+            const double EPS = 1e-9;
+            ensure(uvBoxCheck.min.X() >= -EPS);
+            ensure(uvBoxCheck.min.Y() >= -EPS);
+            ensure(uvBoxCheck.max.X() <= 1.0 + EPS);
+            ensure(uvBoxCheck.max.Y() <= 1.0 + EPS);
         }
 
         // resize

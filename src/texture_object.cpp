@@ -33,6 +33,7 @@
 
 #include <QImageReader>
 #include <QImage>
+#include <QOpenGLContext>
 
 
 TextureObject::TextureObject()
@@ -44,8 +45,10 @@ TextureObject::TextureObject()
 
 TextureObject::~TextureObject()
 {
-    for (std::size_t i = 0; i < texNameVec.size(); ++i)
-        Release(i);
+    if (QOpenGLContext::currentContext() != nullptr) {
+        for (std::size_t i = 0; i < texNameVec.size(); ++i)
+            Release(i);
+    }
 }
 
 bool TextureObject::AddImage(std::string path)
@@ -117,6 +120,13 @@ void TextureObject::Release(int i)
             texBytesVec_[i] = 0;
         }
         RemoveFromLRU(i);
+    }
+}
+
+void TextureObject::ReleaseAll()
+{
+    for (std::size_t i = 0; i < texNameVec.size(); ++i) {
+        Release(static_cast<int>(i));
     }
 }
 

@@ -41,4 +41,3 @@ RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObjectHandl
                      bool filter, RenderMode imode);
 
 #endif // TEXTURE_RENDERING_H
-

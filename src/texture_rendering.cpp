@@ -482,6 +482,8 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
                  << " bytesInUse=" << textureObject->GetCurrentCacheBytes()
                  << "/budget=" << textureObject->GetCacheBudgetBytes();
     }
+
+    if (textureObject) textureObject->ReleaseAll();
 }
 
 static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,

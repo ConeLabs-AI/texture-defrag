@@ -140,5 +140,3 @@ uint32_t CompileShaders(const char **vs_text, const char **fs_text)
 
     return program;
 }
-
-

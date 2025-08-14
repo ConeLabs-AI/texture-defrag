@@ -219,4 +219,3 @@ static void MirrorU(ChartHandle chart)
     }
     chart->ParameterizationChanged();
 }
-

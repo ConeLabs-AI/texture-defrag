@@ -50,6 +50,10 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QString>
+#include <QOpenGLContext>
+#include <QSurfaceFormat>
+#include <QOffscreenSurface>
+#include <QOpenGLFunctions>
 
 struct Args {
     double m = 2.0;
@@ -71,6 +75,8 @@ void PrintArgsUsage(const char *binary);
 bool ParseOption(const std::string& option, const std::string& argument, Args *args);
 Args ParseArgs(int argc, char *argv[]);
 
+void EnsureOpenGLContextOrExit();
+
 int main(int argc, char *argv[])
 {
     // Make sure the executable directory is added to Qt's library path
@@ -90,6 +96,9 @@ int main(int argc, char *argv[])
     ap.rotationNum = args.r;
 
     LOG_INIT(args.l);
+
+    LOG_INFO << "Verifying OpenGL context availability...";
+    EnsureOpenGLContextOrExit();
 
 #ifdef _OPENMP
     LOG_INFO << "OpenMP is enabled.";
@@ -413,4 +422,44 @@ Args ParseArgs(int argc, char *argv[])
     }
 
     return args;
+}
+
+void EnsureOpenGLContextOrExit()
+{
+    QSurfaceFormat format;
+    format.setVersion(4, 1);
+    format.setProfile(QSurfaceFormat::CoreProfile);
+
+    QOpenGLContext context;
+    context.setFormat(format);
+    if (!context.create()) {
+        LOG_ERR << "Failed to create OpenGL context. Ensure a headless backend is available (e.g., set QT_QPA_PLATFORM=offscreen QT_OPENGL=egl) or a valid X/GLX display.";
+        std::exit(-1);
+    }
+
+    QOffscreenSurface surface;
+    surface.setFormat(context.format());
+    surface.create();
+    if (!surface.isValid()) {
+        LOG_ERR << "Failed to create offscreen surface for OpenGL.";
+        std::exit(-1);
+    }
+
+    if (!context.makeCurrent(&surface)) {
+        LOG_ERR << "Failed to make OpenGL context current on offscreen surface.";
+        std::exit(-1);
+    }
+
+    QOpenGLFunctions *f = context.functions();
+    if (f) {
+        f->initializeOpenGLFunctions();
+        const char *vendor = reinterpret_cast<const char *>(f->glGetString(GL_VENDOR));
+        const char *renderer = reinterpret_cast<const char *>(f->glGetString(GL_RENDERER));
+        const char *version = reinterpret_cast<const char *>(f->glGetString(GL_VERSION));
+        LOG_INFO << "[GL] Vendor: " << (vendor ? vendor : "unknown")
+                 << " Renderer: " << (renderer ? renderer : "unknown")
+                 << " Version: " << (version ? version : "unknown");
+    }
+
+    context.doneCurrent();
 }

@@ -18,15 +18,71 @@ The proposed approach is fully automatic and extensively tested on a large bench
 Dependencies:
  * QT5
 
-Building using qmake on Linux with GCC should be straightforward:
+Setup procedure for Ubuntu AWS EC2 instance with Nvidia GPU to build and run in headless environment. Uses virtual X server (Xvfb) with Nvidia hardware OpenGL rendering.
 
+## 1. Instance Setup
+
+**1.0 Install NVIDIA driver (GRID/vGPU)**
+
+Follow AWS documentation: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/install-nvidia-driver.html#nvidia-GRID-driver
+
+**1.1 Install Build Tools and Qt5 Dependencies**
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential qt5-qmake qtbase5-dev libgl1-mesa-dev
 ```
+
+**1.2 Install Virtual Framebuffer (Xvfb)**
+```bash
+sudo apt-get install -y xvfb
+```
+
+**1.3 Set User Permissions for GPU Access**
+```bash
+sudo usermod -a -G video,render ubuntu
+```
+
+**IMPORTANT:** Log out and reconnect SSH session or reboot:
+```bash
+# EITHER log out and reconnect
+exit
+
+# OR reboot
+sudo reboot
+```
+
+## 2. Building the Application
+
+```bash
+# Navigate to project directory, then:
+rm -rf build
 mkdir build && cd build
 qmake ../texture-defrag/texture-defrag.pro -spec linux-g++
-make
+make -j32
 ```
 
-The executable takes as arguments the input mesh file and optional parameters to control the various steps of the texture defragmentation algorithm.
+## 3. Running the Application
+
+Set `__GLX_VENDOR_LIBRARY_NAME=nvidia` to force Nvidia hardware OpenGL rendering instead of software `llvmpipe` renderer.
+
+**3.1 Interactive Testing**
+```bash
+__GLX_VENDOR_LIBRARY_NAME=nvidia \
+xvfb-run --auto-servernum ./texture-defrag \
+~/consor/merlin_textured.obj -o ~/ts/processed.obj -l 1 -g 99999.0 -r 4 -c 5 -p 80
+```
+
+Verify output shows: `[GL] Vendor: NVIDIA Corporation`
+
+**3.2 Background Processing**
+```bash
+nohup env __GLX_VENDOR_LIBRARY_NAME=nvidia \
+xvfb-run --auto-servernum ./texture-defrag \
+~/consor/merlin_textured.obj \
+-o ~/ts/processed.obj \
+-l 1 -g 99999.0 -r 4 -c 5 -p 80 \
+> ~/ts/processing.log 2>&1 &
+```
 
 ```
 Usage: ./texture-defrag MESHFILE [-mbdgutao]

@@ -63,9 +63,9 @@ make -j32
 
 ## 3. Running the Application
 
-Set `__GLX_VENDOR_LIBRARY_NAME=nvidia` to force Nvidia hardware OpenGL rendering instead of software `llvmpipe` renderer.
+Set `__GLX_VENDOR_LIBRARY_NAME=nvidia` to force Nvidia hardware OpenGL rendering instead of software `llvmpipe` renderer:
 
-**3.1 Interactive Testing**
+**Interactive**
 ```bash
 __GLX_VENDOR_LIBRARY_NAME=nvidia \
 xvfb-run --auto-servernum ./texture-defrag \
@@ -74,7 +74,7 @@ xvfb-run --auto-servernum ./texture-defrag \
 
 Verify output shows: `[GL] Vendor: NVIDIA Corporation`
 
-**3.2 Background Processing**
+**Background**
 ```bash
 nohup env __GLX_VENDOR_LIBRARY_NAME=nvidia \
 xvfb-run --auto-servernum ./texture-defrag \

@@ -435,14 +435,14 @@ void EnsureOpenGLContextOrExit(std::unique_ptr<QOpenGLContext>& context, std::un
     format.setVersion(4, 1);
     format.setProfile(QSurfaceFormat::CoreProfile);
 
-    context = std::make_unique<QOpenGLContext>();
+    context.reset(new QOpenGLContext());
     context->setFormat(format);
     if (!context->create()) {
         LOG_ERR << "Failed to create OpenGL context. Ensure a headless backend is available (e.g., set QT_QPA_PLATFORM=offscreen QT_OPENGL=egl) or a valid X/GLX display.";
         std::exit(-1);
     }
 
-    surface = std::make_unique<QOffscreenSurface>();
+    surface.reset(new QOffscreenSurface());
     surface->setFormat(context->format());
     surface->create();
     if (!surface->isValid()) {
@@ -465,5 +465,4 @@ void EnsureOpenGLContextOrExit(std::unique_ptr<QOpenGLContext>& context, std::un
                  << " Renderer: " << (renderer ? renderer : "unknown")
                  << " Version: " << (version ? version : "unknown");
     }
-
 }

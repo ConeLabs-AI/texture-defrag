@@ -42,6 +42,7 @@
 #include <iostream>
 #include <fstream>
 #include <map>
+#include <memory>
 
 #include <omp.h>
 
@@ -75,12 +76,16 @@ void PrintArgsUsage(const char *binary);
 bool ParseOption(const std::string& option, const std::string& argument, Args *args);
 Args ParseArgs(int argc, char *argv[]);
 
-void EnsureOpenGLContextOrExit();
+void EnsureOpenGLContextOrExit(std::unique_ptr<QOpenGLContext>& context, std::unique_ptr<QOffscreenSurface>& surface);
 
 int main(int argc, char *argv[])
 {
     // Make sure the executable directory is added to Qt's library path
     QApplication app(argc, argv);
+
+    // Persistent OpenGL context and offscreen surface for the whole application lifetime
+    std::unique_ptr<QOpenGLContext> mainContext;
+    std::unique_ptr<QOffscreenSurface> mainSurface;
 
     AlgoParameters ap;
 
@@ -98,7 +103,7 @@ int main(int argc, char *argv[])
     LOG_INIT(args.l);
 
     LOG_INFO << "Verifying OpenGL context availability...";
-    EnsureOpenGLContextOrExit();
+    EnsureOpenGLContextOrExit(mainContext, mainSurface);
 
 #ifdef _OPENMP
     LOG_INFO << "OpenMP is enabled.";
@@ -424,33 +429,33 @@ Args ParseArgs(int argc, char *argv[])
     return args;
 }
 
-void EnsureOpenGLContextOrExit()
+void EnsureOpenGLContextOrExit(std::unique_ptr<QOpenGLContext>& context, std::unique_ptr<QOffscreenSurface>& surface)
 {
     QSurfaceFormat format;
     format.setVersion(4, 1);
     format.setProfile(QSurfaceFormat::CoreProfile);
 
-    QOpenGLContext context;
-    context.setFormat(format);
-    if (!context.create()) {
+    context = std::make_unique<QOpenGLContext>();
+    context->setFormat(format);
+    if (!context->create()) {
         LOG_ERR << "Failed to create OpenGL context. Ensure a headless backend is available (e.g., set QT_QPA_PLATFORM=offscreen QT_OPENGL=egl) or a valid X/GLX display.";
         std::exit(-1);
     }
 
-    QOffscreenSurface surface;
-    surface.setFormat(context.format());
-    surface.create();
-    if (!surface.isValid()) {
+    surface = std::make_unique<QOffscreenSurface>();
+    surface->setFormat(context->format());
+    surface->create();
+    if (!surface->isValid()) {
         LOG_ERR << "Failed to create offscreen surface for OpenGL.";
         std::exit(-1);
     }
 
-    if (!context.makeCurrent(&surface)) {
+    if (!context->makeCurrent(surface.get())) {
         LOG_ERR << "Failed to make OpenGL context current on offscreen surface.";
         std::exit(-1);
     }
 
-    QOpenGLFunctions *f = context.functions();
+    QOpenGLFunctions *f = context->functions();
     if (f) {
         f->initializeOpenGLFunctions();
         const char *vendor = reinterpret_cast<const char *>(f->glGetString(GL_VENDOR));
@@ -461,5 +466,4 @@ void EnsureOpenGLContextOrExit()
                  << " Version: " << (version ? version : "unknown");
     }
 
-    context.doneCurrent();
 }

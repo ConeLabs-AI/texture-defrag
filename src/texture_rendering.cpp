@@ -145,29 +145,8 @@ struct RenderingContext {
 
     RenderingContext() {
         if (QOpenGLContext::currentContext() == nullptr) {
-            LOG_DEBUG << "Creating persistent OpenGL context for rendering.";
-            ownContext = true;
-
-            context.reset(new QOpenGLContext());
-            surface.reset(new QOffscreenSurface());
-
-            QSurfaceFormat format;
-            format.setVersion(4, 1);
-            format.setProfile(QSurfaceFormat::OpenGLContextProfile::CoreProfile);
-            context->setFormat(format);
-
-            if (!context->create()) {
-                LOG_ERR << "Failed to create opengl context";
-                std::exit(-1);
-            }
-
-            surface->setFormat(context->format());
-            surface->create();
-
-            if (!context->makeCurrent(surface.get())) {
-                LOG_ERR << "Failed to make OpenGL context current";
-                std::exit(-1);
-            }
+            LOG_ERR << "No current OpenGL context. Ensure a persistent context is created before rendering.";
+            std::exit(-1);
         }
 
         glFuncs = GetOpenGLFunctionsHandle();

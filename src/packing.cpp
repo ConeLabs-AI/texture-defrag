@@ -347,6 +347,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         LOG_INFO << "[DIAG] Creating individual containers for " << remainingUnpacked.size() << " unpacked charts.";
         
         for (unsigned ci : remainingUnpacked) {
+            float mul = chartScaleMul[ci];
             ChartHandle chartptr = charts[ci];
             auto outline = ExtractOutline2d(*chartptr);
             
@@ -380,7 +381,6 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             std::vector<std::vector<vcg::Point2f>> singleOutlineVec;
             singleOutlineVec.emplace_back();
             singleOutlineVec.back().reserve(outline.size());
-            float mul = chartScaleMul[ci];
             for (const auto &p : outline) {
                 singleOutlineVec.back().push_back(vcg::Point2f(static_cast<float>(p.X()*mul), static_cast<float>(p.Y()*mul)));
             }

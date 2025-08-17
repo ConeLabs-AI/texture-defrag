@@ -358,7 +358,6 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             
             // Calculate container size based on bounding box and per-chart scale
             int padding = 8; // 8 pixel padding
-            float mul = chartScaleMul[ci];
             int requiredWidth = (int)std::ceil(bb.DimX() * mul) + padding;
             int requiredHeight = (int)std::ceil(bb.DimY() * mul) + padding;
             

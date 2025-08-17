@@ -50,7 +50,7 @@ void SetRasterizerCacheMaxBytes(std::size_t bytes)
 }
 
 
-int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObject, std::vector<TextureSize>& texszVec, const struct AlgoParameters& params)
+int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObject, std::vector<TextureSize>& texszVec, const struct AlgoParameters& params, const std::map<ChartHandle, int>& anchorMap)
 {
     using Packer = RasterizedOutline2Packer<float, QtOutline2Rasterizer>;
     auto rpack_params = Packer::Parameters();
@@ -63,14 +63,29 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     texszVec.clear();
 
     std::vector<Outline2f> outlines;
+    outlines.reserve(charts.size());
+    std::vector<float> chartScaleMul;
+    chartScaleMul.reserve(charts.size());
+    std::vector<double> chartAreasOriginal;
+    chartAreasOriginal.reserve(charts.size());
 
     for (auto c : charts) {
-        // Save the outline of the parameterization for this portion of the mesh
+        // Determine per-chart scale: 1.0 for 1:1 copy (present in anchorMap), sqrt(2) for resampled charts
+        float mul = (anchorMap.find(c) != anchorMap.end()) ? 1.0f : static_cast<float>(std::sqrt(2.0));
+        chartScaleMul.push_back(mul);
+        // Save the outline of the parameterization for this portion of the mesh and apply per-chart scaling
         Outline2f outline = ExtractOutline2f(*c);
+        // Track original area before scaling
+        double originalAreaAbs = std::abs(vcg::tri::OutlineUtil<float>::Outline2Area(outline));
+        chartAreasOriginal.push_back(originalAreaAbs);
+        for (auto &p : outline) {
+            p.X() *= mul;
+            p.Y() *= mul;
+        }
         outlines.push_back(outline);
     }
 
-    // Precompute per-chart absolute UV area
+    // Precompute per-chart absolute UV area (after per-chart scaling)
     std::vector<double> chartAreas(outlines.size(), 0.0);
     for (size_t i = 0; i < outlines.size(); ++i) {
         chartAreas[i] = std::abs(vcg::tri::OutlineUtil<float>::Outline2Area(outlines[i]));
@@ -92,9 +107,23 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         packingArea += containerVec[i].X() * containerVec[i].Y();
         textureArea += textureObject->TextureWidth(i) * textureObject->TextureHeight(i);
     }
-    // double targetTextureArea = textureArea * params.resolutionScaling * params.resolutionScaling;
-    // double packingScale = (packingArea > 0) ? std::sqrt(targetTextureArea / packingArea) : 1.0;
-    double packingScale = (textureArea > 0) ? std::sqrt(packingArea / (double)textureArea) : 1.0;
+    // Adjust target area: preserve 1:1 charts, give sqrt(2) more area to resampled charts
+    double targetUVArea = 0.0;
+    for (size_t i = 0; i < chartAreasOriginal.size(); ++i) {
+        // 1:1 charts keep original area; resampled charts get mul^2 (i.e., 2.0) area
+        double mul = chartScaleMul[i];
+        targetUVArea += chartAreasOriginal[i] * double(mul) * double(mul);
+    }
+    // If we do not have outline areas, fall back to original texture area target
+    double packingScale = 1.0;
+    if (targetUVArea > 0.0) {
+        // The virtual grid area is packingArea; scale outlines by packingScale so that placed area ~= packingArea
+        // outlines are already multiplied per-chart; Rasterizer also takes packingScale. We set packingScale so that
+        // targetUVArea * packingScale^2 ~= packingArea => packingScale = sqrt(packingArea / targetUVArea)
+        packingScale = std::sqrt((double)packingArea / targetUVArea);
+    } else {
+        packingScale = (textureArea > 0) ? std::sqrt(packingArea / (double)textureArea) : 1.0;
+    }
 
     if (!std::isfinite(packingScale) || packingScale <= 0) {
         LOG_WARN << "[DIAG] Invalid packingScale computed: " << packingScale
@@ -327,10 +356,11 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
                 bb.Add(p);
             }
             
-            // Calculate container size based on bounding box
+            // Calculate container size based on bounding box and per-chart scale
             int padding = 8; // 8 pixel padding
-            int requiredWidth = (int)std::ceil(bb.DimX()) + padding;
-            int requiredHeight = (int)std::ceil(bb.DimY()) + padding;
+            float mul = chartScaleMul[ci];
+            int requiredWidth = (int)std::ceil(bb.DimX() * mul) + padding;
+            int requiredHeight = (int)std::ceil(bb.DimY() * mul) + padding;
             
             // Round up to nearest power of two
             requiredWidth = roundUpToPowerOfTwo(requiredWidth);
@@ -351,8 +381,9 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             std::vector<std::vector<vcg::Point2f>> singleOutlineVec;
             singleOutlineVec.emplace_back();
             singleOutlineVec.back().reserve(outline.size());
+            float mul = chartScaleMul[ci];
             for (const auto &p : outline) {
-                singleOutlineVec.back().push_back(vcg::Point2f(static_cast<float>(p.X()), static_cast<float>(p.Y())));
+                singleOutlineVec.back().push_back(vcg::Point2f(static_cast<float>(p.X()*mul), static_cast<float>(p.Y()*mul)));
             }
  
             std::vector<vcg::Similarity2f> singleTrVec;
@@ -387,13 +418,14 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
                  containerIndices[ci] = nc; // Assign to the current container index
                  packingTransforms[ci] = singleTrVec[0];
  
-                 // Create a new texture/atlas for this chart
-                 TextureSize tsz;
-                 tsz.w = requiredWidth;
-                 tsz.h = requiredHeight;
-                 texszVec.push_back(tsz);
-                 containerVec.push_back(containerSize); // Add the container to the list
-                 nc++; // Increment container count for next individual container
+                // Create a new texture/atlas for this chart
+                TextureSize tsz;
+                float textureScaleLocal = 1.0f / scale;
+                tsz.w = (int)std::max(1.0f, std::floor(requiredWidth * textureScaleLocal));
+                tsz.h = (int)std::max(1.0f, std::floor(requiredHeight * textureScaleLocal));
+                texszVec.push_back(tsz);
+                containerVec.push_back(containerSize); // Add the container to the list
+                nc++; // Increment container count for next individual container
  
                  totPacked++;
  
@@ -419,7 +451,8 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
                 Point2i gridSize = containerVec[ic];
                 for (int j = 0; j < fptr->VN(); ++j) {
                     Point2d uv = fptr->WT(j).P();
-                    Point2f p = packingTransforms[i] * (Point2f(uv[0], uv[1]));
+                    float mul = chartScaleMul[i];
+                    Point2f p = packingTransforms[i] * (Point2f(uv[0] * mul, uv[1] * mul));
                     p.X() /= (double) gridSize.X();
                     p.Y() /= (double) gridSize.Y();
                     fptr->V(j)->T().P() = Point2d(p.X(), p.Y());

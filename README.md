@@ -80,7 +80,7 @@ nohup env __GLX_VENDOR_LIBRARY_NAME=nvidia \
 xvfb-run --auto-servernum ./texture-defrag \
 ~/consor/merlin_textured.obj \
 -o ~/ts/processed.obj \
--l 1 -g 99999.0 -r 4 -c 5 -p 80 \
+-l 1 -g 99999.0 -r 1 -c 5 -p 80 \
 > ~/ts/processing.log 2>&1 &
 ```
 

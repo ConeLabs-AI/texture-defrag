@@ -416,7 +416,7 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
         const QString absPath = texFI.absoluteFilePath();
         // Enqueue save to overlap compression with next sheet rendering
         auto t_enqueue_start = std::chrono::high_resolution_clock::now();
-        saveQueue.enqueue(*teximg, absPath, 90);
+        saveQueue.enqueue(*teximg, absPath, 50);
         auto t_enqueue_end = std::chrono::high_resolution_clock::now();
         t_total_savequeue_enqueue_s += std::chrono::duration<double>(t_enqueue_end - t_enqueue_start).count();
     }
@@ -542,7 +542,7 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
 
     glFuncs->glDrawBuffer(GL_COLOR_ATTACHMENT0);
 
-    glFuncs->glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
+    glFuncs->glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 
     glFuncs->glClear(GL_COLOR_BUFFER_BIT);
 
@@ -605,7 +605,7 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
     glFuncs->glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     if (filter)
-        vcg::PullPush(*textureImage, qRgba(0, 255, 0, 255));
+        vcg::PullPush(*textureImage, qRgba(0, 0, 0, 255));
 
     LOG_INFO << "[RENDER-PROFILE] vbo_s=" << t_vbo_s
              << " draw_s=" << t_draw_s

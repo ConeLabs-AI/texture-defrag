@@ -258,7 +258,7 @@ int main(int argc, char *argv[])
     LOG_INFO << "Packing atlas of size " << chartsToPack.size();
 
     std::vector<TextureSize> texszVec;
-    int npacked = Pack(chartsToPack, textureObject, texszVec, ap);
+    int npacked = Pack(chartsToPack, textureObject, texszVec, ap, anchorMap);
     timings["Packing"] = t.TimeSinceLastCheck();
 
     LOG_INFO << "Packed " << npacked << " charts in " << timings["Packing"] << " seconds";

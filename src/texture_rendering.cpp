@@ -62,13 +62,15 @@ static const char *vs_text[] = {
     "in vec4 color;                                              \n"
     "out vec2 uv;                                                \n"
     "out vec4 fcolor;                                            \n"
+    "uniform vec2 tile_min;                                      \n"
+    "uniform vec2 tile_scale;                                    \n"
     "                                                            \n"
     "void main(void)                                             \n"
     "{                                                           \n"
     "    uv = texcoord;                                          \n"
     "    fcolor = color;                                         \n"
-    "    //if (uv.s < 0) uv = vec2(0.0, 0.0);                    \n"
-    "    vec2 p = vec2(2.0 * position.x - 1.0, 1.0 - 2.0 * position.y);\n"
+    "    vec2 local = (position - tile_min) / tile_scale;        \n"
+    "    vec2 p = vec2(2.0 * local.x - 1.0, 1.0 - 2.0 * local.y);\n"
     "    gl_Position = vec4(p, 0.5, 1.0);                        \n"
     "}                                                           \n"
 };
@@ -142,6 +144,8 @@ struct RenderingContext {
     GLint loc_img0 = -1;
     GLint loc_texture_size = -1;
     GLint loc_render_mode = -1;
+    GLint loc_tile_min = -1;
+    GLint loc_tile_scale = -1;
 
     RenderingContext() {
         if (QOpenGLContext::currentContext() == nullptr) {
@@ -183,6 +187,8 @@ struct RenderingContext {
         loc_img0 = glFuncs->glGetUniformLocation(program, "img0");
         loc_texture_size = glFuncs->glGetUniformLocation(program, "texture_size");
         loc_render_mode = glFuncs->glGetUniformLocation(program, "render_mode");
+        loc_tile_min = glFuncs->glGetUniformLocation(program, "tile_min");
+        loc_tile_scale = glFuncs->glGetUniformLocation(program, "tile_scale");
 
         glFuncs->glGenFramebuffers(1, &fbo);
         glFuncs->glGenTextures(1, &renderTarget);
@@ -525,82 +531,115 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
     auto t_vbo_end = std::chrono::high_resolution_clock::now();
     double t_vbo_s = std::chrono::duration<double>(t_vbo_end - t_vbo_start).count();
 
-    ctx.prepareRenderTarget(textureWidth, textureHeight);
-    glFuncs->glBindFramebuffer(GL_FRAMEBUFFER, ctx.fbo);
+    // Query GL limits and determine tile size for render target
+    GLint maxTexSize = 0;
+    GLint maxRenderbufferSize = 0;
+    GLint maxViewportDims[2] = {0, 0};
+    glFuncs->glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTexSize);
+    glFuncs->glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &maxRenderbufferSize);
+    glFuncs->glGetIntegerv(GL_MAX_VIEWPORT_DIMS, maxViewportDims);
+    int maxSide = std::min(std::min(maxTexSize, maxRenderbufferSize), std::min(maxViewportDims[0], maxViewportDims[1]));
+    int tileWMax = std::min(textureWidth, maxSide);
+    int tileHMax = std::min(textureHeight, maxSide);
 
-    // --- [DIAGNOSTIC] START: QImage Allocation ---
-    LOG_INFO << "[DIAG] Attempting to allocate QImage for rendering. Size: " << textureWidth << "x" << textureHeight;
     std::shared_ptr<QImage> textureImage = std::make_shared<QImage>(textureWidth, textureHeight, QImage::Format_ARGB32);
     if (textureImage->isNull()) {
         LOG_ERR << "[DIAG] FATAL: QImage allocation FAILED. System is out of memory.";
         logging::LogMemoryUsage();
         std::exit(-1);
     }
-    LOG_INFO << "[DIAG] QImage allocation successful. Memory usage AFTER QImage allocation:";
-    logging::LogMemoryUsage();
-    // --- [DIAGNOSTIC] END ---
 
-    glFuncs->glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    double t_draw_s = 0.0;
+    double t_read_s = 0.0;
 
-    glFuncs->glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    // Render and read back per-tile
+    for (int y = 0; y < textureHeight; y += tileHMax) {
+        int tileH = std::min(tileHMax, textureHeight - y);
+        for (int x = 0; x < textureWidth; x += tileWMax) {
+            int tileW = std::min(tileWMax, textureWidth - x);
 
-    glFuncs->glClear(GL_COLOR_BUFFER_BIT);
+            ctx.prepareRenderTarget(tileW, tileH);
+            glFuncs->glBindFramebuffer(GL_FRAMEBUFFER, ctx.fbo);
 
-    auto t_draw_start = std::chrono::high_resolution_clock::now();
-    auto f0 = fvec.begin();
-    auto fbase = f0;
-    while (fbase != fvec.end()) {
-        auto fcurr = fbase;
-        int currTexIndex = WTCSh[*fcurr].tc[0].N();
-        while (fcurr != fvec.end() && WTCSh[*fcurr].tc[0].N() == currTexIndex)
-            fcurr++;
-        int baseIndex = std::distance(f0, fbase) * 3;
-        int count = std::distance(fbase, fcurr) * 3;
+            glFuncs->glDrawBuffer(GL_COLOR_ATTACHMENT0);
 
-        // Load texture image
-        glFuncs->glActiveTexture(GL_TEXTURE0);
-        LOG_DEBUG << "Binding texture unit " << currTexIndex;
-        textureObject->Bind(currTexIndex);
+            glFuncs->glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glFuncs->glClear(GL_COLOR_BUFFER_BIT);
 
-        glFuncs->glUniform1i(ctx.loc_img0, 0);
-        glFuncs->glUniform2f(ctx.loc_texture_size, float(textureObject->TextureWidth(currTexIndex)), float(textureObject->TextureHeight(currTexIndex)));
+            // Set tile transform uniforms (in atlas normalized coordinates)
+            float tileMinX = float(x) / float(textureWidth);
+            float tileMinY = float(y) / float(textureHeight);
+            float tileScaleX = float(tileW) / float(textureWidth);
+            float tileScaleY = float(tileH) / float(textureHeight);
+            glFuncs->glUniform2f(ctx.loc_tile_min, tileMinX, tileMinY);
+            glFuncs->glUniform2f(ctx.loc_tile_scale, tileScaleX, tileScaleY);
 
+            auto t_draw_start = std::chrono::high_resolution_clock::now();
+            auto f0 = fvec.begin();
+            auto fbase = f0;
+            while (fbase != fvec.end()) {
+                auto fcurr = fbase;
+                int currTexIndex = WTCSh[*fcurr].tc[0].N();
+                while (fcurr != fvec.end() && WTCSh[*fcurr].tc[0].N() == currTexIndex)
+                    fcurr++;
+                int baseIndex = std::distance(f0, fbase) * 3;
+                int count = std::distance(fbase, fcurr) * 3;
 
-        glFuncs->glUniform1i(ctx.loc_render_mode, 0);
+                // Load texture image
+                glFuncs->glActiveTexture(GL_TEXTURE0);
+                LOG_DEBUG << "Binding texture unit " << currTexIndex;
+                textureObject->Bind(currTexIndex);
 
-        // Texture parameters are now set once in TextureObject::Bind, so we remove the redundant settings from here.
-        switch (imode) {
-        case Cubic:
-            glFuncs->glUniform1i(ctx.loc_render_mode, 1);
-            break;
-        case Linear:
-            // This is the default render_mode 0 in the shader
-            break;
-        case Nearest:
-            // Nearest filtering must be set on the texture object itself. For simplicity, we assume linear/cubic for this path.
-            // A more robust implementation might require passing filter mode to TextureObject::Bind.
-            break;
-        case FaceColor:
-            glFuncs->glUniform1i(ctx.loc_render_mode, 2);
-            break;
-        default:
-            ensure(0 && "Should never happen");
+                glFuncs->glUniform1i(ctx.loc_img0, 0);
+                glFuncs->glUniform2f(ctx.loc_texture_size, float(textureObject->TextureWidth(currTexIndex)), float(textureObject->TextureHeight(currTexIndex)));
+
+                glFuncs->glUniform1i(ctx.loc_render_mode, 0);
+
+                // Texture parameters are now set once in TextureObject::Bind, so we remove the redundant settings from here.
+                switch (imode) {
+                case Cubic:
+                    glFuncs->glUniform1i(ctx.loc_render_mode, 1);
+                    break;
+                case Linear:
+                    // Default render_mode 0
+                    break;
+                case Nearest:
+                    // Nearest filtering should be set on bound texture if needed
+                    break;
+                case FaceColor:
+                    glFuncs->glUniform1i(ctx.loc_render_mode, 2);
+                    break;
+                default:
+                    ensure(0 && "Should never happen");
+                }
+
+                glFuncs->glDrawArrays(GL_TRIANGLES, baseIndex, count);
+                CHECK_GL_ERROR();
+
+                fbase = fcurr;
+            }
+            auto t_draw_end = std::chrono::high_resolution_clock::now();
+            t_draw_s += std::chrono::duration<double>(t_draw_end - t_draw_start).count();
+
+            // Read back this tile directly into the final image using pixel pack offsets
+            glFuncs->glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glFuncs->glPixelStorei(GL_PACK_ALIGNMENT, 4);
+            int rowPixels = textureImage->bytesPerLine() / 4;
+            glFuncs->glPixelStorei(GL_PACK_ROW_LENGTH, rowPixels);
+            int destSkipRows = textureHeight - (y + tileH);
+            glFuncs->glPixelStorei(GL_PACK_SKIP_ROWS, destSkipRows);
+            glFuncs->glPixelStorei(GL_PACK_SKIP_PIXELS, x);
+            auto t_read_start = std::chrono::high_resolution_clock::now();
+            glFuncs->glReadPixels(0, 0, tileW, tileH, GL_BGRA, GL_UNSIGNED_BYTE, textureImage->bits());
+            auto t_read_end = std::chrono::high_resolution_clock::now();
+            t_read_s += std::chrono::duration<double>(t_read_end - t_read_start).count();
+
+            // Reset pixel store state
+            glFuncs->glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+            glFuncs->glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+            glFuncs->glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
         }
-
-        glFuncs->glDrawArrays(GL_TRIANGLES, baseIndex, count);
-        CHECK_GL_ERROR();
-
-        fbase = fcurr;
     }
-    auto t_draw_end = std::chrono::high_resolution_clock::now();
-    double t_draw_s = std::chrono::duration<double>(t_draw_end - t_draw_start).count();
-
-    glFuncs->glReadBuffer(GL_COLOR_ATTACHMENT0);
-    glFuncs->glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    auto t_read_start = std::chrono::high_resolution_clock::now();
-    glFuncs->glReadPixels(0, 0, textureWidth, textureHeight, GL_BGRA, GL_UNSIGNED_BYTE, textureImage->bits());
-    auto t_read_end = std::chrono::high_resolution_clock::now();
-    double t_read_s = std::chrono::duration<double>(t_read_end - t_read_start).count();
 
     glFuncs->glBindFramebuffer(GL_FRAMEBUFFER, 0);
 

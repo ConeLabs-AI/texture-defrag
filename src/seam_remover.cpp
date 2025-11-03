@@ -33,6 +33,7 @@
 #include "texture_rendering.h"
 
 
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <unordered_set>
@@ -599,7 +600,11 @@ static CostInfo ComputeCost(ClusteredSeamHandle csh, GraphHandle graph, const Al
 
     ChartHandle a = charts.first;
     ChartHandle b = charts.second;
-    if (a->AreaUV() == 0 || b->AreaUV() == 0 || a->Area3D() == 0 || b->Area3D() == 0) {
+    double aUV = a->AreaUV();
+    double bUV = b->AreaUV();
+    double a3D = a->Area3D();
+    double b3D = b->Area3D();
+    if (!std::isfinite(aUV) || !std::isfinite(bUV) || aUV <= 0 || bUV <= 0 || a3D <= 0 || b3D <= 0) {
         return { Infinity(), {}, CostInfo::ZERO_AREA };
     }
 

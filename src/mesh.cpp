@@ -73,6 +73,12 @@ bool LoadMesh(const char *fileName, Mesh& m, TextureObjectHandle& textureObject,
 
     LOG_INFO << "Loaded mesh " << fileName << " (VN " <<  m.VN() << ", FN " << m.FN() << ")";
 
+    if (m.textures.empty()) {
+        LOG_ERR << "No textures referenced by the input mesh. Ensure the OBJ references an MTL (mtllib) and materials specify map_Kd.";
+        QDir::setCurrent(wd);
+        return false;
+    }
+
     for (const string& textureName : m.textures) {
         QFileInfo textureFile(textureName.c_str());
         textureFile.makeAbsolute();
@@ -85,6 +91,12 @@ bool LoadMesh(const char *fileName, Mesh& m, TextureObjectHandle& textureObject,
             LOG_ERR << "Error: Unable to load texture file " << textureName.c_str();
             return false;
         }
+    }
+
+    if (textureObject->ArraySize() == 0) {
+        LOG_ERR << "No textures were loaded. Check that referenced files exist and are supported.";
+        QDir::setCurrent(wd);
+        return false;
     }
 
     QDir::setCurrent(wd);

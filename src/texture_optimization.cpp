@@ -85,7 +85,7 @@ int RotateChartForResampling(ChartHandle chart, const std::set<Mesh::FacePointer
         }
     }
 
-    // compute the rotation angle
+    // compute the rotation angle (guard against degenerate/invalid edges)
     TexCoordStorage tcs = wtcsh[zeroResamplingAreaFp];
     vcg::Point2d d0 = tcs.tc[1].P() - tcs.tc[0].P();
     vcg::Point2d d1 = zeroResamplingAreaFp->WT(1).P() - zeroResamplingAreaFp->WT(0).P();
@@ -94,8 +94,20 @@ int RotateChartForResampling(ChartHandle chart, const std::set<Mesh::FacePointer
         d0.X() *= -1;
     }
 
-    //double rotAngle = ((signedArea > 0) ? -1 : 1) * VecAngle(d0, d1);
-    double rotAngle = VecAngle(d0, d1);
+    double rotAngle = 0.0;
+    double len0 = d0.Norm();
+    double len1 = d1.Norm();
+    if (std::isfinite(len0) && std::isfinite(len1) && len0 > 1e-12 && len1 > 1e-12) {
+        rotAngle = VecAngle(d0, d1);
+        if (!std::isfinite(rotAngle)) {
+            LOG_WARN << "[DIAG] RotateChartForResampling: non-finite rotation angle computed for chart " << chart->id << ", forcing 0.";
+            rotAngle = 0.0;
+        }
+    } else {
+        LOG_WARN << "[DIAG] RotateChartForResampling: degenerate anchor edge for chart " << chart->id
+                 << " (|d0|=" << len0 << ", |d1|=" << len1 << "). Skipping rotation.";
+        rotAngle = 0.0;
+    }
 
     // rotate the uvs
     for (auto fptr : chart->fpVec) {
@@ -121,7 +133,8 @@ void TrimTexture(Mesh& m, std::vector<TextureSize>& texszVec, bool unsafeMip)
     for (unsigned ti = 0; ti < ntex; ++ti) {
         vcg::Box2d uvBox;
         for (auto fptr : facesByTexture[ti]) {
-            if (AreaUV(*fptr) != 0) {
+            double a = AreaUV(*fptr);
+            if (std::isfinite(a) && a != 0) {
                 for (int i = 0; i < 3; ++i) {
                     uvBox.Add(fptr->WT(i).P());
                 }
@@ -153,13 +166,19 @@ void TrimTexture(Mesh& m, std::vector<TextureSize>& texszVec, bool unsafeMip)
             uvBox.max.Y() += inch;
         }
 
+        if (!std::isfinite(uvBox.DimX()) || !std::isfinite(uvBox.DimY()) || uvBox.DimX() <= 0 || uvBox.DimY() <= 0) {
+            LOG_WARN << "[DIAG] TrimTexture: invalid UV bbox for texture index " << ti << ", skipping trim.";
+            continue;
+        }
+
         double uscale = texszVec[ti].w / uvBox.DimX();
         double vscale = texszVec[ti].h / uvBox.DimY();
 
         vcg::Point2d t(uvBox.min.X() / texszVec[ti].w, uvBox.min.Y() / texszVec[ti].h);
 
         for (auto fptr : facesByTexture[ti]) {
-            if (AreaUV(*fptr) != 0) {
+            double a = AreaUV(*fptr);
+            if (std::isfinite(a) && a != 0) {
                 for (int i = 0; i < 3; ++i) {
                     // Translate to new origin and scale to [0,1] domain of the trimmed texture
                     fptr->WT(i).P() -= t;
@@ -180,7 +199,8 @@ void TrimTexture(Mesh& m, std::vector<TextureSize>& texszVec, bool unsafeMip)
         {
             vcg::Box2d uvBoxCheck;
             for (auto fptr : facesByTexture[ti]) {
-                if (AreaUV(*fptr) != 0) {
+                double a = AreaUV(*fptr);
+                if (std::isfinite(a) && a != 0) {
                     for (int i = 0; i < 3; ++i) {
                         uvBoxCheck.Add(fptr->WT(i).P());
                     }

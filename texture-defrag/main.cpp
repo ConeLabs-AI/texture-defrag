@@ -56,6 +56,8 @@
 #include <QOffscreenSurface>
 #include <QOpenGLFunctions>
 
+#include <cmath>
+
 struct Args {
     double m = 2.0;
     double b = 0.2;
@@ -241,7 +243,8 @@ int main(int argc, char *argv[])
     // first discard zero-area charts
     std::vector<ChartHandle> chartsToPack;
     for (auto& entry : graph->charts) {
-        if (entry.second->AreaUV() != 0) {
+        double a = entry.second->AreaUV();
+        if (std::isfinite(a) && a > 0.0) {
             chartsToPack.push_back(entry.second);
         } else {
             for (auto fptr : entry.second->fpVec) {

@@ -378,6 +378,12 @@ int FacesByTextureIndex(Mesh& m, std::vector<std::vector<Mesh::FacePointer>>& fv
 void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObjectHandle textureObject, const std::vector<TextureSize> &texSizes,
                                                    bool filter, RenderMode imode)
 {
+    // Fail fast if textures are unavailable
+    if (!textureObject || textureObject->ArraySize() == 0) {
+        LOG_ERR << "No textures available for rendering. Ensure input OBJ references an MTL with map_Kd textures.";
+        std::exit(-1);
+    }
+
     // Reset GPU texture cache stats for this rendering pass
     if (textureObject) textureObject->ResetCacheStats();
 
@@ -385,6 +391,14 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
     int nTex = FacesByTextureIndex(m, facesByTexture);
 
     ensure(nTex <= (int) texSizes.size());
+
+    // Validate output texture sizes
+    for (int i = 0; i < nTex; ++i) {
+        if (texSizes[i].w <= 0 || texSizes[i].h <= 0) {
+            LOG_ERR << "Invalid output texture size for sheet " << i << ": " << texSizes[i].w << "x" << texSizes[i].h;
+            std::exit(-1);
+        }
+    }
 
     m.textures.clear();
 
@@ -499,6 +513,10 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
         int ih = textureObject->TextureHeight(i);
         inTexSizes.push_back({iw, ih});
     }
+    if (inTexSizes.empty()) {
+        LOG_ERR << "[RENDER] No source textures loaded; cannot render.";
+        std::exit(-1);
+    }
 
     auto t_vbo_start = std::chrono::high_resolution_clock::now();
     glFuncs->glBindBuffer(GL_ARRAY_BUFFER, ctx.vertexbuf);
@@ -507,22 +525,32 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
     glFuncs->glBufferData(GL_ARRAY_BUFFER, bufferSize, NULL, GL_STREAM_DRAW);
     float *p = (float *)glFuncs->glMapBufferRange(GL_ARRAY_BUFFER, 0, bufferSize, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
     ensure(p != nullptr);
+    int invalidIndexFaces = 0;
     for (auto fptr : fvec) {
         int ti = WTCSh[fptr].tc[0].N();
+        bool valid = (ti >= 0 && ti < (int)inTexSizes.size() && inTexSizes[ti].w > 0 && inTexSizes[ti].h > 0);
+        if (!valid) invalidIndexFaces++;
         for (int i = 0; i < 3; ++i) {
             *p++ = fptr->cWT(i).U();
             *p++ = fptr->cWT(i).V();
             vcg::Point2d uv = WTCSh[fptr].tc[i].P();
-            *p++ = uv.X() / inTexSizes[ti].w;
-            *p++ = uv.Y() / inTexSizes[ti].h;
+            if (valid) {
+                *p++ = uv.X() / inTexSizes[ti].w;
+                *p++ = uv.Y() / inTexSizes[ti].h;
+            } else {
+                *p++ = -1.0f; // sentinel to trigger green in shader
+                *p++ = 0.0f;
+            }
             unsigned char *colorptr = (unsigned char *) p;
             *colorptr++ = fptr->C()[0];
             *colorptr++ = fptr->C()[1];
             *colorptr++ = fptr->C()[2];
             *colorptr++ = fptr->C()[3];
             p++;
-
         }
+    }
+    if (invalidIndexFaces > 0) {
+        LOG_WARN << "[RENDER] Faces with invalid source texture index or size: " << invalidIndexFaces;
     }
     glFuncs->glUnmapBuffer(GL_ARRAY_BUFFER);
 
@@ -588,6 +616,12 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
                 // Load texture image
                 glFuncs->glActiveTexture(GL_TEXTURE0);
                 LOG_DEBUG << "Binding texture unit " << currTexIndex;
+                bool batchValid = (currTexIndex >= 0 && currTexIndex < (int)inTexSizes.size() && inTexSizes[currTexIndex].w > 0 && inTexSizes[currTexIndex].h > 0);
+                if (!batchValid) {
+                    LOG_WARN << "[RENDER] Skipping draw for faces with invalid texture index " << currTexIndex;
+                    fbase = fcurr;
+                    continue;
+                }
                 textureObject->Bind(currTexIndex);
 
                 glFuncs->glUniform1i(ctx.loc_img0, 0);

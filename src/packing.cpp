@@ -535,14 +535,40 @@ Outline2d ExtractOutline2d(FaceGroup& chart)
     if (maxsz == 0) {
         useChartBBAsOutline = true;
     } else {
-        i = (outline2Vec.size() == 1) ? 0 : tri::OutlineUtil<double>::LargestOutline2(outline2Vec);
-        if (tri::OutlineUtil<double>::Outline2Area(outline2Vec[i]) < 0)
-            tri::OutlineUtil<double>::ReverseOutline2(outline2Vec[i]);
-        vcg::Box2d outlineBox;
-        for (const auto& p : outline2Vec[i])
-            outlineBox.Add(p);
-        if (outlineBox.DimX() < box.DimX() || outlineBox.DimY() < box.DimY())
+        // Pick the largest finite, positive-area loop; ignore degenerate/non-finite ones
+        int best = -1;
+        double bestArea = 0.0;
+        bool seenNonFinite = false;
+        for (int k = 0; k < (int)outline2Vec.size(); ++k) {
+            std::vector<vcg::Point2d> uniq;
+            uniq.reserve(outline2Vec[k].size());
+            bool localNonFinite = false;
+            for (const auto &p : outline2Vec[k]) {
+                if (!std::isfinite(p.X()) || !std::isfinite(p.Y())) { localNonFinite = true; break; }
+                if (uniq.empty() || (p - uniq.back()).Norm() > 1e-15) uniq.push_back(p);
+            }
+            if (localNonFinite) { seenNonFinite = true; continue; }
+            if (uniq.size() < 3) continue;
+            double a = std::abs(vcg::tri::OutlineUtil<double>::Outline2Area(uniq));
+            if (!std::isfinite(a) || a <= 0.0) continue;
+            if (a > bestArea) { bestArea = a; best = k; }
+        }
+
+        if (best < 0) {
+            if (seenNonFinite) {
+                LOG_WARN << "[DIAG] Outline extraction: encountered non-finite UVs for chart " << chart.id << ". Falling back to UV bounding box.";
+            }
             useChartBBAsOutline = true;
+        } else {
+            i = best;
+            if (tri::OutlineUtil<double>::Outline2Area(outline2Vec[i]) < 0)
+                tri::OutlineUtil<double>::ReverseOutline2(outline2Vec[i]);
+            vcg::Box2d outlineBox;
+            for (const auto& p : outline2Vec[i])
+                outlineBox.Add(p);
+            if (outlineBox.DimX() < box.DimX() || outlineBox.DimY() < box.DimY())
+                useChartBBAsOutline = true;
+        }
     }
 
     if (useChartBBAsOutline) {
@@ -596,12 +622,21 @@ void IntegerShift(Mesh& m, const std::vector<ChartHandle>& chartsToPack, const s
 
             double minResidual = 2 * M_PI;
             int minResidualIndex = -1;
-            for (int i = 0; i < 4; ++i) {
-                double residual = VecAngle(Rotate(d0, angle[i]), d1);
-                if (residual < minResidual) {
-                    minResidual = residual;
-                    minResidualIndex = i;
+            // Guard against degenerate/invalid vectors which can yield NaN residuals
+            double len0 = std::hypot(d0.X(), d0.Y());
+            double len1 = std::hypot(d1.X(), d1.Y());
+            if (std::isfinite(len0) && std::isfinite(len1) && len0 > 1e-12 && len1 > 1e-12) {
+                for (int i = 0; i < 4; ++i) {
+                    double residual = VecAngle(Rotate(d0, angle[i]), d1);
+                    if (std::isfinite(residual) && residual < minResidual) {
+                        minResidual = residual;
+                        minResidualIndex = i;
+                    }
                 }
+            }
+            if (minResidualIndex == -1) {
+                LOG_WARN << "[DIAG] IntegerShift: degenerate anchor edge or invalid residuals for chart. Falling back to rotation 0.";
+                minResidualIndex = 0;
             }
 
             int ti = fptr->cWT(0).N();
@@ -634,7 +669,11 @@ void IntegerShift(Mesh& m, const std::vector<ChartHandle>& chartsToPack, const s
                 dy = 1 - dy;
                 break;
             default:
-                ensure(0 && "VERY BAD");
+                LOG_WARN << "[DIAG] IntegerShift: unexpected rotation index " << minResidualIndex
+                         << " (residual=" << minResidual << ") - falling back to 0.";
+                // Fallback to no rotation adjustment
+                minResidualIndex = 0;
+                break;
             }
 
             double dx1 = std::modf(u1.X() * textureSize.X(), &unused);

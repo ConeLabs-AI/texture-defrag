@@ -151,6 +151,49 @@ int main(int argc, char *argv[])
     tri::UpdateNormal<Mesh>::PerFaceNormalized(m);
     tri::UpdateNormal<Mesh>::PerVertexNormalized(m);
 
+    // Pre-scan: enforce normalized UVs in [0,1] at source. If any UV in a chart violates this,
+    // skip the entire chart by zeroing its UVs so it is excluded downstream.
+    {
+        // Ensure topology is available for connected-component traversal
+        tri::UpdateTopology<Mesh>::FaceFace(m);
+
+        int skippedChartsNonNormalized = 0;
+        {
+            GraphHandle preGraph = ComputeGraph(m, textureObject);
+            for (auto &entry : preGraph->charts) {
+                auto chart = entry.second;
+                bool chartOk = true;
+                for (auto fptr : chart->fpVec) {
+                    for (int i = 0; i < 3; ++i) {
+                        const auto &p = fptr->cWT(i).P();
+                        if (!std::isfinite(p.X()) || !std::isfinite(p.Y()) || p.X() < 0.0 || p.X() > 1.0 || p.Y() < 0.0 || p.Y() > 1.0) {
+                            chartOk = false;
+                            break;
+                        }
+                    }
+                    if (!chartOk) break;
+                }
+                if (!chartOk) {
+                    // Skip chart: zero out its UVs so it becomes zero-area and is ignored later
+                    for (auto fptr : chart->fpVec) {
+                        for (int j = 0; j < fptr->VN(); ++j) {
+                            fptr->V(j)->T().P() = Point2d::Zero();
+                            fptr->V(j)->T().N() = 0;
+                            fptr->WT(j).P() = Point2d::Zero();
+                            fptr->WT(j).N() = 0;
+                        }
+                    }
+                    skippedChartsNonNormalized++;
+                }
+            }
+        }
+
+        if (skippedChartsNonNormalized > 0) {
+            LOG_WARN << "[VALIDATION] Skipped " << skippedChartsNonNormalized
+                     << " charts due to non-normalized or non-finite UVs (expected [0,1]).";
+        }
+    }
+
     ScaleTextureCoordinatesToImage(m, textureObject);
 
     LOG_VERBOSE << "Preparing mesh...";
@@ -279,6 +322,9 @@ int main(int argc, char *argv[])
     }
     double totalNewTextureMB = (totalNewTexturePixels * 4.0) / (1024.0 * 1024.0);
     LOG_INFO << "[DIAG] Total texture memory to be allocated by rendering: " << totalNewTextureMB << " MB";
+    if (totalNewTextureMB > 1024.0 * 1024.0) { // > 1 TB
+        LOG_WARN << "[DIAG] Total planned texture memory exceeds 1 TB. Check UV normalization and packing scale.";
+    }
 
     if (npacked < (int) chartsToPack.size()) {
         LOG_ERR << "Not all charts were packed (" << chartsToPack.size() << " charts, " << npacked << " packed)";

@@ -130,6 +130,33 @@ void TrimTexture(Mesh& m, std::vector<TextureSize>& texszVec, bool unsafeMip)
     std::vector<std::vector<Mesh::FacePointer>> facesByTexture;
     unsigned ntex = FacesByTextureIndex(m, facesByTexture);
 
+    // Validate mapping between texture indices and provided sizes
+    if (ntex > texszVec.size()) {
+        LOG_ERR << "[VALIDATION] TrimTexture: texture index count (" << ntex
+                << ") exceeds size entries (" << texszVec.size() << "). Aborting.";
+        std::exit(-1);
+    }
+
+    // Validate each target sheet size against QImage constraints and sanity
+    {
+        const int MAX_QIMAGE_SIZE = 32767;
+        for (unsigned ti = 0; ti < ntex; ++ti) {
+            if (texszVec[ti].w <= 0 || texszVec[ti].h <= 0) {
+                LOG_ERR << "[VALIDATION] TrimTexture: non-positive sheet size at index " << ti
+                        << ": " << texszVec[ti].w << "x" << texszVec[ti].h << ". Aborting.";
+                std::exit(-1);
+            }
+            if (texszVec[ti].w > MAX_QIMAGE_SIZE || texszVec[ti].h > MAX_QIMAGE_SIZE) {
+                LOG_ERR << "[VALIDATION] TrimTexture: sheet size at index " << ti
+                        << " exceeds QImage limit: " << texszVec[ti].w << "x" << texszVec[ti].h
+                        << " (max " << MAX_QIMAGE_SIZE << "). Aborting.";
+                std::exit(-1);
+            }
+        }
+    }
+
+    LOG_INFO << "[DIAG] TrimTexture: ntex=" << ntex << ", texszVec.size()=" << texszVec.size();
+
     for (unsigned ti = 0; ti < ntex; ++ti) {
         vcg::Box2d uvBox;
         for (auto fptr : facesByTexture[ti]) {

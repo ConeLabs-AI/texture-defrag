@@ -308,8 +308,30 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         if (n == 0) // no charts were packed, stop
             break;
         else {
+            // Compute output container size in pixels, with validation
             double textureScale = 1.0 / packingScale;
-            texszVec.push_back({(int) (containerVec[nc].X() * textureScale), (int) (containerVec[nc].Y() * textureScale)});
+            double w_d = static_cast<double>(containerVec[nc].X()) * textureScale;
+            double h_d = static_cast<double>(containerVec[nc].Y()) * textureScale;
+            if (!std::isfinite(w_d) || !std::isfinite(h_d) || w_d <= 0.0 || h_d <= 0.0) {
+                LOG_ERR << "[VALIDATION] Invalid scaled container size (w=" << w_d << ", h=" << h_d
+                        << ") with packingScale=" << packingScale << ". Aborting.";
+                std::exit(-1);
+            }
+            const int MAX_QIMAGE_SIZE = 32767;
+            if (w_d > MAX_QIMAGE_SIZE || h_d > MAX_QIMAGE_SIZE) {
+                LOG_ERR << "[VALIDATION] Computed output container exceeds QImage limit: "
+                        << w_d << "x" << h_d
+                        << " (grid=" << containerVec[nc].X() << "x" << containerVec[nc].Y()
+                        << ", packingScale=" << packingScale << "). Aborting.";
+                std::exit(-1);
+            }
+            TextureSize outTsz;
+            outTsz.w = static_cast<int>(std::ceil(w_d));
+            outTsz.h = static_cast<int>(std::ceil(h_d));
+            LOG_INFO << "[DIAG] Output container " << nc << " size " << outTsz.w << "x" << outTsz.h
+                     << " (grid " << containerVec[nc].X() << "x" << containerVec[nc].Y()
+                     << ", textureScale=" << textureScale << ")";
+            texszVec.push_back(outTsz);
             for (unsigned i = 0; i < outlines_iter.size(); ++i) {
                 if (polyToContainer[i] != -1) {
                     ensure(polyToContainer[i] == 0); // We only use a single container
@@ -640,7 +662,11 @@ void IntegerShift(Mesh& m, const std::vector<ChartHandle>& chartsToPack, const s
             }
 
             int ti = fptr->cWT(0).N();
-            ensure(ti < (int) texszVec.size());
+            if (ti >= (int) texszVec.size()) {
+                LOG_ERR << "[VALIDATION] IntegerShift: texture index " << ti
+                        << " out of bounds for texszVec.size()=" << texszVec.size() << ". Aborting.";
+                std::exit(-1);
+            }
             vcg::Point2d textureSize(texszVec[ti].w, texszVec[ti].h);
 
             vcg::Point2d u0 = wtcsh[fptr].tc[0].P();

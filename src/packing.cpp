@@ -131,8 +131,19 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         packingScale = 1.0;
     }
 
+    // Guard: if packingScale is extremely small, output sizes will explode. Enforce a minimum.
+    // With grid size up to 16384 and QImage limit of 32767, we need textureScale <= 2, so packingScale >= 0.5
+    const double MIN_PACKING_SCALE = 0.5;
+    if (packingScale < MIN_PACKING_SCALE) {
+        LOG_ERR << "[VALIDATION] packingScale=" << packingScale << " is below minimum " << MIN_PACKING_SCALE
+                << ". This indicates UV areas are far too large relative to packing grid."
+                << " (targetUVArea=" << targetUVArea << ", packingArea=" << packingArea << "). Aborting.";
+        LOG_ERR << "[VALIDATION] This usually means input UVs are not normalized to [0,1] or optimization exploded UV coordinates.";
+        std::exit(-1);
+    }
+
     LOG_INFO << "[DIAG] Packing scale factor: " << packingScale
-             << " (packingArea=" << packingArea << ", textureArea=" << textureArea << ")";
+             << " (packingArea=" << packingArea << ", targetUVArea=" << targetUVArea << ", textureArea=" << textureArea << ")";
 
 
     rpack_params.costFunction = Packer::Parameters::LowestHorizon;
@@ -442,8 +453,23 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
                 // Create a new texture/atlas for this chart
                 TextureSize tsz;
                 float textureScaleLocal = 1.0f / scale;
-                tsz.w = (int)std::max(1.0f, std::floor(requiredWidth * textureScaleLocal));
-                tsz.h = (int)std::max(1.0f, std::floor(requiredHeight * textureScaleLocal));
+                float w_f = requiredWidth * textureScaleLocal;
+                float h_f = requiredHeight * textureScaleLocal;
+                
+                // Validate individual container output size
+                if (!std::isfinite(w_f) || !std::isfinite(h_f) || w_f <= 0 || h_f <= 0) {
+                    LOG_ERR << "[VALIDATION] Invalid individual container size for chart " << ci
+                            << ": " << w_f << "x" << h_f << " (scale=" << scale << "). Skipping.";
+                    continue;
+                }
+                if (w_f > MAX_QIMAGE_SIZE || h_f > MAX_QIMAGE_SIZE) {
+                    LOG_ERR << "[VALIDATION] Individual container for chart " << ci << " exceeds QImage limit: "
+                            << w_f << "x" << h_f << ". Skipping.";
+                    continue;
+                }
+                
+                tsz.w = (int)std::max(1.0f, std::ceil(w_f));
+                tsz.h = (int)std::max(1.0f, std::ceil(h_f));
                 texszVec.push_back(tsz);
                 containerVec.push_back(containerSize); // Add the container to the list
                 nc++; // Increment container count for next individual container
@@ -453,6 +479,22 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
                  LOG_INFO << "[DIAG] Successfully packed chart " << ci << " into individual container " << (nc-1) << " with scale: " << scale;
              } else {
                  LOG_ERR << "[DIAG] Failed to pack chart " << ci << " even in individual container";
+             }
+         }
+         
+         // Periodic check: abort if cumulative texture memory is getting out of hand
+         if (remainingUnpacked.size() > 1000 && (totPacked % 10000 == 0)) {
+             int64_t cumulativePixels = 0;
+             for (const auto& sz : texszVec) {
+                 cumulativePixels += (int64_t)sz.w * sz.h;
+             }
+             double cumulativeGB = (cumulativePixels * 4.0) / (1024.0 * 1024.0 * 1024.0);
+             LOG_INFO << "[DIAG] Packing progress: " << totPacked << " charts, cumulative texture memory: " << cumulativeGB << " GB";
+             const double MAX_CUMULATIVE_GB = 64.0;
+             if (cumulativeGB > MAX_CUMULATIVE_GB) {
+                 LOG_ERR << "[VALIDATION] Cumulative texture memory (" << cumulativeGB << " GB) exceeds limit of "
+                         << MAX_CUMULATIVE_GB << " GB during packing. Aborting.";
+                 std::exit(-1);
              }
          }
      }

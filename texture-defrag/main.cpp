@@ -43,6 +43,8 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <algorithm>
+#include <functional>
 
 #include <omp.h>
 
@@ -283,14 +285,25 @@ int main(int argc, char *argv[])
 
     // pack the atlas
 
-    // first discard zero-area charts
+    // First discard zero-area charts AND charts with exploded/invalid UVs
+    // This catches cases where optimization produced runaway UV coordinates
     std::vector<ChartHandle> chartsToPack;
+    int skippedZeroArea = 0;
+    int skippedExplodedUV = 0;
+    int skippedNonFiniteUV = 0;
+    
+    // Maximum reasonable UV dimension after scaling to image pixels
+    // Input textures are typically up to 8K, so 100K pixels is a generous upper bound
+    const double MAX_REASONABLE_UV_DIM = 100000.0;
+    
     for (auto& entry : graph->charts) {
-        double a = entry.second->AreaUV();
-        if (std::isfinite(a) && a > 0.0) {
-            chartsToPack.push_back(entry.second);
-        } else {
-            for (auto fptr : entry.second->fpVec) {
+        ChartHandle chart = entry.second;
+        double a = chart->AreaUV();
+        
+        // Check for zero/invalid area
+        if (!std::isfinite(a) || a <= 0.0) {
+            skippedZeroArea++;
+            for (auto fptr : chart->fpVec) {
                 for (int j = 0; j < fptr->VN(); ++j) {
                     fptr->V(j)->T().P() = Point2d::Zero();
                     fptr->V(j)->T().N() = 0;
@@ -298,7 +311,54 @@ int main(int argc, char *argv[])
                     fptr->WT(j).N() = 0;
                 }
             }
+            continue;
         }
+        
+        // Check for exploded/non-finite UV bounding box
+        vcg::Box2d uvBox = chart->UVBox();
+        bool hasNonFinite = !std::isfinite(uvBox.min.X()) || !std::isfinite(uvBox.min.Y()) ||
+                            !std::isfinite(uvBox.max.X()) || !std::isfinite(uvBox.max.Y());
+        bool hasExploded = uvBox.DimX() > MAX_REASONABLE_UV_DIM || uvBox.DimY() > MAX_REASONABLE_UV_DIM;
+        
+        if (hasNonFinite) {
+            skippedNonFiniteUV++;
+            for (auto fptr : chart->fpVec) {
+                for (int j = 0; j < fptr->VN(); ++j) {
+                    fptr->V(j)->T().P() = Point2d::Zero();
+                    fptr->V(j)->T().N() = 0;
+                    fptr->WT(j).P() = Point2d::Zero();
+                    fptr->WT(j).N() = 0;
+                }
+            }
+            continue;
+        }
+        
+        if (hasExploded) {
+            skippedExplodedUV++;
+            LOG_WARN << "[DIAG] Chart " << chart->id << " has exploded UV box: "
+                     << uvBox.DimX() << "x" << uvBox.DimY() << " (max=" << MAX_REASONABLE_UV_DIM << "). Skipping.";
+            for (auto fptr : chart->fpVec) {
+                for (int j = 0; j < fptr->VN(); ++j) {
+                    fptr->V(j)->T().P() = Point2d::Zero();
+                    fptr->V(j)->T().N() = 0;
+                    fptr->WT(j).P() = Point2d::Zero();
+                    fptr->WT(j).N() = 0;
+                }
+            }
+            continue;
+        }
+        
+        chartsToPack.push_back(chart);
+    }
+    
+    if (skippedZeroArea > 0) {
+        LOG_INFO << "[VALIDATION] Skipped " << skippedZeroArea << " charts with zero/invalid area.";
+    }
+    if (skippedNonFiniteUV > 0) {
+        LOG_WARN << "[VALIDATION] Skipped " << skippedNonFiniteUV << " charts with non-finite UV coordinates.";
+    }
+    if (skippedExplodedUV > 0) {
+        LOG_WARN << "[VALIDATION] Skipped " << skippedExplodedUV << " charts with exploded UV coordinates (dim > " << MAX_REASONABLE_UV_DIM << ").";
     }
 
     LOG_INFO << "Packing atlas of size " << chartsToPack.size();
@@ -321,9 +381,29 @@ int main(int argc, char *argv[])
         totalNewTexturePixels += (int64_t)sz.w * sz.h;
     }
     double totalNewTextureMB = (totalNewTexturePixels * 4.0) / (1024.0 * 1024.0);
-    LOG_INFO << "[DIAG] Total texture memory to be allocated by rendering: " << totalNewTextureMB << " MB";
-    if (totalNewTextureMB > 1024.0 * 1024.0) { // > 1 TB
-        LOG_WARN << "[DIAG] Total planned texture memory exceeds 1 TB. Check UV normalization and packing scale.";
+    double totalNewTextureGB = totalNewTextureMB / 1024.0;
+    LOG_INFO << "[DIAG] Total texture memory to be allocated by rendering: " << totalNewTextureMB << " MB (" << totalNewTextureGB << " GB)";
+    
+    // Hard limit: abort if planned allocation exceeds 64 GB to prevent OOM/crash
+    const double MAX_TEXTURE_MEMORY_GB = 64.0;
+    if (totalNewTextureGB > MAX_TEXTURE_MEMORY_GB) {
+        LOG_ERR << "[VALIDATION] Total planned texture memory (" << totalNewTextureGB 
+                << " GB) exceeds hard limit of " << MAX_TEXTURE_MEMORY_GB << " GB. Aborting.";
+        LOG_ERR << "[VALIDATION] This usually indicates non-normalized UVs or collapsed packing scale.";
+        LOG_ERR << "[VALIDATION] texszVec has " << texszVec.size() << " entries.";
+        // Log a few of the largest entries for debugging
+        std::vector<std::pair<int64_t, size_t>> sizeIdx;
+        for (size_t i = 0; i < texszVec.size(); ++i) {
+            sizeIdx.push_back({(int64_t)texszVec[i].w * texszVec[i].h, i});
+        }
+        std::sort(sizeIdx.begin(), sizeIdx.end(), std::greater<std::pair<int64_t, size_t>>());
+        LOG_ERR << "[VALIDATION] Largest texture sheets:";
+        for (size_t k = 0; k < std::min<size_t>(10, sizeIdx.size()); ++k) {
+            size_t idx = sizeIdx[k].second;
+            LOG_ERR << "  [" << idx << "] " << texszVec[idx].w << "x" << texszVec[idx].h 
+                    << " = " << sizeIdx[k].first << " pixels";
+        }
+        std::exit(-1);
     }
 
     if (npacked < (int) chartsToPack.size()) {

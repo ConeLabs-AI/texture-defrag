@@ -215,6 +215,32 @@ int main(int argc, char *argv[])
     int inputCharts = graph->Count();
     double inputUVLen = graph->BorderUV();
 
+    // [DIAG] Log UV/3D area ratio stats before optimization
+    {
+        std::vector<double> ratios;
+        ratios.reserve(graph->charts.size());
+        double minR = std::numeric_limits<double>::infinity();
+        double maxR = 0.0;
+        for (auto &entry : graph->charts) {
+            auto chart = entry.second;
+            double a3d = chart->Area3D();
+            double auv = chart->AreaUV();
+            if (a3d <= 0 || !std::isfinite(auv)) continue;
+            double r = auv / a3d;
+            ratios.push_back(r);
+            minR = std::min(minR, r);
+            maxR = std::max(maxR, r);
+        }
+        if (!ratios.empty()) {
+            size_t mid = ratios.size() / 2;
+            std::nth_element(ratios.begin(), ratios.begin() + mid, ratios.end());
+            double med = ratios[mid];
+            LOG_INFO << "[DIAG] BEFORE optimization UV/3D area ratio stats: min=" << minR
+                     << " median=" << med << " max=" << maxR
+                     << " (charts=" << ratios.size() << ")";
+        }
+    }
+
     // ensure all charts are oriented coherently, and then store the wtc attribute
     ReorientCharts(graph);
 
@@ -283,6 +309,33 @@ int main(int argc, char *argv[])
     int outputCharts = graph->Count();
     double outputUVLen = graph->BorderUV();
 
+    // [DIAG] Log UV/3D area ratio stats after optimization (before packing)
+    double medianExpansion = 1.0;
+    {
+        std::vector<double> ratios;
+        ratios.reserve(graph->charts.size());
+        double minR = std::numeric_limits<double>::infinity();
+        double maxR = 0.0;
+        for (auto &entry : graph->charts) {
+            auto chart = entry.second;
+            double a3d = chart->Area3D();
+            double auv = chart->AreaUV();
+            if (a3d <= 0 || !std::isfinite(auv)) continue;
+            double r = auv / a3d;
+            ratios.push_back(r);
+            minR = std::min(minR, r);
+            maxR = std::max(maxR, r);
+        }
+        if (!ratios.empty()) {
+            size_t mid = ratios.size() / 2;
+            std::nth_element(ratios.begin(), ratios.begin() + mid, ratios.end());
+            medianExpansion = ratios[mid];
+            LOG_INFO << "[DIAG] AFTER optimization UV/3D area ratio stats: min=" << minR
+                     << " median=" << medianExpansion << " max=" << maxR
+                     << " (charts=" << ratios.size() << ")";
+        }
+    }
+
     // pack the atlas
 
     // First discard zero-area charts AND charts with exploded/invalid UVs
@@ -292,9 +345,14 @@ int main(int argc, char *argv[])
     int skippedExplodedUV = 0;
     int skippedNonFiniteUV = 0;
     
-    // Maximum reasonable UV dimension after scaling to image pixels
-    // Input textures are typically up to 8K, so 100K pixels is a generous upper bound
-    const double MAX_REASONABLE_UV_DIM = 100000.0;
+    // Dynamic UV dimension limit: 4x the max texture dimension
+    double maxTexDim = (double)std::max(1024, textureObject->MaxSize());
+    double maxReasonableUVDim = 4.0 * maxTexDim;
+    
+    // Expansion factor threshold: 1000x median is definitely an outlier
+    double maxExpansion = (medianExpansion > 1e-9) ? medianExpansion * 1000.0 : 1e20;
+    LOG_INFO << "[DIAG] Packing validation thresholds: maxReasonableUVDim=" << maxReasonableUVDim
+             << ", maxExpansion=" << maxExpansion;
     
     for (auto& entry : graph->charts) {
         ChartHandle chart = entry.second;
@@ -318,7 +376,19 @@ int main(int argc, char *argv[])
         vcg::Box2d uvBox = chart->UVBox();
         bool hasNonFinite = !std::isfinite(uvBox.min.X()) || !std::isfinite(uvBox.min.Y()) ||
                             !std::isfinite(uvBox.max.X()) || !std::isfinite(uvBox.max.Y());
-        bool hasExploded = uvBox.DimX() > MAX_REASONABLE_UV_DIM || uvBox.DimY() > MAX_REASONABLE_UV_DIM;
+        
+        // Use dynamic limit based on texture size
+        bool hasExploded = uvBox.DimX() > maxReasonableUVDim || uvBox.DimY() > maxReasonableUVDim;
+        
+        // Also check expansion factor (UV area vs 3D area) to catch warped charts
+        if (!hasExploded && !hasNonFinite && chart->Area3D() > 1e-9) {
+            double exp = chart->AreaUV() / chart->Area3D();
+            if (exp > maxExpansion) {
+                hasExploded = true;
+                LOG_WARN << "[DIAG] Chart " << chart->id << " has exploded expansion factor: " << exp
+                         << " (threshold=" << maxExpansion << "). Treating as exploded.";
+            }
+        }
         
         if (hasNonFinite) {
             skippedNonFiniteUV++;
@@ -335,8 +405,12 @@ int main(int argc, char *argv[])
         
         if (hasExploded) {
             skippedExplodedUV++;
+            double a3d = chart->Area3D();
+            double auv = chart->AreaUV();
             LOG_WARN << "[DIAG] Chart " << chart->id << " has exploded UV box: "
-                     << uvBox.DimX() << "x" << uvBox.DimY() << " (max=" << MAX_REASONABLE_UV_DIM << "). Skipping.";
+                     << uvBox.DimX() << "x" << uvBox.DimY() << " (max=" << maxReasonableUVDim << ")"
+                     << ", AreaUV=" << auv << ", Area3D=" << a3d
+                     << ", UV/3D ratio=" << (a3d > 0 ? auv / a3d : -1.0) << ". Skipping.";
             for (auto fptr : chart->fpVec) {
                 for (int j = 0; j < fptr->VN(); ++j) {
                     fptr->V(j)->T().P() = Point2d::Zero();
@@ -358,7 +432,8 @@ int main(int argc, char *argv[])
         LOG_WARN << "[VALIDATION] Skipped " << skippedNonFiniteUV << " charts with non-finite UV coordinates.";
     }
     if (skippedExplodedUV > 0) {
-        LOG_WARN << "[VALIDATION] Skipped " << skippedExplodedUV << " charts with exploded UV coordinates (dim > " << MAX_REASONABLE_UV_DIM << ").";
+        LOG_WARN << "[VALIDATION] Skipped " << skippedExplodedUV << " charts with exploded UV coordinates"
+                 << " (dim > " << maxReasonableUVDim << " or expansion > " << maxExpansion << ").";
     }
 
     LOG_INFO << "Packing atlas of size " << chartsToPack.size();

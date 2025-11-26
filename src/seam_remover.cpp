@@ -1059,11 +1059,20 @@ static CheckStatus CheckBoundaryAfterAlignment(SeamData& sd)
 static CheckStatus CheckAfterLocalOptimizationInner(SeamData& sd, AlgoStateHandle state, const AlgoParameters& params)
 {
     double newArapVal = (state->arapNum + (sd.outputArapNum - sd.inputArapNum)) / state->arapDenom;
-    if (newArapVal > params.globalDistortionThreshold)
+    if (newArapVal > params.globalDistortionThreshold) {
+        LOG_DEBUG << "[DIAG] Rejecting move for charts " << sd.a->id
+                  << (sd.a != sd.b ? ("/" + std::to_string(sd.b->id)) : "")
+                  << " due to global ARAP energy " << newArapVal
+                  << " > threshold " << params.globalDistortionThreshold;
         return FAIL_DISTORTION_GLOBAL;
+    }
 
     double localDistortion = sd.outputArapNum / sd.outputArapDenom;
     if (localDistortion > params.distortionTolerance) {
+        LOG_DEBUG << "[DIAG] Rejecting move for charts " << sd.a->id
+                  << (sd.a != sd.b ? ("/" + std::to_string(sd.b->id)) : "")
+                  << " due to local ARAP distortion " << localDistortion
+                  << " > threshold " << params.distortionTolerance;
         return FAIL_DISTORTION_LOCAL;
     }
 
@@ -1081,6 +1090,10 @@ static CheckStatus CheckAfterLocalOptimizationInner(SeamData& sd, AlgoStateHandl
     double outputRatio = std::abs(outputNegativeArea / outputAbsoluteArea);
 
     if (outputRatio > inputRatio) {
+        LOG_DEBUG << "[DIAG] Rejecting move for charts " << sd.a->id
+                  << (sd.a != sd.b ? ("/" + std::to_string(sd.b->id)) : "")
+                  << " due to increased folded area ratio: input=" << inputRatio
+                  << ", output=" << outputRatio;
         return FAIL_LOCAL_OVERLAP;
     }
 
@@ -1204,6 +1217,18 @@ static CheckStatus OptimizeChart(SeamData& sd, GraphHandle graph, bool fixInters
         fptr->V(2)->T().P() = *itV++; fptr->WT(2).P() = *itW++;
     }
 
+    // [UV SCALE GUARD] Measure UV bounding box before ARAP optimization
+    vcg::Box2d optBoxBefore;
+    for (auto fptr : sd.optimizationArea) {
+        for (int i = 0; i < 3; ++i) {
+            optBoxBefore.Add(fptr->WT(i).P());
+        }
+    }
+    double scaleBefore = std::max(optBoxBefore.DimX(), optBoxBefore.DimY());
+    if (scaleBefore <= 0 || !std::isfinite(scaleBefore)) {
+        scaleBefore = 1.0; // avoid div-by-zero
+    }
+
     // before updating the wedge tex coords, compute the arap contribution of the optimization area
     // WARNING: it is critial that at this point the wedge tex coords HAVE NOT YET BEEN UPDATED
     ARAP::ComputeEnergyFromStoredWedgeTC(support.fpVec, graph->mesh, &sd.inputArapNum, &sd.inputArapDenom);
@@ -1312,6 +1337,31 @@ static CheckStatus OptimizeChart(SeamData& sd, GraphHandle graph, bool fixInters
     sd.si = arap.Solve();
 
     PERF_TIMER_ACCUMULATE_FROM_PREVIOUS(t_optimize_arap);
+
+    // [UV SCALE GUARD] Measure UV bounding box after ARAP optimization (on shell)
+    vcg::Box2d optBoxAfter;
+    for (auto& sf : sd.shell.face) {
+        if (sf.IsHoleFilling()) continue;
+        for (int i = 0; i < 3; ++i) {
+            optBoxAfter.Add(sf.V(i)->T().P());
+        }
+    }
+    double scaleAfter = std::max(optBoxAfter.DimX(), optBoxAfter.DimY());
+    double scaleRatio = (scaleBefore > 0) ? scaleAfter / scaleBefore : 1.0;
+
+    LOG_DEBUG << "[ARAP] Opt area bbox before: " << optBoxBefore.DimX() << "x" << optBoxBefore.DimY()
+              << ", after: " << optBoxAfter.DimX() << "x" << optBoxAfter.DimY()
+              << ", scaleRatio: " << scaleRatio;
+
+    // Hard guard: reject if ARAP blows up the local UV scale beyond a reasonable factor
+    const double MAX_LOCAL_SCALE_RATIO = 50.0;
+    if (!std::isfinite(scaleRatio) || scaleRatio > MAX_LOCAL_SCALE_RATIO) {
+        LOG_WARN << "[VALIDATION] ARAP produced extreme UV scale explosion (ratio=" << scaleRatio
+                 << ") for charts " << sd.a->id
+                 << (sd.a != sd.b ? ("/" + std::to_string(sd.b->id)) : "")
+                 << ". Rejecting move to prevent packing failure.";
+        return FAIL_DISTORTION_LOCAL;
+    }
 
     SyncShellWithUV(sd.shell);
 

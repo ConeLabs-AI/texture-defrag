@@ -1076,6 +1076,34 @@ static CheckStatus CheckAfterLocalOptimizationInner(SeamData& sd, AlgoStateHandl
         return FAIL_DISTORTION_LOCAL;
     }
 
+    // Check if the combined chart exceeds the physical texture limit (~32k)
+    // QImage cannot handle dimensions larger than 32767 pixels. We reject any merge
+    // that would create a chart exceeding this limit to prevent downstream packing failures.
+    {
+        vcg::Box2d fullBox;
+        // Calculate the bounding box of the POTENTIAL new chart using the updated wedge coords
+        for (auto fptr : sd.a->fpVec) {
+            for (int k = 0; k < 3; ++k)
+                fullBox.Add(fptr->WT(k).P());
+        }
+        if (sd.b != sd.a) {
+            for (auto fptr : sd.b->fpVec) {
+                for (int k = 0; k < 3; ++k)
+                    fullBox.Add(fptr->WT(k).P());
+            }
+        }
+
+        // Limit based on QImage (32767). We use 32000 to be safe and allow for padding.
+        const double MAX_UV_DIM = 32000.0;
+        if (fullBox.DimX() > MAX_UV_DIM || fullBox.DimY() > MAX_UV_DIM) {
+            LOG_DEBUG << "[DIAG] Rejecting move for charts " << sd.a->id
+                      << (sd.a != sd.b ? ("/" + std::to_string(sd.b->id)) : "")
+                      << " due to global UV size explosion: " << fullBox.DimX() << "x" << fullBox.DimY()
+                      << " (limit=" << MAX_UV_DIM << ")";
+            return FAIL_DISTORTION_GLOBAL;
+        }
+    }
+
     /* Check if the folded area is too large */
     double outputNegativeArea = 0;
     double outputAbsoluteArea = 0;

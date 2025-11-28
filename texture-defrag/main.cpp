@@ -338,8 +338,10 @@ int main(int argc, char *argv[])
 
     // pack the atlas
 
-    // First discard zero-area charts AND charts with exploded/invalid UVs
-    // This catches cases where optimization produced runaway UV coordinates
+    // First discard zero-area charts AND charts with invalid or grossly oversized UVs.
+    // This catches cases where optimization produced truly runaway UV coordinates,
+    // but does NOT discard charts solely based on large UV/3D area expansion, which
+    // are instead handled by the global texel budget during packing.
     std::vector<ChartHandle> chartsToPack;
     int skippedZeroArea = 0;
     int skippedExplodedUV = 0;
@@ -349,10 +351,7 @@ int main(int argc, char *argv[])
     double maxTexDim = (double)std::max(1024, textureObject->MaxSize());
     double maxReasonableUVDim = 4.0 * maxTexDim;
     
-    // Expansion factor threshold: 1000x median is definitely an outlier
-    double maxExpansion = (medianExpansion > 1e-9) ? medianExpansion * 1000.0 : 1e20;
-    LOG_INFO << "[DIAG] Packing validation thresholds: maxReasonableUVDim=" << maxReasonableUVDim
-             << ", maxExpansion=" << maxExpansion;
+    LOG_INFO << "[DIAG] Packing validation thresholds: maxReasonableUVDim=" << maxReasonableUVDim;
     
     for (auto& entry : graph->charts) {
         ChartHandle chart = entry.second;
@@ -377,18 +376,9 @@ int main(int argc, char *argv[])
         bool hasNonFinite = !std::isfinite(uvBox.min.X()) || !std::isfinite(uvBox.min.Y()) ||
                             !std::isfinite(uvBox.max.X()) || !std::isfinite(uvBox.max.Y());
         
-        // Use dynamic limit based on texture size
+        // Use dynamic limit based on texture size: only treat charts as exploded
+        // if their UV bounding box is unreasonably large in absolute pixel units.
         bool hasExploded = uvBox.DimX() > maxReasonableUVDim || uvBox.DimY() > maxReasonableUVDim;
-        
-        // Also check expansion factor (UV area vs 3D area) to catch warped charts
-        if (!hasExploded && !hasNonFinite && chart->Area3D() > 1e-9) {
-            double exp = chart->AreaUV() / chart->Area3D();
-            if (exp > maxExpansion) {
-                hasExploded = true;
-                LOG_WARN << "[DIAG] Chart " << chart->id << " has exploded expansion factor: " << exp
-                         << " (threshold=" << maxExpansion << "). Treating as exploded.";
-            }
-        }
         
         if (hasNonFinite) {
             skippedNonFiniteUV++;
@@ -433,7 +423,7 @@ int main(int argc, char *argv[])
     }
     if (skippedExplodedUV > 0) {
         LOG_WARN << "[VALIDATION] Skipped " << skippedExplodedUV << " charts with exploded UV coordinates"
-                 << " (dim > " << maxReasonableUVDim << " or expansion > " << maxExpansion << ").";
+                 << " (dim > " << maxReasonableUVDim << ").";
     }
 
     LOG_INFO << "Packing atlas of size " << chartsToPack.size();

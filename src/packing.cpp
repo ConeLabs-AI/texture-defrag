@@ -102,48 +102,68 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
 
     // compute the scale factor for the packing
     int packingArea = 0;
-    int textureArea = 0;
     for (unsigned i = 0; i < containerVec.size(); ++i) {
         packingArea += containerVec[i].X() * containerVec[i].Y();
-        textureArea += textureObject->TextureWidth(i) * textureObject->TextureHeight(i);
-    }
-    // Adjust target area: preserve 1:1 charts, give sqrt(2) more area to resampled charts
-    double targetUVArea = 0.0;
-    for (size_t i = 0; i < chartAreasOriginal.size(); ++i) {
-        // 1:1 charts keep original area; resampled charts get mul^2 (i.e., 2.0) area
-        double mul = chartScaleMul[i];
-        targetUVArea += chartAreasOriginal[i] * double(mul) * double(mul);
-    }
-    // If we do not have outline areas, fall back to original texture area target
-    double packingScale = 1.0;
-    if (targetUVArea > 0.0) {
-        // The virtual grid area is packingArea; scale outlines by packingScale so that placed area ~= packingArea
-        // outlines are already multiplied per-chart; Rasterizer also takes packingScale. We set packingScale so that
-        // targetUVArea * packingScale^2 ~= packingArea => packingScale = sqrt(packingArea / targetUVArea)
-        packingScale = std::sqrt((double)packingArea / targetUVArea);
-    } else {
-        packingScale = (textureArea > 0) ? std::sqrt(packingArea / (double)textureArea) : 1.0;
     }
 
-    if (!std::isfinite(packingScale) || packingScale <= 0) {
+    // Total input texture budget in texels (pixel^2). This is the global quantity
+    // we want the packed atlas to roughly match, regardless of pathological local
+    // UV distortions in individual charts.
+    int64_t textureAreaPixels = 0;
+    for (std::size_t i = 0; i < textureObject->ArraySize(); ++i) {
+        textureAreaPixels += static_cast<int64_t>(textureObject->TextureWidth(i)) *
+                             static_cast<int64_t>(textureObject->TextureHeight(i));
+    }
+
+    // Adjust target area: preserve 1:1 charts, give sqrt(2) more area to resampled charts.
+    // We keep this "naive" per-chart sum for diagnostics and relative weighting,
+    // but we do not let it dictate an unbounded global texel budget.
+    double naiveTargetUVArea = 0.0;
+    for (size_t i = 0; i < chartAreasOriginal.size(); ++i) {
+        double mul = chartScaleMul[i];
+        naiveTargetUVArea += chartAreasOriginal[i] * double(mul) * double(mul);
+    }
+
+    // Global target UV area in pixel^2: primarily driven by the input texture
+    // resolution, with an optional slack factor to allow a modest increase.
+    const double SLACK_FACTOR = 1.0;
+    double targetUVArea = 0.0;
+    if (textureAreaPixels > 0) {
+        targetUVArea = std::max(1.0, static_cast<double>(textureAreaPixels)) * SLACK_FACTOR;
+    } else {
+        // Fallback if we somehow have no texture info: use the naive per-chart area.
+        targetUVArea = std::max(1.0, naiveTargetUVArea);
+    }
+
+    // The virtual grid area is packingArea; outlines are scaled by packingScale such that
+    // targetUVArea * packingScale^2 ~= packingArea  => packingScale = sqrt(packingArea / targetUVArea)
+    double packingScale = std::sqrt(static_cast<double>(packingArea) / targetUVArea);
+
+    if (!std::isfinite(packingScale) || packingScale <= 0.0) {
         LOG_WARN << "[DIAG] Invalid packingScale computed: " << packingScale
-                 << ". Resetting to 1.0. (packingArea=" << packingArea << ", textureArea=" << textureArea << ")";
+                 << ". Resetting to 1.0. (packingArea=" << packingArea
+                 << ", targetUVArea=" << targetUVArea
+                 << ", textureAreaPixels=" << textureAreaPixels << ")";
         packingScale = 1.0;
     }
 
-    // Guard: if packingScale is extremely small, output sizes will explode. Enforce a minimum.
-    // With grid size up to 16384 and QImage limit of 32767, we need textureScale <= 2, so packingScale >= 0.5
-    const double MIN_PACKING_SCALE = 0.5;
+    // Safety clamp: prevent absurdly small scales that would explode output sizes
+    // before the explicit QImage limit checks later on.
+    const double MIN_PACKING_SCALE = 1e-3;
     if (packingScale < MIN_PACKING_SCALE) {
-        LOG_ERR << "[VALIDATION] packingScale=" << packingScale << " is below minimum " << MIN_PACKING_SCALE
-                << ". This indicates UV areas are far too large relative to packing grid."
-                << " (targetUVArea=" << targetUVArea << ", packingArea=" << packingArea << "). Aborting.";
-        LOG_ERR << "[VALIDATION] This usually means input UVs are not normalized to [0,1] or optimization exploded UV coordinates.";
-        std::exit(-1);
+        LOG_WARN << "[VALIDATION] packingScale=" << packingScale
+                 << " is extremely small; clamping to " << MIN_PACKING_SCALE
+                 << " (packingArea=" << packingArea
+                 << ", targetUVArea=" << targetUVArea
+                 << ", textureAreaPixels=" << textureAreaPixels << ").";
+        packingScale = MIN_PACKING_SCALE;
     }
 
     LOG_INFO << "[DIAG] Packing scale factor: " << packingScale
-             << " (packingArea=" << packingArea << ", targetUVArea=" << targetUVArea << ", textureArea=" << textureArea << ")";
+             << " (packingArea=" << packingArea
+             << ", targetUVArea=" << targetUVArea
+             << ", naiveTargetUVArea=" << naiveTargetUVArea
+             << ", textureAreaPixels=" << textureAreaPixels << ")";
 
 
     rpack_params.costFunction = Packer::Parameters::LowestHorizon;

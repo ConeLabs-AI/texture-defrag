@@ -41,6 +41,7 @@
 #include <unordered_map>
 
 #include <vcg/complex/algorithms/clean.h>
+#include <vcg/complex/append.h>
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -489,7 +490,7 @@ void FixInconsistentUVWinding(Mesh& m)
     }
 
     m.Clear();
-    m = std::move(newMesh);
+    tri::Append::Mesh(m, newMesh);
 }
 
 AlgoStateHandle InitializeState(GraphHandle graph, const AlgoParameters& algoParameters)

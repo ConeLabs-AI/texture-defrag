@@ -39,6 +39,7 @@
 #include <unordered_set>
 #include <stack>
 #include <unordered_map>
+#include <string>
 
 #include <vcg/complex/algorithms/clean.h>
 #include <vcg/complex/append.h>
@@ -46,9 +47,6 @@
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <sys/sysctl.h>
-#elif defined(__linux__)
-#include <string>
-#include <fstream>
 #elif defined(_WIN32)
 #include <windows.h>
 #endif
@@ -490,7 +488,7 @@ void FixInconsistentUVWinding(Mesh& m)
     }
 
     m.Clear();
-    tri::Append::Mesh(m, newMesh);
+    tri::Append<Mesh, Mesh>::Mesh(m, newMesh);
 }
 
 AlgoStateHandle InitializeState(GraphHandle graph, const AlgoParameters& algoParameters)

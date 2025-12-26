@@ -248,7 +248,7 @@ namespace vcg{
                   }
                 }
             }
-            return (static_cast<unsigned int>(_objectPtrs.size()));
+        return (static_cast<unsigned int>(_objectPtrs.size()));
       }
     }
 

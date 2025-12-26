@@ -52,22 +52,22 @@ void ReorientCharts(GraphHandle graph)
     }
 }
 
+struct RigidCluster {
+    double area3D;
+    double sinSum;
+    double cosSum;
+    int count;
+    Mesh::FacePointer anchor;
+
+    RigidCluster(double a3d, double s, double c, int cnt, Mesh::FacePointer anchor_)
+        : area3D(a3d), sinSum(s), cosSum(c), count(cnt), anchor(anchor_) {}
+};
+
 int RotateChartForResampling(ChartHandle chart, const std::set<Mesh::FacePointer>& /*changeSet*/, const std::map<RegionID, bool> &flippedInput, bool colorize, double *zeroResamplingArea)
 {
     Mesh& m = chart->mesh;
     auto wtcsh = GetWedgeTexCoordStorageAttribute(m);
     *zeroResamplingArea = 0;
-
-    struct RigidCluster {
-        double area3D;
-        double sinSum;
-        double cosSum;
-        int count;
-        Mesh::FacePointer anchor;
-
-        RigidCluster(double a3d, double s, double c, int cnt, Mesh::FacePointer anc)
-            : area3D(a3d), sinSum(s), cosSum(c), count(cnt), anchor(anc) {}
-    };
 
     // We cluster rotations into bins. Since we only care about rotations that 
     // can be recovered via 90-degree increments in packing, we can cluster 

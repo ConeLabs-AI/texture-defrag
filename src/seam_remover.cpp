@@ -37,8 +37,6 @@
 #include <fstream>
 #include <iomanip>
 #include <unordered_set>
-#include <stack>
-#include <unordered_map>
 #include <string>
 
 #include <vcg/complex/algorithms/clean.h>
@@ -324,12 +322,6 @@ void PrepareMesh(Mesh& m, int *vndup)
     bool wasOriented, isOrientable;
     tri::Clean<Mesh>::OrientCoherentlyMesh(m, wasOriented, isOrientable);
 
-    // Ensure UV winding is coherent within each 3D connected component.
-    // Faces whose UV orientation disagrees with the dominant orientation of their
-    // component are detached into separate charts so that downstream code never
-    // sees mixed UV winding inside a chart.
-    FixInconsistentUVWinding(m);
-
     tri::UpdateTopology<Mesh>::FaceFace(m);
 
     int numRemovedFaces = tri::Clean<Mesh>::RemoveNonManifoldFace(m);
@@ -352,143 +344,6 @@ void PrepareMesh(Mesh& m, int *vndup)
     tri::UpdateTopology<Mesh>::VertexFace(m);
 
     tri::Allocator<Mesh>::CompactEveryVector(m);
-}
-
-void FixInconsistentUVWinding(Mesh& m)
-{
-    if (m.FN() == 0)
-        return;
-
-    // Ensure we have face-face topology
-    tri::UpdateTopology<Mesh>::FaceFace(m);
-
-    const double AREA_EPS = 1e-15;
-
-    std::vector<char> visited(m.face.size(), 0);
-    std::vector<char> detachMask(m.face.size(), 0);
-
-    int numComponents = 0;
-
-    for (auto &f : m.face) {
-        if (f.IsD())
-            continue;
-        int fid = tri::Index(m, &f);
-        if (visited[fid])
-            continue;
-
-        // Traverse a 3D-connected component using face-face adjacency
-        std::vector<Mesh::FacePointer> component;
-        std::stack<Mesh::FacePointer> st;
-        st.push(&f);
-        visited[fid] = 1;
-
-        int posCount = 0;
-        int negCount = 0;
-
-        while (!st.empty()) {
-            Mesh::FacePointer fp = st.top();
-            st.pop();
-            component.push_back(fp);
-
-            double a = AreaUV(*fp);
-            if (std::isfinite(a) && std::abs(a) > AREA_EPS) {
-                if (a > 0.0) posCount++;
-                else         negCount++;
-            }
-
-            for (int i = 0; i < 3; ++i) {
-                Mesh::FacePointer nfp = fp->FFp(i);
-                if (!nfp || nfp == fp || nfp->IsD())
-                    continue;
-                int nid = tri::Index(m, nfp);
-                if (!visited[nid]) {
-                    visited[nid] = 1;
-                    st.push(nfp);
-                }
-            }
-        }
-
-        ++numComponents;
-
-        // If the component already has coherent UV orientation, nothing to do
-        if (posCount == 0 || negCount == 0)
-            continue;
-
-        // Determine dominant UV orientation sign for this component
-        double dominantSign = (posCount >= negCount) ? 1.0 : -1.0;
-
-        for (Mesh::FacePointer fp : component) {
-            double a = AreaUV(*fp);
-            if (!std::isfinite(a) || std::abs(a) <= AREA_EPS)
-                continue;
-            double s = (a > 0.0) ? 1.0 : -1.0;
-            if (s != dominantSign) {
-                int idx = tri::Index(m, fp);
-                detachMask[idx] = 1;
-            }
-        }
-    }
-
-    int facesToDetach = 0;
-    for (char c : detachMask) if (c) ++facesToDetach;
-
-    if (facesToDetach == 0) {
-        LOG_INFO << "[VALIDATION] UV winding is already coherent within each 3D connected component.";
-        return;
-    }
-
-    LOG_INFO << "[VALIDATION] Detected " << facesToDetach
-             << " faces with UV winding opposite to the dominant orientation of their component. "
-             << "Detaching them into separate charts.";
-
-    // Rebuild the mesh so that "detached" faces use duplicated vertices,
-    // turning per-face winding inconsistencies into explicit seams.
-    Mesh newMesh;
-    newMesh.name = m.name;
-    newMesh.textures = m.textures;
-
-    std::unordered_map<Mesh::VertexPointer, Mesh::VertexPointer> vmapConsistent;
-    std::unordered_map<Mesh::VertexPointer, Mesh::VertexPointer> vmapInconsistent;
-    vmapConsistent.reserve(m.vert.size());
-    vmapInconsistent.reserve(m.vert.size() / 4 + 1);
-
-    auto ensureVertexCopy = [&](Mesh::VertexPointer oldV, bool inconsistent) -> Mesh::VertexPointer {
-        auto &vmap = inconsistent ? vmapInconsistent : vmapConsistent;
-        auto it = vmap.find(oldV);
-        if (it != vmap.end())
-            return it->second;
-
-        auto vi = tri::Allocator<Mesh>::AddVertices(newMesh, 1);
-        Mesh::VertexPointer newV = &*vi;
-        newV->ImportData(*oldV);
-        vmap[oldV] = newV;
-        return newV;
-    };
-
-    for (auto &f : m.face) {
-        if (f.IsD())
-            continue;
-
-        int idx = tri::Index(m, &f);
-        bool inconsistent = (detachMask[idx] != 0);
-
-        auto fi = tri::Allocator<Mesh>::AddFaces(newMesh, 1);
-        Mesh::FacePointer nf = &*fi;
-
-        nf->ImportData(f);
-
-        for (int i = 0; i < 3; ++i) {
-            Mesh::VertexPointer oldV = f.V(i);
-            Mesh::VertexPointer newV = ensureVertexCopy(oldV, inconsistent);
-            nf->V(i) = newV;
-        }
-
-        nf->SetMesh();
-        // FF/VF adjacency will be recomputed later in PrepareMesh.
-    }
-
-    m.Clear();
-    tri::Append<Mesh, Mesh>::Mesh(m, newMesh);
 }
 
 AlgoStateHandle InitializeState(GraphHandle graph, const AlgoParameters& algoParameters)

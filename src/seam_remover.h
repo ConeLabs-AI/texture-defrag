@@ -176,15 +176,5 @@ AlgoStateHandle InitializeState(GraphHandle graph, const AlgoParameters& algoPar
 void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoParameters& params);
 void Finalize(GraphHandle graph, const std::string& outname, int *vndup);
 
-/* Detect faces whose UV triangle winding disagrees with the dominant UV
- * orientation of their 3D connected component and detach them into separate
- * charts. This converts per-triangle winding inconsistencies into proper
- * seams so that each chart has coherent UV orientation.
- *
- * This helper is invoked during PrepareMesh to sanitize the input before
- * ComputeGraph / ReorientCharts; external code normally does not need to call
- * it directly. */
-void FixInconsistentUVWinding(Mesh& m);
-
 
 #endif // SEAM_REMOVER_H

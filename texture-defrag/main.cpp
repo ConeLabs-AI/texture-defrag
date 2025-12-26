@@ -269,10 +269,29 @@ int main(int argc, char *argv[])
 
     LOG_INFO << "Rotating charts...";
     double zeroResamplingMeshArea = 0;
+    std::map<ChartHandle, float> chartMultipliers;
     for (auto entry : graph->charts) {
         ChartHandle chart = entry.second;
         double zeroResamplingChartArea;
-        int anchor = RotateChartForResampling(chart, state->changeSet, flipped, colorize, &zeroResamplingChartArea);
+        int anchor = RotateChartForResampling(chart, {}, flipped, colorize, &zeroResamplingChartArea);
+        
+        double chartArea3D = chart->Area3D();
+        double resampledFraction = 1.0; 
+        if (chartArea3D > 1e-12) {
+            resampledFraction = 1.0 - (zeroResamplingChartArea / chartArea3D);
+        }
+        
+        if (!std::isfinite(resampledFraction) || resampledFraction > 1.0) resampledFraction = 1.0;
+        if (resampledFraction < 0.0) resampledFraction = 0.0;
+        
+        // Multiplier: fully rigid (fraction=0) -> 1.0, fully resampled (fraction=1) -> sqrt(2)
+        float mul = static_cast<float>(std::sqrt(1.0 + resampledFraction));
+        
+        if (!std::isfinite(mul) || mul < 1.0f) mul = 1.0f;
+        if (mul > 1.4143f) mul = 1.4143f; // slightly more than sqrt(2)
+        
+        chartMultipliers[chart] = mul;
+
         if (anchor != -1) {
             anchorMap[chart] = anchor;
             zeroResamplingMeshArea += zeroResamplingChartArea;
@@ -439,7 +458,7 @@ int main(int argc, char *argv[])
     LOG_INFO << "Packing atlas of size " << chartsToPack.size();
 
     std::vector<TextureSize> texszVec;
-    int npacked = Pack(chartsToPack, textureObject, texszVec, ap, anchorMap);
+    int npacked = Pack(chartsToPack, textureObject, texszVec, ap, chartMultipliers);
     timings["Packing"] = t.TimeSinceLastCheck();
 
     LOG_INFO << "Packed " << npacked << " charts in " << timings["Packing"] << " seconds";
@@ -528,10 +547,12 @@ int main(int argc, char *argv[])
         LOG_ERR << "Model not saved correctly";
     timings["Saving mesh"] = t.TimeSinceLastCheck();
 
-    LOG_INFO << "--- Timings ---";
+    std::stringstream timingsSS;
+    timingsSS << "--- Timings ---";
     for (const auto& timing : timings) {
-        LOG_INFO << timing.first << ": " << timing.second << "s";
+        timingsSS << "\n" << timing.first << ": " << timing.second << "s";
     }
+    LOG_INFO << timingsSS.str();
     LOG_INFO << "Processing took " << t.TimeElapsed() << " seconds";
 
     return 0;

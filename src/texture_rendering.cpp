@@ -456,7 +456,7 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
     double t_total_s = std::chrono::duration<double>(t_total_end - t_total_start).count();
 
     // Log performance summary
-    LOG_INFO << "[RENDER-STATS] sheets=" << nTex
+    LOG_VERBOSE << "[RENDER-STATS] sheets=" << nTex
              << " pixels=" << total_pixels_rendered
              << " total_s=" << t_total_s
              << " render_s=" << t_total_render_s
@@ -472,7 +472,7 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
         auto cs = textureObject->GetCacheStats();
         uint64_t lookups = cs.hits + cs.misses;
         double hitRate = lookups ? double(cs.hits) / double(lookups) : 0.0;
-        LOG_INFO << "[TEX-CACHE] lookups=" << lookups
+        LOG_VERBOSE << "[TEX-CACHE] lookups=" << lookups
                  << " hits=" << cs.hits
                  << " misses=" << cs.misses
                  << " hitRate=" << hitRate

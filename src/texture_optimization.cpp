@@ -28,6 +28,7 @@
 #include "arap.h"
 #include "mesh_attribute.h"
 #include "logging.h"
+#include "math_utils.h"
 
 #include "shell.h"
 
@@ -36,6 +37,8 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+
+#include <Eigen/SVD>
 
 
 static void MirrorU(ChartHandle chart);
@@ -49,80 +52,115 @@ void ReorientCharts(GraphHandle graph)
     }
 }
 
-int RotateChartForResampling(ChartHandle chart, const std::set<Mesh::FacePointer>& changeSet, const std::map<RegionID, bool> &flippedInput, bool colorize, double *zeroResamplingArea)
+int RotateChartForResampling(ChartHandle chart, const std::set<Mesh::FacePointer>& /*changeSet*/, const std::map<RegionID, bool> &flippedInput, bool colorize, double *zeroResamplingArea)
 {
     Mesh& m = chart->mesh;
     auto wtcsh = GetWedgeTexCoordStorageAttribute(m);
     *zeroResamplingArea = 0;
 
-    // compute the area contribution of each initial region restricted to
-    // faces that have _NOT_ been changed by the optimization
+    struct RigidCluster {
+        double area3D = 0;
+        double sinSum = 0;
+        double cosSum = 0;
+        int count = 0;
+        Mesh::FacePointer anchor = nullptr;
+    };
 
-    std::unordered_map<RegionID, double> areaMap;
-    std::unordered_map<RegionID, Mesh::FacePointer> idfp;
+    // We cluster rotations into bins. Since we only care about rotations that 
+    // can be recovered via 90-degree increments in packing, we can cluster 
+    // the "base" rotation angle (mod 90).
+    // Actually, the paper says "maximal set ... sharing the same transformation matrix".
+    // That means same rotation angle theta.
+    
+    std::vector<RigidCluster> clusters;
+    const double ANGLE_TOLERANCE = 2.0 * M_PI / 180.0; // 2 degrees
+    const double RIGID_TOLERANCE = 0.05; // 5% deviation in singular values
+
+    // Per-face storage to track cluster membership for later colorization
+    std::map<Mesh::FacePointer, int> faceClusterIdx;
 
     for (auto fptr : chart->fpVec) {
-        double areaUV = AreaUV(*fptr);
+        double areaUV_original;
         double area3D = Area3D(*fptr);
-        if ((changeSet.find(fptr) == changeSet.end()) && (areaUV != 0)) {
-            areaMap[fptr->initialId] += area3D;
-            idfp[fptr->initialId] = fptr;
+        
+        vcg::Point2d x10 = wtcsh[fptr].tc[1].P() - wtcsh[fptr].tc[0].P();
+        vcg::Point2d x20 = wtcsh[fptr].tc[2].P() - wtcsh[fptr].tc[0].P();
+        vcg::Point2d u10 = fptr->WT(1).P() - fptr->WT(0).P();
+        vcg::Point2d u20 = fptr->WT(2).P() - fptr->WT(0).P();
+
+        areaUV_original = std::abs(x10 ^ x20);
+        if (areaUV_original <= 1e-12) continue;
+
+        Eigen::Matrix2d Jf = ComputeTransformationMatrix(x10, x20, u10, u20);
+        Eigen::JacobiSVD<Eigen::Matrix2d> svd(Jf, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        Eigen::Vector2d sigma = svd.singularValues();
+
+        // Check if nearly rigid (isometry)
+        if (std::abs(sigma[0] - 1.0) < RIGID_TOLERANCE && std::abs(sigma[1] - 1.0) < RIGID_TOLERANCE) {
+            Eigen::Matrix2d R = svd.matrixU() * svd.matrixV().transpose();
+            if (R.determinant() < 0) {
+                Eigen::Matrix2d U = svd.matrixU();
+                U.col(1) *= -1;
+                R = U * svd.matrixV().transpose();
+            }
+            
+            double angle = std::atan2(R(1, 0), R(0, 0));
+            
+            bool found = false;
+            for (int ci = 0; ci < (int)clusters.size(); ++ci) {
+                auto& c = clusters[ci];
+                double avgAngle = std::atan2(c.sinSum / c.count, c.cosSum / c.count);
+                double diff = std::abs(angle - avgAngle);
+                if (diff > M_PI) diff = 2.0 * M_PI - diff;
+                if (diff < ANGLE_TOLERANCE) {
+                    c.area3D += area3D;
+                    c.sinSum += std::sin(angle);
+                    c.cosSum += std::cos(angle);
+                    c.count++;
+                    if (!c.anchor || area3D > Area3D(*(c.anchor))) c.anchor = fptr;
+                    faceClusterIdx[fptr] = ci;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                faceClusterIdx[fptr] = (int)clusters.size();
+                clusters.push_back({area3D, std::sin(angle), std::cos(angle), 1, fptr});
+            }
         }
     }
 
-    // if all the faces changed coordinates there is nothing to do
-    if (areaMap.size() == 0) {
+    if (clusters.empty()) {
         return -1;
     }
 
-    // compute the unchanged region with the largest area contribution
-
-    Mesh::FacePointer zeroResamplingAreaFp = nullptr;
-    for (auto& entry : areaMap) {
-        if (entry.second > *zeroResamplingArea) {
-            *zeroResamplingArea = entry.second;
-            zeroResamplingAreaFp = idfp[entry.first];
+    // Pick the cluster with the largest 3D area
+    int bestClusterIdx = 0;
+    double maxArea = -1.0;
+    for (int i = 0; i < (int)clusters.size(); ++i) {
+        if (clusters[i].area3D > maxArea) {
+            maxArea = clusters[i].area3D;
+            bestClusterIdx = i;
         }
     }
+    const auto& bestCluster = clusters[bestClusterIdx];
 
-    // compute the rotation angle (guard against degenerate/invalid edges)
-    TexCoordStorage tcs = wtcsh[zeroResamplingAreaFp];
-    vcg::Point2d d0 = tcs.tc[1].P() - tcs.tc[0].P();
-    vcg::Point2d d1 = zeroResamplingAreaFp->WT(1).P() - zeroResamplingAreaFp->WT(0).P();
-
-    if (flippedInput.at(zeroResamplingAreaFp->initialId)) {
-        d0.X() *= -1;
-    }
-
-    double rotAngle = 0.0;
-    double len0 = d0.Norm();
-    double len1 = d1.Norm();
-    if (std::isfinite(len0) && std::isfinite(len1) && len0 > 1e-12 && len1 > 1e-12) {
-        rotAngle = VecAngle(d0, d1);
-        if (!std::isfinite(rotAngle)) {
-            LOG_WARN << "[DIAG] RotateChartForResampling: non-finite rotation angle computed for chart " << chart->id << ", forcing 0.";
-            rotAngle = 0.0;
-        }
-    } else {
-        LOG_WARN << "[DIAG] RotateChartForResampling: degenerate anchor edge for chart " << chart->id
-                 << " (|d0|=" << len0 << ", |d1|=" << len1 << "). Skipping rotation.";
-        rotAngle = 0.0;
-    }
+    *zeroResamplingArea = bestCluster.area3D;
+    double rotAngle = std::atan2(bestCluster.sinSum / bestCluster.count, bestCluster.cosSum / bestCluster.count);
+    Mesh::FacePointer anchorFp = bestCluster.anchor;
 
     // rotate the uvs
     for (auto fptr : chart->fpVec) {
         for (int i = 0; i < 3; ++i) {
-            fptr->WT(i).P().Rotate(rotAngle);
+            fptr->WT(i).P().Rotate(-rotAngle); // Rotate back to align with grid
             fptr->V(i)->T().P() = fptr->WT(i).P();
         }
-        if (colorize) {
-            if ((fptr->initialId == zeroResamplingAreaFp->initialId) && (changeSet.find(fptr) == changeSet.end()))
-                fptr->C() = vcg::Color4b(85, 246, 85, 255);
+        if (colorize && faceClusterIdx.count(fptr) && faceClusterIdx[fptr] == bestClusterIdx) {
+            fptr->C() = vcg::Color4b(85, 246, 85, 255);
         }
     }
 
-    return tri::Index(chart->mesh, zeroResamplingAreaFp);
-
+    return tri::Index(chart->mesh, anchorFp);
 }
 
 void TrimTexture(Mesh& m, std::vector<TextureSize>& texszVec, bool unsafeMip)

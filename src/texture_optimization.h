@@ -44,10 +44,9 @@ void ReorientCharts(GraphHandle graph);
 /* Given a chart, compute both the set of 2D orientation of each initial component
  * and its 3D area. Then rotate the chart according to the largest surface area contribution
  * of the initial components that have been clustered in the chart.
- * Returns the index of an anchor face, i.e. a face that does not belong to the
- * change set and is inside the largest initial component that induced the rotation
+ * Returns the index of an anchor face, i.e. a face that belongs to the largest rigid cluster.
  */
-int RotateChartForResampling(ChartHandle chart, const std::set<Mesh::FacePointer> &changeSet, const std::map<RegionID, bool>& flippedInput, bool colorize, double *zeroResamplingArea);
+int RotateChartForResampling(ChartHandle chart, const std::set<Mesh::FacePointer> &/*changeSet*/, const std::map<RegionID, bool>& flippedInput, bool colorize, double *zeroResamplingArea);
 
 /* Texture trimming to remove unused space */
 void TrimTexture(Mesh& m, std::vector<TextureSize>& texszVec, bool unsafeMip);

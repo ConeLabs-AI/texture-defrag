@@ -33,7 +33,7 @@
 /* Pack the texture atlas encoded in the graph. Assumes the segmentation
  * correctly reflects the texture coordinates.
  * Returns the actual number of charts packed */
-int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObject, std::vector<TextureSize>& texszVec, const struct AlgoParameters& params, const std::map<ChartHandle, int>& anchorMap);
+int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObject, std::vector<TextureSize>& texszVec, const struct AlgoParameters& params, const std::map<ChartHandle, float>& chartMultipliers);
 
 /* Computes the UV outline(s) of the given chart. If the chart has no outlines,
  * which can happen for some inputs on small closed components that are ignored

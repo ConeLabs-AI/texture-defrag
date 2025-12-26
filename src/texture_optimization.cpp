@@ -59,11 +59,14 @@ int RotateChartForResampling(ChartHandle chart, const std::set<Mesh::FacePointer
     *zeroResamplingArea = 0;
 
     struct RigidCluster {
-        double area3D = 0;
-        double sinSum = 0;
-        double cosSum = 0;
-        int count = 0;
-        Mesh::FacePointer anchor = nullptr;
+        double area3D;
+        double sinSum;
+        double cosSum;
+        int count;
+        Mesh::FacePointer anchor;
+
+        RigidCluster(double a3d, double s, double c, int cnt, Mesh::FacePointer anc)
+            : area3D(a3d), sinSum(s), cosSum(c), count(cnt), anchor(anc) {}
     };
 
     // We cluster rotations into bins. Since we only care about rotations that 
@@ -125,7 +128,7 @@ int RotateChartForResampling(ChartHandle chart, const std::set<Mesh::FacePointer
             }
             if (!found) {
                 faceClusterIdx[fptr] = (int)clusters.size();
-                clusters.push_back({area3D, std::sin(angle), std::cos(angle), 1, fptr});
+                clusters.emplace_back(area3D, std::sin(angle), std::cos(angle), 1, fptr);
             }
         }
     }

@@ -58,7 +58,7 @@ sudo reboot
 rm -rf build
 mkdir build && cd build
 qmake ../texture-defrag/texture-defrag.pro -spec linux-g++
-make -j32
+make -j$(nproc)
 ```
 
 ## 3. Running the Application

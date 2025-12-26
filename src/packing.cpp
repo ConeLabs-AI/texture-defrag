@@ -25,6 +25,7 @@
 #include "logging.h"
 #include "utils.h"
 #include "mesh_attribute.h"
+#include "timer.h"
 
 #include <vcg/complex/algorithms/outline_support.h>
 #ifdef _OPENMP
@@ -41,6 +42,30 @@
 #include <numeric>
 #include <cmath>
 #include <random>
+
+namespace vcg {
+/**
+ * Composition of two Similarity2 transformations: A * B
+ * Resulting transformation R(p) = A(B(p))
+ * Similarity2 transformation: T(S(R(p))) = tra + sca * (Rotate(p, rotRad))
+ * 
+ * A(p) = a.tra + a.sca * Rotate(p, a.rotRad)
+ * B(p) = b.tra + b.sca * Rotate(p, b.rotRad)
+ * A(B(p)) = a.tra + a.sca * Rotate(b.tra + b.sca * Rotate(p, b.rotRad), a.rotRad)
+ *         = a.tra + a.sca * Rotate(b.tra, a.rotRad) + a.sca * b.sca * Rotate(Rotate(p, b.rotRad), a.rotRad)
+ *         = (a.tra + a.sca * Rotate(b.tra, a.rotRad)) + (a.sca * b.sca) * Rotate(p, a.rotRad + b.rotRad)
+ */
+template <class SCALAR_TYPE>
+Similarity2<SCALAR_TYPE> operator*(const Similarity2<SCALAR_TYPE> &a, const Similarity2<SCALAR_TYPE> &b) {
+    Similarity2<SCALAR_TYPE> res;
+    res.rotRad = a.rotRad + b.rotRad;
+    res.sca = a.sca * b.sca;
+    Point2<SCALAR_TYPE> rotatedTra = b.tra;
+    rotatedTra.Rotate(a.rotRad);
+    res.tra = a.tra + rotatedTra * a.sca;
+    return res;
+}
+}
 
 typedef vcg::RasterizedOutline2Packer<float, QtOutline2Rasterizer> RasterizationBasedPacker;
 

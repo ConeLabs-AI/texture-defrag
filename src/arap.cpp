@@ -168,10 +168,9 @@ void ARAP::ComputeSystemMatrix(Mesh& m, const std::vector<Cot>& cotan, Eigen::Sp
     L.makeCompressed();
 }
 
-static std::vector<Eigen::Matrix2d> ComputeRotations(Mesh& m)
+static void ComputeRotations(Mesh& m, std::vector<Eigen::Matrix2d>& rotations)
 {
     auto tsa = GetTargetShapeAttribute(m);
-    std::vector<Eigen::Matrix2d> rotations;
     rotations.resize(m.FN());
     #pragma omp parallel for
     for (int fi = 0; fi < m.FN(); ++fi) {
@@ -192,8 +191,6 @@ static std::vector<Eigen::Matrix2d> ComputeRotations(Mesh& m)
 
         rotations[fi] = R;
     }
-
-    return rotations;
 }
 
 void ARAP::ComputeRHS(Mesh& m, const std::vector<Eigen::Matrix2d>& rotations, const std::vector<Cot>& cotan, Eigen::VectorXd& bu, Eigen::VectorXd& bv)
@@ -402,9 +399,11 @@ ARAPSolveInfo ARAP::Solve()
     bool converged = false;
     int iter = 0;
 
+    std::vector<Eigen::Matrix2d> rotations;
+    Eigen::VectorXd bu, bv;
+
     while (!converged && iter < max_iter) {
-        std::vector<Eigen::Matrix2d> rotations = ComputeRotations(m);
-        Eigen::VectorXd bu, bv;
+        ComputeRotations(m, rotations);
         ComputeRHS(m, rotations, cotan, bu, bv);
 
         Eigen::VectorXd xu = solver.solve(bu);

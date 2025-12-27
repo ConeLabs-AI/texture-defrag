@@ -2458,6 +2458,19 @@ static CheckStatus OptimizeChart_Virtual(MergeJobResult& result, TopologyDiff& d
         // Also fix if in additionalFixedVertices (retry mechanism)
         if (additionalFixedVertices.find(origV) != additionalFixedVertices.end()) {
             shouldFix = true;
+        } else {
+            // The intersection detection finds Original vertices.
+            // The virtual shell used for optimization contains Representative vertices.
+            // Check if any vertex merged into this representative is in additionalFixedVertices.
+            auto mgIt = diff.mergeGroups.find(origV);
+            if (mgIt != diff.mergeGroups.end()) {
+                for (Mesh::VertexPointer vMerged : mgIt->second) {
+                    if (additionalFixedVertices.find(vMerged) != additionalFixedVertices.end()) {
+                        shouldFix = true;
+                        break;
+                    }
+                }
+            }
         }
 
         if (shouldFix) {

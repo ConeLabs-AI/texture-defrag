@@ -57,8 +57,12 @@ double VecAngle(const PointType& u, const PointType& v)
    typename PointType::ScalarType nu = u.Norm();
    typename PointType::ScalarType nv = v.Norm();
 
+   if (nu <= 0 || nv <= 0) return 0.0;
+
    double n = (u*nv - v*nu).Norm();
    double d = (u*nv + v*nu).Norm();
+
+   if (d <= 0) return M_PI;
 
    return 2.0 * std::atan(n/d);
 }

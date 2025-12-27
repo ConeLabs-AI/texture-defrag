@@ -81,7 +81,6 @@ static std::unordered_set<Mesh::VertexPointer> ComputeVerticesWithinOffsetThresh
 static CheckStatus CheckBoundaryAfterAlignment(SeamData& sd);
 static CheckStatus CheckAfterLocalOptimization(SeamData& sd, AlgoStateHandle state, const AlgoParameters& params);
 static CheckStatus OptimizeChart(SeamData& sd, GraphHandle graph, bool fixIntersectingEdges);
-static CheckStatus OptimizeChartFast(SeamData& sd, GraphHandle graph);
 static void AcceptMove(const SeamData& sd, AlgoStateHandle state, GraphHandle graph, const AlgoParameters& params);
 static void RejectMove(const SeamData& sd, AlgoStateHandle state, GraphHandle graph, CheckStatus status);
 static void EraseSeam(ClusteredSeamHandle csh, AlgoStateHandle state, GraphHandle graph);
@@ -477,31 +476,14 @@ void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoPara
             }
 
             if (status == PASS) {
-                bool usedFastPath = false;
-                if (sd.optimizationArea.size() <= 20) {
-                    if (k <= 100) LOG_INFO << "  [Iter " << k << "] Using OptimizeChartFast";
-                    status = OptimizeChartFast(sd, graph);
-                    usedFastPath = true;
-                } else {
-                    if (k <= 100) LOG_INFO << "  [Iter " << k << "] Using OptimizeChart (full)";
-                    status = OptimizeChart(sd, graph, false);
-                }
+                if (k <= 100) LOG_INFO << "  [Iter " << k << "] Using OptimizeChart";
+                status = OptimizeChart(sd, graph, false);
 
                 if (status == PASS) {
                     status = CheckAfterLocalOptimization(sd, state, params);
 
                     if (k <= 100 && status != PASS) {
                         LOG_INFO << "  [Iter " << k << "] CheckAfterLocalOptimization failed: " << status;
-                    }
-
-                    // If fast path failed due to distortion or local overlap, fall back to full optimization
-                    if (status != PASS && usedFastPath && 
-                        (status == FAIL_DISTORTION_LOCAL || status == FAIL_DISTORTION_GLOBAL || status == FAIL_LOCAL_OVERLAP)) {
-                        LOG_DEBUG << "Fast path check failed (" << status << "), falling back to full optimization";
-                        if (k <= 100) LOG_INFO << "  [Iter " << k << "] Fast path failed, falling back to full optimization";
-                        status = OptimizeChart(sd, graph, false);
-                        if (status == PASS)
-                            status = CheckAfterLocalOptimization(sd, state, params);
                     }
                 } else if (k <= 100) {
                     LOG_INFO << "  [Iter " << k << "] Optimization failed: " << status;
@@ -1013,7 +995,7 @@ static std::unordered_set<Mesh::VertexPointer> ComputeVerticesWithinOffsetThresh
         dist[entry.first] = entry.second;
     }
 
-    std::make_heap(h.begin(), h.end());
+    std::make_heap(h.begin(), h.end(), cmp);
 
     while (!h.empty()) {
         std::pop_heap(h.begin(), h.end(), cmp);
@@ -1484,41 +1466,6 @@ static CheckStatus OptimizeChart(SeamData& sd, GraphHandle graph, bool fixInters
 
     return sd.si.numericalError ? FAIL_NUMERICAL_ERROR : PASS;
 }
-
-static CheckStatus OptimizeChartFast(SeamData& sd, GraphHandle graph)
-{
-    PERF_TIMER_START;
-
-    // Reset UVs to stored state for input energy calculation
-    auto itV = sd.texcoordoptVert.begin();
-    auto itW = sd.texcoordoptWedge.begin();
-    std::vector<Mesh::FacePointer> fpVec;
-    fpVec.reserve(sd.optimizationArea.size());
-    for (auto fptr : sd.optimizationArea) {
-        fpVec.push_back(fptr);
-        fptr->V(0)->T().P() = *itV++; fptr->WT(0).P() = *itW++;
-        fptr->V(1)->T().P() = *itV++; fptr->WT(1).P() = *itW++;
-        fptr->V(2)->T().P() = *itV++; fptr->WT(2).P() = *itW++;
-    }
-
-    // Input energy (pre-alignment)
-    ARAP::ComputeEnergyFromStoredWedgeTC(fpVec, graph->mesh, &sd.inputArapNum, &sd.inputArapDenom);
-
-    // Sync wedge coordinates (WT) to the vertex coordinates (V->T) updated by AlignAndMerge
-    WedgeTexFromVertexTex(sd.a);
-    if (sd.a != sd.b)
-        WedgeTexFromVertexTex(sd.b);
-
-    // Output energy (post-alignment, skipping ARAP optimization)
-    ARAP::ComputeEnergyFromStoredWedgeTC(fpVec, graph->mesh, &sd.outputArapNum, &sd.outputArapDenom);
-
-    sd.si.finalEnergy = (sd.outputArapDenom > 0) ? (sd.outputArapNum / sd.outputArapDenom) : 0;
-    sd.si.numericalError = false;
-
-    PERF_TIMER_ACCUMULATE(t_optimize);
-    return PASS;
-}
-
 
 static bool SeamInterceptsOptimizationArea(ClusteredSeamHandle csh, const SeamData& sd)
 {

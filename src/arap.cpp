@@ -25,7 +25,6 @@
 #include "logging.h"
 #include "math_utils.h"
 
-#include <Eigen/IterativeLinearSolvers>
 #include <iomanip>
 #include <unordered_set>
 #include <omp.h>
@@ -118,14 +117,13 @@ static std::vector<ARAP::Cot> ComputeCotangentVector(Mesh& m)
     return cotan;
 }
 
-void ARAP::ComputeSystemMatrix(Mesh& m, const std::vector<Cot>& cotan, Eigen::SparseMatrix<double, Eigen::RowMajor>& L)
+void ARAP::ComputeSystemMatrix(Mesh& m, const std::vector<Cot>& cotan, Eigen::SparseMatrix<double>& L)
 {
     using Td = Eigen::Triplet<double>;
 
-    L.resize(m.VN(), m.VN());
+    L.resize(n_free_verts, n_free_verts);
     L.setZero();
     std::vector<Td> tri;
-    auto Idx = [&m](const Mesh::VertexPointer vp) { return (int) tri::Index(m, vp); };
 
     #pragma omp parallel
     {
@@ -134,29 +132,40 @@ void ARAP::ComputeSystemMatrix(Mesh& m, const std::vector<Cot>& cotan, Eigen::Sp
         for (int fi = 0; fi < m.FN(); ++fi) {
             auto &f = m.face[fi];
             for (int i = 0; i < 3; ++i) {
-                if (std::find(fixed_i.begin(), fixed_i.end(), (int) tri::Index(m, f.V(i))) == fixed_i.end()) {
-                    Mesh::VertexPointer vi = f.V0(i);
-                    int j = (i+1)%3;
-                    Mesh::VertexPointer vj = f.V1(i);
-                    int k = (i+2)%3;
-                    Mesh::VertexPointer vk = f.V2(i);
+                int global_i = (int) tri::Index(m, f.V0(i));
+                int global_j = (int) tri::Index(m, f.V1(i));
+                int global_k = (int) tri::Index(m, f.V2(i));
 
-                    ensure(Idx(vi) >= 0); ensure(Idx(vi) < m.VN());
-                    ensure(Idx(vj) >= 0); ensure(Idx(vj) < m.VN());
-                    ensure(Idx(vk) >= 0); ensure(Idx(vk) < m.VN());
+                int local_i = global_to_local_idx[global_i];
+                int local_j = global_to_local_idx[global_j];
+                int local_k = global_to_local_idx[global_k];
 
-                    double weight_ij = cotan[fi].v[k];
-                    double weight_ik = cotan[fi].v[j];
+                if (local_i != -1) {
+                    double weight_ij = cotan[fi].v[2]; // k is 2 in V0, V1, V2 mapping? No, wait.
+                    // The original code used:
+                    // int j = (i+1)%3;
+                    // Mesh::VertexPointer vj = f.V1(i);
+                    // int k = (i+2)%3;
+                    // Mesh::VertexPointer vk = f.V2(i);
+                    // double weight_ij = cotan[fi].v[k];
+                    // double weight_ik = cotan[fi].v[j];
 
-                    if (!std::isfinite(weight_ij))
-                        weight_ij = 1e-8;
+                    int j_idx = (i+1)%3;
+                    int k_idx = (i+2)%3;
+                    double weight_ij = cotan[fi].v[k_idx];
+                    double weight_ik = cotan[fi].v[j_idx];
 
-                    if (!std::isfinite(weight_ik))
-                        weight_ik = 1e-8;
+                    if (!std::isfinite(weight_ij)) weight_ij = 1e-8;
+                    if (!std::isfinite(weight_ik)) weight_ik = 1e-8;
 
-                    tri_private.push_back(Td(Idx(vi), Idx(vj), -weight_ij));
-                    tri_private.push_back(Td(Idx(vi), Idx(vk), -weight_ik));
-                    tri_private.push_back(Td(Idx(vi), Idx(vi), (weight_ij + weight_ik)));
+                    // i is Free, check j and k
+                    if (local_j != -1) {
+                        tri_private.push_back(Td(local_i, local_j, -weight_ij));
+                    }
+                    if (local_k != -1) {
+                        tri_private.push_back(Td(local_i, local_k, -weight_ik));
+                    }
+                    tri_private.push_back(Td(local_i, local_i, weight_ij + weight_ik));
                 }
             }
         }
@@ -164,9 +173,6 @@ void ARAP::ComputeSystemMatrix(Mesh& m, const std::vector<Cot>& cotan, Eigen::Sp
         tri.insert(tri.end(), tri_private.begin(), tri_private.end());
     }
 
-    for (auto vi : fixed_i) {
-        tri.push_back(Td(vi, vi, 1));
-    }
     L.setFromTriplets(tri.begin(), tri.end());
     L.makeCompressed();
 }
@@ -201,42 +207,58 @@ static std::vector<Eigen::Matrix2d> ComputeRotations(Mesh& m)
 
 void ARAP::ComputeRHS(Mesh& m, const std::vector<Eigen::Matrix2d>& rotations, const std::vector<Cot>& cotan, Eigen::VectorXd& bu, Eigen::VectorXd& bv)
 {
-    auto Idx = [&m](const Mesh::VertexPointer vp) { return (int) tri::Index(m, vp); };
-    bu.setZero();
-    bv.setZero();
-    auto tsa = GetTargetShapeAttribute(m);
+    bu.setZero(n_free_verts);
+    bv.setZero(n_free_verts);
 
     #pragma omp parallel
     {
-        Eigen::VectorXd bu_private = Eigen::VectorXd::Zero(m.VN());
-        Eigen::VectorXd bv_private = Eigen::VectorXd::Zero(m.VN());
+        Eigen::VectorXd bu_private = Eigen::VectorXd::Zero(n_free_verts);
+        Eigen::VectorXd bv_private = Eigen::VectorXd::Zero(n_free_verts);
         #pragma omp for nowait
         for (int fi = 0; fi < m.FN(); ++fi) {
             auto &f = m.face[fi];
             const Eigen::Matrix2d& Rf = rotations[fi];
-
             const auto& t = local_frame_coords[fi];
 
             for (int i = 0; i < 3; ++i) {
-                Mesh::VertexPointer vi = f.V0(i);
-                int j = (i+1)%3;
-                int k = (i+2)%3;
+                int global_i = (int) tri::Index(m, f.V0(i));
+                int local_i = global_to_local_idx[global_i];
 
-                double weight_ij = cotan[fi].v[k];
-                double weight_ik = cotan[fi].v[j];
+                if (local_i != -1) {
+                    int j_local_idx = (i+1)%3;
+                    int k_local_idx = (i+2)%3;
 
-                if (!std::isfinite(weight_ij))
-                    weight_ij = 1e-8;
+                    int global_j = (int) tri::Index(m, f.V1(i));
+                    int global_k = (int) tri::Index(m, f.V2(i));
+                    int local_j = global_to_local_idx[global_j];
+                    int local_k = global_to_local_idx[global_k];
 
-                if (!std::isfinite(weight_ik))
-                    weight_ik = 1e-8;
+                    double weight_ij = cotan[fi].v[k_local_idx];
+                    double weight_ik = cotan[fi].v[j_local_idx];
 
-                Eigen::Vector2d x_ij = t[i] - t[j];
-                Eigen::Vector2d x_ik = t[i] - t[k];
+                    if (!std::isfinite(weight_ij)) weight_ij = 1e-8;
+                    if (!std::isfinite(weight_ik)) weight_ik = 1e-8;
 
-                Eigen::Vector2d rhs = (weight_ij * Rf) * x_ij + (weight_ik * Rf) * x_ik;
-                bu_private(Idx(vi)) += rhs.x();
-                bv_private(Idx(vi)) += rhs.y();
+                    // 1. Standard ARAP Rotation Forces
+                    Eigen::Vector2d x_ij = t[i] - t[j_local_idx];
+                    Eigen::Vector2d x_ik = t[i] - t[k_local_idx];
+                    Eigen::Vector2d rhs_rot = (weight_ij * Rf) * x_ij + (weight_ik * Rf) * x_ik;
+
+                    bu_private(local_i) += rhs_rot.x();
+                    bv_private(local_i) += rhs_rot.y();
+
+                    // 2. Fixed Vertex Pull (Boundary Conditions)
+                    if (local_j == -1) {
+                        vcg::Point2d fixed_pos_j = m.vert[global_j].T().P();
+                        bu_private(local_i) += weight_ij * fixed_pos_j.X();
+                        bv_private(local_i) += weight_ij * fixed_pos_j.Y();
+                    }
+                    if (local_k == -1) {
+                        vcg::Point2d fixed_pos_k = m.vert[global_k].T().P();
+                        bu_private(local_i) += weight_ik * fixed_pos_k.X();
+                        bv_private(local_i) += weight_ik * fixed_pos_k.Y();
+                    }
+                }
             }
         }
         #pragma omp critical
@@ -244,11 +266,6 @@ void ARAP::ComputeRHS(Mesh& m, const std::vector<Eigen::Matrix2d>& rotations, co
             bu += bu_private;
             bv += bv_private;
         }
-    }
-
-    for (unsigned i = 0; i < fixed_i.size(); ++i) {
-        bu(fixed_i[i]) = fixed_pos[i].X();
-        bv(fixed_i[i]) = fixed_pos[i].Y();
     }
 }
 
@@ -351,21 +368,38 @@ ARAPSolveInfo ARAP::Solve()
 
     PrecomputeData();
 
-    Eigen::SparseMatrix<double, Eigen::RowMajor> A;
-    ComputeSystemMatrix(m, cotan, A);
+    // 1. Establish the mapping [0, N_free]
+    global_to_local_idx.assign(m.VN(), -1);
+    local_to_global_idx.clear();
+    n_free_verts = 0;
 
-    Eigen::VectorXd xu = Eigen::VectorXd::Constant(m.VN(), 0);
-    Eigen::VectorXd xv = Eigen::VectorXd::Constant(m.VN(), 0);
+    // We use a set for O(log N) lookup or a bool array for O(1)
+    std::vector<bool> is_fixed(m.VN(), false);
+    for (int idx : fixed_i) {
+        if (idx >= 0 && idx < m.VN())
+            is_fixed[idx] = true;
+    }
 
-    double e = CurrentEnergy();
+    for (int i = 0; i < m.VN(); ++i) {
+        if (!is_fixed[i]) {
+            global_to_local_idx[i] = n_free_verts;
+            local_to_global_idx.push_back(i);
+            n_free_verts++;
+        }
+    }
 
-    // The system matrix is not symmetric - using preconditioned BiCGSTAB
-    Eigen::BiCGSTAB<Eigen::SparseMatrix<double, Eigen::RowMajor>, Eigen::IncompleteLUT<double>> solver;
+    // Ensure fixed vertices are at their fixed positions
+    for (unsigned i = 0; i < fixed_i.size(); ++i) {
+        m.vert[fixed_i[i]].T().P() = fixed_pos[i];
+    }
 
-    solver.compute(A);
+    // 2. Build and Factorize the System Matrix
+    Eigen::SparseMatrix<double> L;
+    ComputeSystemMatrix(m, cotan, L);
 
+    solver.compute(L);
     if (solver.info() != Eigen::Success) {
-        LOG_WARN << "Cotan matrix factorization failed: " << solver.info();
+        LOG_WARN << "ARAP: Matrix factorization failed: " << solver.info();
         si.numericalError = true;
         return si;
     }
@@ -373,39 +407,35 @@ ARAPSolveInfo ARAP::Solve()
     si.initialEnergy = CurrentEnergy();
     LOG_DEBUG << "ARAP: Starting energy is " << si.initialEnergy;
 
+    double e = si.initialEnergy;
     bool converged = false;
     int iter = 0;
-    while (!converged && iter < max_iter) {
 
+    while (!converged && iter < max_iter) {
         std::vector<Eigen::Matrix2d> rotations = ComputeRotations(m);
-        Eigen::VectorXd bu(m.VN());
-        Eigen::VectorXd bv(m.VN());
+        Eigen::VectorXd bu, bv;
         ComputeRHS(m, rotations, cotan, bu, bv);
 
-        Eigen::VectorXd xu_iter = solver.solve(bu);
-
-        if (!(solver.info() == Eigen::Success)) {
-            LOG_WARN << "ARAP solve failed";
+        Eigen::VectorXd xu = solver.solve(bu);
+        if (solver.info() != Eigen::Success) {
+            LOG_WARN << "ARAP: solve(u) failed";
             si.numericalError = true;
-            return si;
+            break;
         }
 
-        LOG_DEBUG << "ARAP solve (u) converged in " << solver.iterations() << " iterations with error " << solver.error();
-
-        Eigen::VectorXd xv_iter = solver.solve(bv);
-
-        if (!(solver.info() == Eigen::Success)) {
-            LOG_WARN << "ARAP solve failed";
+        Eigen::VectorXd xv = solver.solve(bv);
+        if (solver.info() != Eigen::Success) {
+            LOG_WARN << "ARAP: solve(v) failed";
             si.numericalError = true;
-            return si;
+            break;
         }
 
-        LOG_DEBUG << "ARAP solve (v) converged in " << solver.iterations() << " iterations with error " << solver.error();
-
+        // 3. Unpack back to Mesh
         #pragma omp parallel for
-        for (int vi = 0; vi < m.VN(); ++vi) {
-            m.vert[vi].T().P().X() = xu_iter(vi);
-            m.vert[vi].T().P().Y() = xv_iter(vi);
+        for (int local_i = 0; local_i < n_free_verts; ++local_i) {
+            int global_i = local_to_global_idx[local_i];
+            m.vert[global_i].T().P().X() = xu(local_i);
+            m.vert[global_i].T().P().Y() = xv(local_i);
         }
 
         #pragma omp parallel for
@@ -425,10 +455,7 @@ ARAPSolveInfo ARAP::Solve()
             converged = true;
         }
 
-        xu = xu_iter;
-        xv = xv_iter;
         e = e_curr;
-
         iter++;
     }
 
@@ -440,10 +467,7 @@ ARAPSolveInfo ARAP::Solve()
 
     LOG_DEBUG << "ARAP: Energy after optimization is " << CurrentEnergy() << " (" << iter << " iterations)";
 
-    // Extra step to ensure the fixed vertices do not move at all
-    for (unsigned i = 0; i < fixed_i.size(); ++i) {
-        m.vert[fixed_i[i]].T().P() = fixed_pos[i];
-    }
+    // Final update for wedges
     for (auto& f : m.face) {
         for (int i = 0; i < 3; ++i) {
             f.WT(i).P() = f.cV(i)->T().P();
@@ -467,5 +491,3 @@ void ARAP::PrecomputeData()
         local_frame_coords[fi][2] = x_20;
     }
 }
-
-

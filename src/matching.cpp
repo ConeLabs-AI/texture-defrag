@@ -170,21 +170,6 @@ MatchingTransform ComputeMatchingRigidMatrix(const std::vector<vcg::Point2d>& ta
 
     Eigen::Matrix2d R  = V * d.asDiagonal() * U.transpose();
 
-    // Rotation snapping: if the rotation is nearly a multiple of 90 degrees, force it to be exactly that multiple
-    {
-        double angle = std::atan2(R(1, 0), R(0, 0));
-        double angleDeg = angle * 180.0 / M_PI;
-        double snappedAngleDeg = std::round(angleDeg / 90.0) * 90.0;
-        const double SNAP_THRESHOLD_DEG = 2.0; // 2 degrees tolerance for snapping
-
-        if (std::abs(angleDeg - snappedAngleDeg) < SNAP_THRESHOLD_DEG) {
-            double snappedAngle = snappedAngleDeg * M_PI / 180.0;
-            double c = std::cos(snappedAngle);
-            double s = std::sin(snappedAngle);
-            R << c, -s, s, c;
-        }
-    }
-
     ensure(R.determinant() > 0);
 
     Eigen::Vector2d ect(ct[0], ct[1]);

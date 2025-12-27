@@ -1874,9 +1874,7 @@ static CostInfo ReduceSeam(ClusteredSeamHandle csh, AlgoStateHandle state, Graph
     }
 }
 
-// ============================================================================
 // PARALLEL OPTIMIZATION IMPLEMENTATION
-// ============================================================================
 
 // Global parallel configuration
 static ParallelConfig g_parallelConfig;
@@ -1899,9 +1897,6 @@ static TopologyDiff AlignAndMerge_Virtual(ClusteredSeamHandle csh, const ChartHa
                                           const MatchingTransform& mi, const AlgoParameters& params);
 static void ComputeOptimizationArea_Virtual(MergeJobResult& result, const TopologyDiff& diff,
                                             const ChartHandle a, const ChartHandle b);
-static CheckStatus OptimizeChart_Virtual(MergeJobResult& result, TopologyDiff& diff,
-                                         const std::vector<Mesh::FacePointer>& supportFaces, Mesh& mesh,
-                                         const AlgoParameters& params);
 static CheckStatus CheckBoundary_Virtual(const MergeJobResult& result, const TopologyDiff& diff,
                                          const ChartHandle a, const ChartHandle b);
 static CheckStatus CheckAfterOptimization_Virtual(MergeJobResult& result, const TopologyDiff& diff,
@@ -1914,10 +1909,8 @@ static double ComputeArapEnergyFromVirtualPositions(const std::vector<Mesh::Face
                                                      const std::unordered_map<Mesh::VertexPointer, vcg::Point2d>& virtualUV,
                                                      double* num, double* denom);
 
-// ============================================================================
 // AlignAndMerge_Virtual: Compute merge WITHOUT modifying global mesh
 // Returns a TopologyDiff describing the merge result
-// ============================================================================
 static TopologyDiff AlignAndMerge_Virtual(ClusteredSeamHandle csh, const ChartHandle a, const ChartHandle b,
                                           const MatchingTransform& mi, const AlgoParameters& params)
 {
@@ -2111,9 +2104,7 @@ static std::unordered_set<Mesh::VertexPointer> ComputeVerticesWithinOffsetThresh
     return vset;
 }
 
-// ============================================================================
 // ComputeOptimizationArea_Virtual: Compute optimization area from TopologyDiff
-// ============================================================================
 static void ComputeOptimizationArea_Virtual(MergeJobResult& result, const TopologyDiff& diff,
                                             const ChartHandle a, const ChartHandle b)
 {
@@ -3219,7 +3210,7 @@ void GreedyOptimization_Parallel(GraphHandle graph, AlgoStateHandle state, const
             // Get charts
             ChartPair charts = GetCharts(result.csh, graph);
             if (!charts.first || !charts.second) {
-                result.status = FAIL_TOPOLOGY;
+                result.checkStatus = FAIL_TOPOLOGY;
                 continue;
             }
 
@@ -3253,7 +3244,7 @@ void GreedyOptimization_Parallel(GraphHandle graph, AlgoStateHandle state, const
             if (transIt != batchTransforms.end()) {
                 transform = transIt->second;
             } else {
-                result.status = FAIL_TOPOLOGY;
+                result.checkStatus = FAIL_TOPOLOGY;
                 continue;
             }
 
@@ -3321,7 +3312,7 @@ void GreedyOptimization_Parallel(GraphHandle graph, AlgoStateHandle state, const
                 }
             }
 
-            result.status = status;
+            result.checkStatus = status;
             if (status == PASS) {
                 result.diff = std::move(diff);
             }
@@ -3348,7 +3339,7 @@ void GreedyOptimization_Parallel(GraphHandle graph, AlgoStateHandle state, const
         for (size_t idx : order) {
             MergeJobResult& result = results[idx];
 
-            if (result.status == PASS) {
+            if (result.checkStatus == PASS) {
                 // Check for "Moving Walls" collision with already committed results
                 bool collision = false;
                 if (config.enableSpatialCheck) {
@@ -3375,7 +3366,7 @@ void GreedyOptimization_Parallel(GraphHandle graph, AlgoStateHandle state, const
             } else {
                 // Rejected - invalidate with penalty
                 EraseSeam(result.csh, state, graph);
-                InvalidateCluster(result.csh, state, graph, result.status, PENALTY_MULTIPLIER);
+                InvalidateCluster(result.csh, state, graph, result.checkStatus, PENALTY_MULTIPLIER);
 
                 if (result.chartIdA != result.chartIdB) {
                     state->failed[result.chartIdA].insert(result.chartIdB);

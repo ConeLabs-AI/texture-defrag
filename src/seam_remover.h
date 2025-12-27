@@ -111,6 +111,21 @@ struct SeamData {
 // Parallel Architecture Data Structures
 // ============================================================================
 
+enum CheckStatus {
+    PASS=0,
+    FAIL_LOCAL_OVERLAP,
+    FAIL_GLOBAL_OVERLAP_BEFORE,
+    FAIL_GLOBAL_OVERLAP_AFTER_OPT, // border of the optimization area self-intersects
+    FAIL_GLOBAL_OVERLAP_AFTER_BND, // border of the optimzation area hit the fixed border
+    FAIL_DISTORTION_LOCAL,
+    FAIL_DISTORTION_GLOBAL,
+    FAIL_TOPOLOGY,  // shell genus is > 0 or shell is closed
+    FAIL_NUMERICAL_ERROR,
+    UNKNOWN,
+    FAIL_GLOBAL_OVERLAP_UNFIXABLE,
+    _END
+};
+
 // TopologyDiff: Describes the merge result without modifying global mesh state.
 // Worker threads produce this; main thread applies it during commit phase.
 struct TopologyDiff {
@@ -169,13 +184,13 @@ struct MergeJobResult {
     ClusteredSeamHandle csh;
 
     // Outcome
-    CheckStatus status;
+    CheckStatus checkStatus;
 
     // Chart IDs involved (for locking/collision detection)
     RegionID chartIdA;
     RegionID chartIdB;
 
-    // Resulting Data (Valid only if status == PASS)
+    // Resulting Data (Valid only if checkStatus == PASS)
     TopologyDiff diff;
 
     // Metrics for scoring updates
@@ -213,7 +228,7 @@ struct MergeJobResult {
     std::vector<HalfEdgePair> intersectionInternal;
     std::unordered_set<Mesh::VertexPointer> fixedVerticesFromIntersectingEdges;
 
-    MergeJobResult() : csh{nullptr}, status{UNKNOWN}, chartIdA{INVALID_ID}, chartIdB{INVALID_ID},
+    MergeJobResult() : csh{nullptr}, checkStatus{UNKNOWN}, chartIdA{INVALID_ID}, chartIdB{INVALID_ID},
                        finalEnergy{0}, initialEnergy{0}, arapIterations{0},
                        inputArapNum{0}, inputArapDenom{0}, outputArapNum{0}, outputArapDenom{0},
                        inputNegativeArea{0}, inputAbsoluteArea{0}, inputUVBorderLength{0} {}
@@ -237,22 +252,6 @@ struct ParallelBatchStats {
 // ============================================================================
 // End Parallel Architecture Data Structures
 // ============================================================================
-
-// enum of the possible outcomes for safety checks when performing merge operations
-enum CheckStatus {
-    PASS=0,
-    FAIL_LOCAL_OVERLAP,
-    FAIL_GLOBAL_OVERLAP_BEFORE,
-    FAIL_GLOBAL_OVERLAP_AFTER_OPT, // border of the optimization area self-intersects
-    FAIL_GLOBAL_OVERLAP_AFTER_BND, // border of the optimzation area hit the fixed border
-    FAIL_DISTORTION_LOCAL,
-    FAIL_DISTORTION_GLOBAL,
-    FAIL_TOPOLOGY,  // shell genus is > 0 or shell is closed
-    FAIL_NUMERICAL_ERROR,
-    UNKNOWN,
-    FAIL_GLOBAL_OVERLAP_UNFIXABLE,
-    _END
-};
 
 struct CostInfo {
     enum MatchingValue {

@@ -401,9 +401,13 @@ void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoPara
     PrintStateInfo(state, graph, params);
 
     LOG_INFO << "Atlas energy before optimization is " << ARAP::ComputeEnergyFromStoredWedgeTC(graph->mesh, nullptr, nullptr);
+    LOG_INFO << "Starting greedy optimization loop with " << state->queue.size() << " operations...";
 
     int k = 0;
     while (state->queue.size() > 0) {
+        if (k < 1000) {
+            LOG_INFO << "Iteration " << k << " - Queue size: " << state->queue.size();
+        }
 
         if (state->queue.size() > 2 * state->cost.size())
             PurgeQueue(state);
@@ -425,75 +429,107 @@ void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoPara
 
         WeightedSeam ws = state->queue.top();
         state->queue.pop();
-        if (Valid(ws, state)) {
-            if (ws.second == Infinity()) {
-                // sanity check
-                for (auto& entry : state->cost)
-                    ensure(entry.second == Infinity());
-                LOG_INFO << "Queue is empty, interrupting.";
-                break;
-            } else {
-                ++k;
-                if ((k % 6000) == 0) {
-                    LOG_INFO << "Logging execution stats after " << k << " iterations";
-                    LogExecutionStats();
-                }
-                SeamData sd;
-                ComputeSeamData(sd, ws.first, graph, state);
-                LOG_DEBUG << "  Chart ids are " << sd.a->id << " " << sd.b->id << " (areas = " << sd.a->AreaUV() << ", " << sd.b->AreaUV() << ")";
+        if (!Valid(ws, state)) {
+            if (k < 1000 && (state->queue.size() % 1000 == 0)) {
+                LOG_INFO << "  [Iter " << k << "] Skipping invalid queue entry, queue size: " << state->queue.size();
+            }
+            continue;
+        }
 
-                OffsetMap om = AlignAndMerge(ws.first, sd, state->transform[ws.first], params);
+        if (ws.second == Infinity()) {
+            // sanity check
+            for (auto& entry : state->cost)
+                ensure(entry.second == Infinity());
+            LOG_INFO << "Queue is empty, interrupting.";
+            break;
+        } else {
+            ++k;
+            if ((k % 6000) == 0) {
+                LOG_INFO << "Logging execution stats after " << k << " iterations";
+                LogExecutionStats();
+            }
 
-                ComputeOptimizationArea(sd, graph->mesh, om);
+            SeamData sd;
+            ComputeSeamData(sd, ws.first, graph, state);
 
-                // when merging two charts, check if they collide outside the optimization area
+            if (k <= 100) {
+                LOG_INFO << "  [Iter " << k << "] Processing charts " << sd.a->id << " and " << sd.b->id
+                         << " (areas UV: " << sd.a->AreaUV() << ", " << sd.b->AreaUV() << ")";
+            }
 
-                CheckStatus status = (sd.a != sd.b) ? CheckBoundaryAfterAlignment(sd) : PASS;
+            LOG_DEBUG << "  Chart ids are " << sd.a->id << " " << sd.b->id << " (areas = " << sd.a->AreaUV() << ", " << sd.b->AreaUV() << ")";
 
-                if (status == PASS) {
-                    bool usedFastPath = false;
-                    if (sd.optimizationArea.size() <= 20) {
-                        status = OptimizeChartFast(sd, graph);
-                        usedFastPath = true;
-                    } else {
-                        status = OptimizeChart(sd, graph, false);
-                    }
+            OffsetMap om = AlignAndMerge(ws.first, sd, state->transform[ws.first], params);
 
-                    if (status == PASS) {
-                        status = CheckAfterLocalOptimization(sd, state, params);
+            ComputeOptimizationArea(sd, graph->mesh, om);
 
-                        // If fast path failed due to distortion or local overlap, fall back to full optimization
-                        if (status != PASS && usedFastPath && 
-                            (status == FAIL_DISTORTION_LOCAL || status == FAIL_DISTORTION_GLOBAL || status == FAIL_LOCAL_OVERLAP)) {
-                            LOG_DEBUG << "Fast path check failed (" << status << "), falling back to full optimization";
-                            status = OptimizeChart(sd, graph, false);
-                            if (status == PASS)
-                                status = CheckAfterLocalOptimization(sd, state, params);
-                        }
-                    }
-                }
+            if (k <= 100) {
+                LOG_INFO << "  [Iter " << k << "] Optimization area size: " << sd.optimizationArea.size() << " faces";
+            }
 
-                while (status == FAIL_GLOBAL_OVERLAP_AFTER_OPT || status == FAIL_GLOBAL_OVERLAP_AFTER_BND) {
-                    LOG_DEBUG << "Global overlaps detected after ARAP optimization, fixing edges";
-                    CheckStatus iterStatus = OptimizeChart(sd, graph, true);
-                    if (iterStatus == _END)
-                        break;
-                    else
-                        status = CheckAfterLocalOptimization(sd, state, params);
-                }
+            // when merging two charts, check if they collide outside the optimization area
 
-                statsCheck[status]++;
+            CheckStatus status = (sd.a != sd.b) ? CheckBoundaryAfterAlignment(sd) : PASS;
 
-                if (status == PASS) {
-                    AcceptMove(sd, state, graph, params);
-                    ColorizeSeam(sd.csh, vcg::Color4b(255, 69, 0, 255));
-                    accept++;
-                    LOG_DEBUG << "Accepted operation";
+            if (k <= 100 && status != PASS) {
+                LOG_INFO << "  [Iter " << k << "] CheckBoundaryAfterAlignment failed: " << status;
+            }
+
+            if (status == PASS) {
+                bool usedFastPath = false;
+                if (sd.optimizationArea.size() <= 20) {
+                    if (k <= 100) LOG_INFO << "  [Iter " << k << "] Using OptimizeChartFast";
+                    status = OptimizeChartFast(sd, graph);
+                    usedFastPath = true;
                 } else {
-                    RejectMove(sd, state, graph, status);
-                    reject++;
-                    LOG_DEBUG << "Rejected operation";
+                    if (k <= 100) LOG_INFO << "  [Iter " << k << "] Using OptimizeChart (full)";
+                    status = OptimizeChart(sd, graph, false);
                 }
+
+                if (status == PASS) {
+                    status = CheckAfterLocalOptimization(sd, state, params);
+
+                    if (k <= 100 && status != PASS) {
+                        LOG_INFO << "  [Iter " << k << "] CheckAfterLocalOptimization failed: " << status;
+                    }
+
+                    // If fast path failed due to distortion or local overlap, fall back to full optimization
+                    if (status != PASS && usedFastPath && 
+                        (status == FAIL_DISTORTION_LOCAL || status == FAIL_DISTORTION_GLOBAL || status == FAIL_LOCAL_OVERLAP)) {
+                        LOG_DEBUG << "Fast path check failed (" << status << "), falling back to full optimization";
+                        if (k <= 100) LOG_INFO << "  [Iter " << k << "] Fast path failed, falling back to full optimization";
+                        status = OptimizeChart(sd, graph, false);
+                        if (status == PASS)
+                            status = CheckAfterLocalOptimization(sd, state, params);
+                    }
+                } else if (k <= 100) {
+                    LOG_INFO << "  [Iter " << k << "] Optimization failed: " << status;
+                }
+            }
+
+            while (status == FAIL_GLOBAL_OVERLAP_AFTER_OPT || status == FAIL_GLOBAL_OVERLAP_AFTER_BND) {
+                LOG_DEBUG << "Global overlaps detected after ARAP optimization, fixing edges";
+                if (k <= 100) LOG_INFO << "  [Iter " << k << "] Global overlap detected, retrying with edge fixing";
+                CheckStatus iterStatus = OptimizeChart(sd, graph, true);
+                if (iterStatus == _END)
+                    break;
+                else
+                    status = CheckAfterLocalOptimization(sd, state, params);
+            }
+
+            statsCheck[status]++;
+
+            if (status == PASS) {
+                AcceptMove(sd, state, graph, params);
+                ColorizeSeam(sd.csh, vcg::Color4b(255, 69, 0, 255));
+                accept++;
+                LOG_DEBUG << "Accepted operation";
+                if (k <= 100) LOG_INFO << "  [Iter " << k << "] ACCEPTED";
+            } else {
+                RejectMove(sd, state, graph, status);
+                reject++;
+                LOG_DEBUG << "Rejected operation";
+                if (k <= 100) LOG_INFO << "  [Iter " << k << "] REJECTED (status: " << status << ")";
             }
         }
     }

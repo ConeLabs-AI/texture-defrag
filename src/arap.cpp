@@ -141,15 +141,6 @@ void ARAP::ComputeSystemMatrix(Mesh& m, const std::vector<Cot>& cotan, Eigen::Sp
                 int local_k = global_to_local_idx[global_k];
 
                 if (local_i != -1) {
-                    double weight_ij = cotan[fi].v[2]; // k is 2 in V0, V1, V2 mapping? No, wait.
-                    // The original code used:
-                    // int j = (i+1)%3;
-                    // Mesh::VertexPointer vj = f.V1(i);
-                    // int k = (i+2)%3;
-                    // Mesh::VertexPointer vk = f.V2(i);
-                    // double weight_ij = cotan[fi].v[k];
-                    // double weight_ik = cotan[fi].v[j];
-
                     int j_idx = (i+1)%3;
                     int k_idx = (i+2)%3;
                     double weight_ij = cotan[fi].v[k_idx];

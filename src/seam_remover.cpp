@@ -443,6 +443,7 @@ void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoPara
             LOG_INFO << "Queue is empty, interrupting.";
             break;
         } else {
+            Timer iterTimer;
             ++k;
             if ((k % 6000) == 0) {
                 LOG_INFO << "Logging execution stats after " << k << " iterations";
@@ -507,14 +508,24 @@ void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoPara
                 }
             }
 
-            while (status == FAIL_GLOBAL_OVERLAP_AFTER_OPT || status == FAIL_GLOBAL_OVERLAP_AFTER_BND) {
+            int retryCount = 0;
+            const int MAX_RETRIES = 10;
+            while ((status == FAIL_GLOBAL_OVERLAP_AFTER_OPT || status == FAIL_GLOBAL_OVERLAP_AFTER_BND) && retryCount < MAX_RETRIES) {
+                retryCount++;
                 LOG_DEBUG << "Global overlaps detected after ARAP optimization, fixing edges";
-                if (k <= 100) LOG_INFO << "  [Iter " << k << "] Global overlap detected, retrying with edge fixing";
+                if (k <= 100) LOG_INFO << "  [Iter " << k << "] Global overlap detected, retrying with edge fixing (" << retryCount << ")";
                 CheckStatus iterStatus = OptimizeChart(sd, graph, true);
                 if (iterStatus == _END)
                     break;
-                else
-                    status = CheckAfterLocalOptimization(sd, state, params);
+                if (iterStatus != PASS) {
+                    status = iterStatus;
+                    break;
+                }
+                status = CheckAfterLocalOptimization(sd, state, params);
+            }
+
+            if (retryCount == MAX_RETRIES) {
+                LOG_DEBUG << "Reached MAX_RETRIES for edge fixing, giving up";
             }
 
             statsCheck[status]++;
@@ -530,6 +541,12 @@ void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoPara
                 reject++;
                 LOG_DEBUG << "Rejected operation";
                 if (k <= 100) LOG_INFO << "  [Iter " << k << "] REJECTED (status: " << status << ")";
+            }
+
+            if (iterTimer.TimeElapsed() > 5.0) {
+                LOG_WARN << "  [Iter " << k << "] Long iteration detected: " << std::fixed << std::setprecision(2) << iterTimer.TimeElapsed() << "s "
+                         << "(charts " << sd.a->id << " and " << sd.b->id << ", "
+                         << sd.optimizationArea.size() << " faces)";
             }
         }
     }

@@ -130,11 +130,11 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     }
 
     // compute the scale factor for the packing
-    int packingArea = 0;
-    int textureArea = 0;
+    int64_t packingArea = 0;
+    int64_t textureArea = 0;
     for (unsigned i = 0; i < containerVec.size(); ++i) {
-        packingArea += containerVec[i].X() * containerVec[i].Y();
-        textureArea += textureObject->TextureWidth(i) * textureObject->TextureHeight(i);
+        packingArea += (int64_t)containerVec[i].X() * containerVec[i].Y();
+        textureArea += (int64_t)textureObject->TextureWidth(i) * textureObject->TextureHeight(i);
     }
     // Adjust target area: preserve 1:1 charts, give sqrt(2) more area to resampled charts
     double targetUVArea = 0.0;
@@ -164,11 +164,12 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     // With grid size up to 16384 and QImage limit of 32767, we need textureScale <= 2, so packingScale >= 0.5
     const double MIN_PACKING_SCALE = 0.5;
     if (packingScale < MIN_PACKING_SCALE) {
-        LOG_ERR << "[VALIDATION] packingScale=" << packingScale << " is below minimum " << MIN_PACKING_SCALE
-                << ". This indicates UV areas are far too large relative to packing grid."
-                << " (targetUVArea=" << targetUVArea << ", packingArea=" << packingArea << "). Aborting.";
-        LOG_ERR << "[VALIDATION] This usually means input UVs are not normalized to [0,1] or optimization exploded UV coordinates.";
-        std::exit(-1);
+        LOG_WARN << "[VALIDATION] packingScale=" << packingScale << " is below minimum " << MIN_PACKING_SCALE
+                 << ". Clamping to " << MIN_PACKING_SCALE << " - output will be DOWNSAMPLED."
+                 << " (targetUVArea=" << targetUVArea << ", packingArea=" << packingArea << ")";
+        LOG_WARN << "[VALIDATION] This usually means input textures are very large relative to packing grid."
+                 << " Some texture detail may be lost due to downsampling.";
+        packingScale = MIN_PACKING_SCALE;
     }
 
     LOG_INFO << "[DIAG] Packing scale factor: " << packingScale
@@ -478,8 +479,10 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             }
             const int MAX_QIMAGE_SIZE = 32767;
             if (w_d > MAX_QIMAGE_SIZE || h_d > MAX_QIMAGE_SIZE) {
-                LOG_ERR << "[VALIDATION] Computed output container exceeds QImage limit: " << w_d << "x" << h_d << ". Aborting.";
-                std::exit(-1);
+                LOG_WARN << "[VALIDATION] Computed output container exceeds QImage limit: " << w_d << "x" << h_d
+                         << ". Clamping to " << MAX_QIMAGE_SIZE << " - output will be DOWNSAMPLED.";
+                w_d = std::min(w_d, static_cast<double>(MAX_QIMAGE_SIZE));
+                h_d = std::min(h_d, static_cast<double>(MAX_QIMAGE_SIZE));
             }
             TextureSize outTsz;
             outTsz.w = static_cast<int>(std::ceil(w_d));

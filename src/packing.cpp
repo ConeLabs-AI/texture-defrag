@@ -69,6 +69,48 @@ Similarity2<SCALAR_TYPE> operator*(const Similarity2<SCALAR_TYPE> &a, const Simi
 
 typedef vcg::RasterizedOutline2Packer<float, QtOutline2Rasterizer> RasterizationBasedPacker;
 
+struct PackingStats {
+    // Timings
+    double mesoTime = 0;
+    double parallelTime = 0;
+    double individualTime = 0;
+    double totalTime = 0;
+
+    // Chart counts
+    size_t totalCharts = 0;
+    size_t macroCharts = 0;
+    size_t microCharts = 0;
+    size_t mesoBins = 0;
+
+    // Area/Efficiency
+    double totalMicroArea = 0;
+    double totalMesoBinArea = 0;
+    double totalPackableArea = 0;
+
+    // Skip counts
+    int skippedEmpty = 0;
+    int skippedInvalid = 0;
+    int skippedTooLarge = 0;
+
+    // Sheet counts
+    int estimatedSheets = 0;
+    int actualSheets = 0;
+    int parallelBins = 0;
+    int individualSheets = 0;
+
+    // Warnings
+    int microChartsOverMaxDim = 0;
+    int outlineExtractionWarnings = 0;
+    int infiniteGrowthWarnings = 0;
+    int individualPackFailures = 0;
+
+    // Cache
+    long long cacheLookups = 0;
+    long long cacheHits = 0;
+    long long cacheMisses = 0;
+    double cacheHitRate = 0;
+};
+
 void SetRasterizerCacheMaxBytes(std::size_t bytes)
 {
     QtOutline2Rasterizer::setCacheMaxBytes(bytes);
@@ -77,13 +119,14 @@ void SetRasterizerCacheMaxBytes(std::size_t bytes)
 
 int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObject, std::vector<TextureSize>& texszVec, const struct AlgoParameters& params, const std::map<ChartHandle, float>& chartMultipliers)
 {
+    Timer totalTimer;
+    PackingStats stats;
+    stats.totalCharts = charts.size();
+
     using Packer = RasterizedOutline2Packer<float, QtOutline2Rasterizer>;
     auto rpack_params = Packer::Parameters();
     
-    // Reset rasterizer cache stats for this packing run
     QtOutline2Rasterizer::statsSnapshot(true);
-    
-    // Pack the atlas
 
     texszVec.clear();
 
@@ -95,16 +138,13 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     chartAreasOriginal.reserve(charts.size());
 
     for (auto c : charts) {
-        // Determine per-chart scale from the pre-computed multipliers
         float mul = 1.4142f; // Default to sqrt(2) if not found
         auto it = chartMultipliers.find(c);
         if (it != chartMultipliers.end()) {
             mul = it->second;
         }
         chartScaleMul.push_back(mul);
-        // Save the outline of the parameterization for this portion of the mesh and apply per-chart scaling
-        Outline2f outline = ExtractOutline2f(*c);
-        // Track original area before scaling
+        Outline2f outline = ExtractOutline2f(*c, &stats.outlineExtractionWarnings);
         double originalAreaAbs = std::abs(vcg::tri::OutlineUtil<float>::Outline2Area(outline));
         chartAreasOriginal.push_back(originalAreaAbs);
         for (auto &p : outline) {
@@ -114,7 +154,6 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         outlines.push_back(outline);
     }
 
-    // Precompute per-chart absolute UV area (after per-chart scaling)
     std::vector<double> chartAreas(outlines.size(), 0.0);
     for (size_t i = 0; i < outlines.size(); ++i) {
         chartAreas[i] = std::abs(vcg::tri::OutlineUtil<float>::Outline2Area(outlines[i]));
@@ -129,14 +168,12 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         containerVec.push_back(container);
     }
 
-    // compute the scale factor for the packing
     int64_t packingArea = 0;
     int64_t textureArea = 0;
     for (unsigned i = 0; i < containerVec.size(); ++i) {
         packingArea += (int64_t)containerVec[i].X() * containerVec[i].Y();
         textureArea += (int64_t)textureObject->TextureWidth(i) * textureObject->TextureHeight(i);
     }
-    // Adjust target area: preserve 1:1 charts, give sqrt(2) more area to resampled charts
     double targetUVArea = 0.0;
     for (size_t i = 0; i < chartAreasOriginal.size(); ++i) {
         // 1:1 charts keep original area; resampled charts get mul^2 (i.e., 2.0) area
@@ -145,7 +182,6 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     }
     double packingScale = 1.0;
 
-    // Hierarchical Packing Step: Meso-pack micro charts into macro-tiles (bins)
     Timer mesoTimer;
     const int MICRO_CHART_FACE_THRESHOLD = 5;
     const int MESO_BIN_MAX_DIM = 2048; // in packing grid units
@@ -160,6 +196,8 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             macroIndices.push_back(i);
         }
     }
+    stats.microCharts = microIndices.size();
+    stats.macroCharts = macroIndices.size();
 
     struct MesoBin {
         std::vector<unsigned> chartIndices;
@@ -188,7 +226,6 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         float currentX = 0, currentY = 0, shelfHeight = 0;
         float padding = 4.0f / (float)packingScale; // 4 pixels in UV space
 
-        int microChartsOverMaxDim = 0;
         for (unsigned idx : microIndices) {
             vcg::Box2f bb;
             for (const auto& p : outlines[idx]) bb.Add(p);
@@ -214,7 +251,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             }
 
             if (w * packingScale > MESO_BIN_MAX_DIM || h * packingScale > MESO_BIN_MAX_DIM) {
-                microChartsOverMaxDim++;
+                stats.microChartsOverMaxDim++;
             }
 
             vcg::Similarity2f relTr;
@@ -228,11 +265,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             currentX = snapToPixel(currentX + w);
             shelfHeight = std::max(shelfHeight, h);
         }
-        if (microChartsOverMaxDim > 0) {
-            LOG_WARN << "[DIAG] " << microChartsOverMaxDim << " micro charts were larger than MESO_BIN_MAX_DIM and may overflow their bins.";
-        }
 
-        // Finalize bins: compute their rectangular outlines and reset coordinates to (0,0)
         for (auto& bin : mesoBins) {
             vcg::Box2f binBB;
             for (size_t i = 0; i < bin.chartIndices.size(); ++i) {
@@ -254,17 +287,12 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             bin.outline.push_back(vcg::Point2f(0, binBB.max.Y()));
         }
 
-        double totalBinArea = 0;
+        stats.mesoTime = mesoTimer.TimeElapsed();
+        stats.mesoBins = mesoBins.size();
         for (const auto& bin : mesoBins) {
-            totalBinArea += std::abs(vcg::tri::OutlineUtil<float>::Outline2Area(bin.outline));
+            stats.totalMesoBinArea += std::abs(vcg::tri::OutlineUtil<float>::Outline2Area(bin.outline));
         }
-        double totalMicroArea = 0;
-        for (unsigned idx : microIndices) totalMicroArea += chartAreas[idx];
-
-        LOG_INFO << "[MESO-STATS] Micro charts: " << microIndices.size() 
-                 << " packed into " << mesoBins.size() << " bins (" << mesoTimer.TimeElapsed() << "s)";
-        LOG_INFO << "[MESO-STATS] Bins efficiency: " << (totalBinArea > 0 ? (totalMicroArea / totalBinArea) : 0) 
-                 << " (MicroUV: " << totalMicroArea << " / BinUV: " << totalBinArea << ")";
+        for (unsigned idx : microIndices) stats.totalMicroArea += chartAreas[idx];
     }
 
     struct Packable {
@@ -317,7 +345,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
 
     for (size_t i = 0; i < packables.size(); ++i) {
         if (packables[i].outline.empty()) {
-            skippedEmpty++;
+            stats.skippedEmpty++;
             continue;
         }
 
@@ -325,7 +353,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         for (const auto& p : packables[i].outline) bbox.Add(p);
 
         if (!std::isfinite(bbox.DimX()) || !std::isfinite(bbox.DimY()) || bbox.DimX() < 0 || bbox.DimY() < 0) {
-            skippedInvalid++;
+            stats.skippedInvalid++;
             continue;
         }
 
@@ -334,17 +362,13 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         float diagonal = std::sqrt(w * w + h * h);
 
         if (diagonal > QIMAGE_MAX_DIM) {
-            skippedTooLarge++;
+            stats.skippedTooLarge++;
             continue;
         }
 
         double a = std::abs(vcg::tri::OutlineUtil<float>::Outline2Area(packables[i].outline));
         items.push_back({(int)i, a});
     }
-
-    if (skippedEmpty > 0) LOG_WARN << "[DIAG] Skipped " << skippedEmpty << " items with empty outlines.";
-    if (skippedInvalid > 0) LOG_WARN << "[DIAG] Skipped " << skippedInvalid << " items due to invalid/non-finite UV bounding box.";
-    if (skippedTooLarge > 0) LOG_WARN << "[DIAG] Skipped " << skippedTooLarge << " items because their scaled diagonal exceeds QImage limits.";
 
     // 2. Sort Descending by Area (LPT Heuristic)
     std::sort(items.begin(), items.end(), [](const ParallelItem& a, const ParallelItem& b) {
@@ -354,6 +378,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     // 3. Estimate Sheets & Distribute
     double totalPackableArea = 0;
     for (const auto& item : items) totalPackableArea += item.area;
+    stats.totalPackableArea = totalPackableArea;
 
     int numThreads = 1;
 #ifdef _OPENMP
@@ -365,10 +390,8 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     int estimatedSheets = (int)std::ceil(totalPackableArea / (gridArea * 0.85));
     // Ensure we have at least as many sheets as threads to maximize concurrency
     int numSheets = std::max(numThreads, estimatedSheets);
-
-    LOG_INFO << "[PACKING] Scale fixed to 1.0. Total UV Area: " << totalPackableArea 
-             << ". Est. Sheets: " << estimatedSheets 
-             << ". Parallel bins: " << numSheets;
+    stats.estimatedSheets = estimatedSheets;
+    stats.parallelBins = numSheets;
 
     struct SheetBin {
         std::vector<int> packableIndices;
@@ -398,11 +421,17 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     };
     std::vector<ThreadResult> results(numSheets);
 
-    LOG_INFO << "[DIAG] Starting parallel packing of " << items.size() << " items into " << numSheets << " sheets using " << numThreads << " threads.";
+    Timer parallelTimer;
+    int sheetsProcessed = 0;
+    int lastReportedProgress = -1;
 
     #pragma omp parallel for schedule(dynamic)
     for (int i = 0; i < numSheets; ++i) {
-        if (sheets[i].packableIndices.empty()) continue;
+        if (sheets[i].packableIndices.empty()) {
+            #pragma omp atomic
+            sheetsProcessed++;
+            continue;
+        }
 
         // 1. Setup Input
         std::vector<Outline2f> subsetOutlines;
@@ -447,7 +476,9 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
                 
                 // Safety break for giant/degenerate charts
                 if (++safetyCounter > 50) {
-                     LOG_WARN << "Thread " << i << " infinite growth detected. Giant chart?";
+                     #pragma omp critical
+                     stats.infiniteGrowthWarnings++;
+
                      // Fallback: Try one last time with downscaling just for this bucket
                      RasterizationBasedPacker::PackBestEffortAtScale(
                         subsetOutlines, localCont, localTr, localPolyToCont, rpack_params, 0.5f, false);
@@ -477,7 +508,18 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
                 results[i].originalPackableIndices.push_back(subsetIndices[k]);
             }
         }
+
+        #pragma omp critical
+        {
+            sheetsProcessed++;
+            int progress = (sheetsProcessed * 100) / numSheets;
+            if (progress / 5 > lastReportedProgress / 5) {
+                LOG_INFO << "[PACKING] Progress: " << progress << "% (" << sheetsProcessed << "/" << numSheets << " parallel bins)";
+                lastReportedProgress = progress;
+            }
+        }
     }
+    stats.parallelTime = parallelTimer.TimeElapsed();
 
     // 5. Global Reconstruction (Serialized)
     std::vector<int> packableContainerIndices(packables.size(), -1);
@@ -554,12 +596,11 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     }
     
     if (!remainingUnpacked.empty()) {
-        LOG_INFO << "[DIAG] Creating individual containers for " << remainingUnpacked.size() << " unpacked charts.";
-        
+        Timer individualTimer;
         for (unsigned ci : remainingUnpacked) {
             float mul = chartScaleMul[ci];
             ChartHandle chartptr = charts[ci];
-            auto outline = ExtractOutline2d(*chartptr);
+            auto outline = ExtractOutline2d(*chartptr, &stats.outlineExtractionWarnings);
             
             vcg::Box2d bb;
             for (const auto& p : outline) bb.Add(p);
@@ -604,7 +645,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
                 float h_f = requiredHeight * textureScaleLocal;
                 
                 if (!std::isfinite(w_f) || !std::isfinite(h_f) || w_f <= 0 || h_f <= 0 || w_f > MAX_QIMAGE_SIZE || h_f > MAX_QIMAGE_SIZE) {
-                    LOG_ERR << "[VALIDATION] Invalid individual container size for chart " << ci << ". Skipping.";
+                    stats.individualPackFailures++;
                     continue;
                 }
                 
@@ -614,8 +655,12 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
                 atlasContainerSizes.push_back(containerSize);
                 nc++;
                 totPackedCharts++;
+                stats.individualSheets++;
+             } else {
+                stats.individualPackFailures++;
              }
         }
+        stats.individualTime = individualTimer.TimeElapsed();
     }
 
     for (unsigned i = 0; i < charts.size(); ++i) {
@@ -653,22 +698,50 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     {
         auto s = QtOutline2Rasterizer::statsSnapshot(false);
         long long lookups = static_cast<long long>(s.hits) + static_cast<long long>(s.misses);
-        double hitRate = (lookups > 0) ? (double(s.hits) / double(lookups)) : 0.0;
-        LOG_INFO << "[PACK-CACHE] lookups=" << lookups
-                 << " hits=" << s.hits
-                 << " misses=" << s.misses
-                 << " hitRate=" << hitRate
-                 << " inserts=" << s.inserts
-                 << " evictions=" << s.evictions
-                 << " bytes=" << s.bytesCurrent << "/" << s.bytesMax;
+        stats.cacheLookups = lookups;
+        stats.cacheHits = s.hits;
+        stats.cacheMisses = s.misses;
+        stats.cacheHitRate = (lookups > 0) ? (double(s.hits) / double(lookups)) : 0.0;
     }
+
+    stats.totalTime = totalTimer.TimeElapsed();
+    stats.actualSheets = (int)texszVec.size();
+
+    LOG_INFO << "------- Packing Phase Statistics -------";
+    LOG_INFO << "Charts: Total=" << stats.totalCharts << ", Macro=" << stats.macroCharts << ", Micro=" << stats.microCharts;
+    LOG_INFO << "Meso-packing: " << stats.mesoBins << " bins created (" << stats.mesoTime << "s)";
+    if (stats.mesoBins > 0) {
+        LOG_INFO << "Meso-efficiency: " << (stats.totalMesoBinArea > 0 ? (stats.totalMicroArea / stats.totalMesoBinArea) : 0) 
+                 << " (MicroUV: " << stats.totalMicroArea << " / BinUV: " << stats.totalMesoBinArea << ")";
+    }
+    LOG_INFO << "Parallel Packing: " << stats.parallelBins << " bins, " << stats.actualSheets - stats.individualSheets << " sheets (" << stats.parallelTime << "s)";
+    LOG_INFO << "Individual Packing: " << stats.individualSheets << " sheets (" << stats.individualTime << "s)";
+    LOG_INFO << "Total Sheets: " << stats.actualSheets << " (Estimated: " << stats.estimatedSheets << ")";
+    LOG_INFO << "Total Time: " << stats.totalTime << "s";
+    
+    if (stats.skippedEmpty > 0 || stats.skippedInvalid > 0 || stats.skippedTooLarge > 0 || 
+        stats.microChartsOverMaxDim > 0 || stats.infiniteGrowthWarnings > 0 || stats.individualPackFailures > 0) {
+        LOG_INFO << "------- Packing Warnings Summary -------";
+        if (stats.skippedEmpty > 0) LOG_WARN << "Skipped " << stats.skippedEmpty << " items with empty outlines.";
+        if (stats.skippedInvalid > 0) LOG_WARN << "Skipped " << stats.skippedInvalid << " items due to invalid/non-finite UV bounding box.";
+        if (stats.skippedTooLarge > 0) LOG_WARN << "Skipped " << stats.skippedTooLarge << " items because their scaled diagonal exceeds QImage limits.";
+        if (stats.microChartsOverMaxDim > 0) LOG_WARN << stats.microChartsOverMaxDim << " micro charts were larger than MESO_BIN_MAX_DIM.";
+        if (stats.infiniteGrowthWarnings > 0) LOG_WARN << stats.infiniteGrowthWarnings << " parallel bins triggered infinite growth safety.";
+        if (stats.individualPackFailures > 0) LOG_WARN << stats.individualPackFailures << " individual chart packing failures.";
+    }
+
+    LOG_INFO << "[PACK-CACHE] lookups=" << stats.cacheLookups
+             << " hits=" << stats.cacheHits
+             << " misses=" << stats.cacheMisses
+             << " hitRate=" << stats.cacheHitRate;
+    LOG_INFO << "----------------------------------------";
 
     return totPackedCharts;
 }
 
-Outline2f ExtractOutline2f(FaceGroup& chart)
+Outline2f ExtractOutline2f(FaceGroup& chart, int* warningCounter)
 {
-    Outline2d outline2d = ExtractOutline2d(chart);
+    Outline2d outline2d = ExtractOutline2d(chart, warningCounter);
     Outline2f outline2f;
     for (auto& p : outline2d) {
         outline2f.push_back(vcg::Point2f(p.X(), p.Y()));
@@ -676,7 +749,7 @@ Outline2f ExtractOutline2f(FaceGroup& chart)
     return outline2f;
 }
 
-Outline2d ExtractOutline2d(FaceGroup& chart)
+Outline2d ExtractOutline2d(FaceGroup& chart, int* warningCounter)
 {
     //ensure(chart.numMerges == 0);
 
@@ -739,7 +812,7 @@ Outline2d ExtractOutline2d(FaceGroup& chart)
 
         if (best < 0) {
             if (seenNonFinite) {
-                LOG_WARN << "[DIAG] Outline extraction: encountered non-finite UVs for chart " << chart.id << ". Falling back to UV bounding box.";
+                if (warningCounter) (*warningCounter)++;
             }
             useChartBBAsOutline = true;
         } else {
@@ -785,6 +858,9 @@ void IntegerShift(Mesh& m, const std::vector<ChartHandle>& chartsToPack, const s
 
     auto Rotate = [] (vcg::Point2d p, double theta) -> vcg::Point2d { return p.Rotate(theta); };
 
+    int degenerateAnchorEdges = 0;
+    int unexpectedRotationIndices = 0;
+
     for (auto c : chartsToPack) {
         auto it = anchorMap.find(c);
         if (it != anchorMap.end()) {
@@ -812,7 +888,7 @@ void IntegerShift(Mesh& m, const std::vector<ChartHandle>& chartsToPack, const s
                 }
             }
             if (minResidualIndex == -1) {
-                LOG_WARN << "[DIAG] IntegerShift: degenerate anchor edge or invalid residuals for chart. Falling back to rotation 0.";
+                degenerateAnchorEdges++;
                 minResidualIndex = 0;
             }
 
@@ -850,8 +926,7 @@ void IntegerShift(Mesh& m, const std::vector<ChartHandle>& chartsToPack, const s
                 dy = 1 - dy;
                 break;
             default:
-                LOG_WARN << "[DIAG] IntegerShift: unexpected rotation index " << minResidualIndex
-                         << " (residual=" << minResidual << ") - falling back to 0.";
+                unexpectedRotationIndices++;
                 // Fallback to no rotation adjustment
                 minResidualIndex = 0;
                 break;
@@ -870,5 +945,12 @@ void IntegerShift(Mesh& m, const std::vector<ChartHandle>& chartsToPack, const s
                 }
             }
         }
+    }
+
+    if (degenerateAnchorEdges > 0 || unexpectedRotationIndices > 0) {
+        LOG_INFO << "------- Integer Shift Statistics -------";
+        if (degenerateAnchorEdges > 0) LOG_WARN << "Degenerate anchor edges: " << degenerateAnchorEdges;
+        if (unexpectedRotationIndices > 0) LOG_WARN << "Unexpected rotation indices: " << unexpectedRotationIndices;
+        LOG_INFO << "----------------------------------------";
     }
 }

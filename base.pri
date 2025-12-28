@@ -16,6 +16,7 @@ INCLUDEPATH += $$PWD/src $$VCGPATH $$VCGPATH/eigenlib
 
 DEFINES += EIGEN_DONT_ALIGN_STATICALLY
 DEFINES += EIGEN_MAX_STATIC_ALIGN_BYTES=0
+DEFINES += ARAP_ENABLE_TIMING
 
 #### PLATFORM SPECIFIC #########################################################
 
@@ -35,6 +36,7 @@ unix|mingw-g++ {
 win32-msvc* {
     # For Microsoft Visual C++ compiler on Windows
     QMAKE_CXXFLAGS += /openmp
+    QMAKE_CXXFLAGS += /arch:AVX2
     # MSVC does not typically require a separate linker flag for OpenMP
 }
 

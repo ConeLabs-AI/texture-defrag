@@ -23,12 +23,14 @@
 #define ARAP_H
 
 #include "mesh.h"
+#include "arap_simd.h"
 
 #include <Eigen/Core>
 #include <Eigen/Sparse>
 #include <Eigen/SparseCholesky>
 #include <vector>
 #include <array>
+#include <chrono>
 
 
 struct ARAPSolveInfo {
@@ -36,6 +38,57 @@ struct ARAPSolveInfo {
     double finalEnergy;
     int iterations;
     bool numericalError;
+
+#ifdef ARAP_ENABLE_TIMING
+    double timePrecompute_ms;
+    double timeRotations_ms;
+    double timeRHS_ms;
+    double timeSolve_ms;
+    double timeEnergy_ms;
+    double timeTotal_ms;
+#endif
+};
+
+// Structure-of-Arrays for SIMD-friendly batched processing
+struct SoARotations {
+    std::vector<double> r00, r01, r10, r11;
+
+    void resize(size_t n) {
+        r00.resize(n); r01.resize(n);
+        r10.resize(n); r11.resize(n);
+    }
+
+    void clear() {
+        r00.clear(); r01.clear();
+        r10.clear(); r11.clear();
+    }
+};
+
+struct SoALocalCoords {
+    // Local frame coordinates per face (3 vertices, 2D each)
+    // Vertex 0 is always at origin, so we only store vertices 1 and 2
+    std::vector<double> x1, y1;  // vertex 1
+    std::vector<double> x2, y2;  // vertex 2
+
+    void resize(size_t n) {
+        x1.resize(n); y1.resize(n);
+        x2.resize(n); y2.resize(n);
+    }
+
+    void clear() {
+        x1.clear(); y1.clear();
+        x2.clear(); y2.clear();
+    }
+};
+
+struct SoAJacobians {
+    // Jacobian matrices per face: [[a,b],[c,d]]
+    std::vector<double> a, b, c, d;
+
+    void resize(size_t n) {
+        a.resize(n); b.resize(n);
+        c.resize(n); d.resize(n);
+    }
 };
 
 class ARAP {
@@ -63,11 +116,18 @@ private:
 
     std::vector<std::array<Eigen::Vector2d, 3>> local_frame_coords;
 
+    // SoA data for SIMD-optimized processing
+    SoALocalCoords soa_local_coords;
+    SoARotations soa_rotations;
+
     int max_iter;
 
     void ComputeSystemMatrix(Mesh& m, const std::vector<Cot>& cotan, Eigen::SparseMatrix<double>& L);
     void ComputeRHS(Mesh& m, const std::vector<Eigen::Matrix2d>& rotations, const std::vector<Cot>& cotan, Eigen::VectorXd& bu, Eigen::VectorXd& bv);
+    void ComputeRHSSIMD(Mesh& m, const std::vector<Cot>& cotan, Eigen::VectorXd& bu, Eigen::VectorXd& bv);
     void PrecomputeData();
+    void ComputeRotationsSIMD(Mesh& m);
+    double CurrentEnergySIMD();
 
 public:
 

@@ -130,8 +130,6 @@ static const char *fs_text[] = {
     "}                                                                     \n"
 };
 
-// A struct to manage persistent OpenGL state throughout the rendering of all texture sheets.
-// This avoids costly creation/destruction of contexts, programs, and buffers for each sheet.
 struct RenderingContext {
     OpenGLFunctionsHandle glFuncs;
     std::unique_ptr<QOpenGLContext> context;
@@ -147,7 +145,6 @@ struct RenderingContext {
     int renderedTexHeight = -1;
     GLint initialDrawBuffer = 0;
 
-    // Cached uniform locations
     GLint loc_img0 = -1;
     GLint loc_texture_size = -1;
     GLint loc_render_mode = -1;
@@ -190,7 +187,6 @@ struct RenderingContext {
 
         glFuncs->glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-        // Cache uniform locations
         loc_img0 = glFuncs->glGetUniformLocation(program, "img0");
         loc_texture_size = glFuncs->glGetUniformLocation(program, "texture_size");
         loc_render_mode = glFuncs->glGetUniformLocation(program, "render_mode");
@@ -248,7 +244,6 @@ struct RenderingContext {
     }
 };
 
-// Simple background saving queue to overlap PNG compression with rendering
 class ImageSaveQueue {
 public:
     explicit ImageSaveQueue(int maxInFlight = 2) : maxInFlight(maxInFlight) {
@@ -335,6 +330,13 @@ private:
             }
             if (!ok) {
                 LOG_ERR << "Error saving texture file " << task.path.toStdString();
+                QFileInfo fi(task.path);
+                QDir dir = fi.absoluteDir();
+                if (!dir.exists()) {
+                    LOG_ERR << "  - Reason: Directory " << dir.absolutePath().toStdString() << " does not exist.";
+                } else {
+                    LOG_ERR << "  - Reason: Path exists but save failed. Check permissions or disk space.";
+                }
             }
         }
     }
@@ -365,7 +367,6 @@ int FacesByTextureIndex(Mesh& m, std::vector<std::vector<Mesh::FacePointer>>& fv
 {
     fv.clear();
 
-    // Detect the number of required textures
     int nTex = 1;
     for (auto&f : m.face) {
         nTex = std::max(nTex, f.cWT(0).N() + 1);
@@ -391,7 +392,6 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
         std::exit(-1);
     }
 
-    // Reset GPU texture cache stats for this rendering pass
     if (textureObject) textureObject->ResetCacheStats();
 
     std::vector<std::vector<Mesh::FacePointer>> facesByTexture;
@@ -410,22 +410,43 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
     m.textures.clear();
 
     QFileInfo fi(outFileName.c_str());
+    QDir outDir = fi.absoluteDir();
+
+    // Ensure the output directory exists
+    if (!outDir.exists()) {
+        if (outDir.mkpath(".")) {
+            LOG_INFO << "Created output directory: " << outDir.absolutePath().toStdString();
+        } else {
+            LOG_ERR << "FAILED to create output directory: " << outDir.absolutePath().toStdString();
+            std::exit(-1);
+        }
+    }
+
     QString wd = QDir::currentPath();
-    QDir::setCurrent(fi.absoluteDir().absolutePath());
+    if (!QDir::setCurrent(outDir.absolutePath())) {
+        LOG_ERR << "FAILED to set current directory to " << outDir.absolutePath().toStdString();
+        std::exit(-1);
+    }
 
     auto t_total_start = std::chrono::high_resolution_clock::now();
     double t_total_render_s = 0.0;
     double t_total_savequeue_enqueue_s = 0.0;
-    double t_total_png_save_s = 0.0; // captured by queue
-    double t_save_wait_s = 0.0;      // time waiting in finish()
+    double t_total_png_save_s = 0.0;
+    double t_save_wait_s = 0.0;
     int64_t total_pixels_rendered = 0;
 
     RenderingContext renderingContext;
     ImageSaveQueue saveQueue(2);
     saveQueue.resetStats();
 
+    int lastReportedProgress = -1;
     for (int i = 0; i < nTex; ++i) {
-        LOG_INFO << "Processing sheet " << (i + 1) << " of " << nTex << "...";
+        int progress = (i * 100) / nTex;
+        if (progress / 5 > lastReportedProgress / 5 || i == 0) {
+            LOG_INFO << "[RENDERING] Progress: " << progress << "% (" << i << "/" << nTex << " sheets)";
+            lastReportedProgress = progress;
+        }
+
         auto t_render_start = std::chrono::high_resolution_clock::now();
         std::shared_ptr<QImage> teximg = RenderTexture(renderingContext, facesByTexture[i], m, textureObject, filter, imode, texSizes[i].w, texSizes[i].h);
         auto t_render_end = std::chrono::high_resolution_clock::now();
@@ -441,7 +462,6 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
         QFileInfo texFI(texturePath.c_str());
         m.textures.push_back(texFI.fileName().toStdString());
         const QString absPath = texFI.absoluteFilePath();
-        // Enqueue save to overlap compression with next sheet rendering
         auto t_enqueue_start = std::chrono::high_resolution_clock::now();
         saveQueue.enqueue(*teximg, absPath, 50);
         auto t_enqueue_end = std::chrono::high_resolution_clock::now();
@@ -449,6 +469,9 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
     }
 
     // Ensure all pending saves are complete before restoring working directory
+    if (saveQueue.statsSnapshot().saved < nTex) {
+        LOG_INFO << "[RENDERING] Finalizing background image saves...";
+    }
     auto t_save_finish_start = std::chrono::high_resolution_clock::now();
     saveQueue.finish();
     auto t_save_finish_end = std::chrono::high_resolution_clock::now();
@@ -463,23 +486,22 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
     double t_total_s = std::chrono::duration<double>(t_total_end - t_total_start).count();
 
     // Log performance summary
-    LOG_VERBOSE << "[RENDER-STATS] sheets=" << nTex
-             << " pixels=" << total_pixels_rendered
-             << " total_s=" << t_total_s
-             << " render_s=" << t_total_render_s
-             << " enqueue_s=" << t_total_savequeue_enqueue_s
-             << " save_wait_s=" << t_save_wait_s
-             << " png_save_s=" << t_total_png_save_s
-             << " png_min_s=" << saveStats.minSaveS
-             << " png_max_s=" << saveStats.maxSaveS
-             << " png_saved=" << saveStats.saved;
+    LOG_INFO << "------- Rendering Phase Statistics -------";
+    LOG_INFO << "Sheets: " << nTex << ", Total Pixels: " << total_pixels_rendered;
+    LOG_INFO << "Total Time: " << t_total_s << "s";
+    LOG_INFO << "  - Rasterization (GL): " << t_total_render_s << "s";
+    LOG_INFO << "  - Enqueueing tasks: " << t_total_savequeue_enqueue_s << "s";
+    LOG_INFO << "  - IO wait (finalizing): " << t_save_wait_s << "s";
+    LOG_INFO << "  - PNG Encoding (background total): " << t_total_png_save_s << "s";
+    LOG_INFO << "PNG encoding speed: min=" << saveStats.minSaveS << "s, max=" << saveStats.maxSaveS << "s per sheet";
+    LOG_INFO << "-------------------------------------------";
 
     // Log GPU texture cache stats
     if (textureObject) {
         auto cs = textureObject->GetCacheStats();
         uint64_t lookups = cs.hits + cs.misses;
         double hitRate = lookups ? double(cs.hits) / double(lookups) : 0.0;
-        LOG_VERBOSE << "[TEX-CACHE] lookups=" << lookups
+        LOG_INFO << "[TEX-CACHE] lookups=" << lookups
                  << " hits=" << cs.hits
                  << " misses=" << cs.misses
                  << " hitRate=" << hitRate
@@ -500,7 +522,6 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
 {
     auto WTCSh = GetWedgeTexCoordStorageAttribute(m);
 
-    // sort the faces in increasing order of input texture unit
     auto FaceComparatorByInputTexIndex = [&WTCSh](const Mesh::FacePointer& f1, const Mesh::FacePointer& f2) {
         return WTCSh[f1].tc[0].N() < WTCSh[f2].tc[0].N();
     };
@@ -511,8 +532,6 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
     glFuncs->glUseProgram(ctx.program);
     glFuncs->glBindVertexArray(ctx.vao);
     CHECK_GL_ERROR();
-
-    // Allocate vertex data
 
     std::vector<TextureSize> inTexSizes;
     for (std::size_t i = 0; i < textureObject->ArraySize(); ++i) {
@@ -561,8 +580,7 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
     }
     glFuncs->glUnmapBuffer(GL_ARRAY_BUFFER);
 
-    p = nullptr;
-    glFuncs->glBindBuffer(GL_ARRAY_BUFFER, 0); // done, unbind
+    glFuncs->glBindBuffer(GL_ARRAY_BUFFER, 0);
     auto t_vbo_end = std::chrono::high_resolution_clock::now();
     double t_vbo_s = std::chrono::duration<double>(t_vbo_end - t_vbo_start).count();
 
@@ -587,7 +605,6 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
     double t_draw_s = 0.0;
     double t_read_s = 0.0;
 
-    // Render and read back per-tile
     for (int y = 0; y < textureHeight; y += tileHMax) {
         int tileH = std::min(tileHMax, textureHeight - y);
         for (int x = 0; x < textureWidth; x += tileWMax) {
@@ -601,7 +618,6 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
             glFuncs->glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
             glFuncs->glClear(GL_COLOR_BUFFER_BIT);
 
-            // Set tile transform uniforms (in atlas normalized coordinates)
             float tileMinX = float(x) / float(textureWidth);
             float tileMinY = float(y) / float(textureHeight);
             float tileScaleX = float(tileW) / float(textureWidth);
@@ -620,7 +636,6 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
                 int baseIndex = std::distance(f0, fbase) * 3;
                 int count = std::distance(fbase, fcurr) * 3;
 
-                // Load texture image
                 glFuncs->glActiveTexture(GL_TEXTURE0);
                 LOG_DEBUG << "Binding texture unit " << currTexIndex;
                 bool batchValid = (currTexIndex >= 0 && currTexIndex < (int)inTexSizes.size() && inTexSizes[currTexIndex].w > 0 && inTexSizes[currTexIndex].h > 0);
@@ -636,7 +651,6 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
 
                 glFuncs->glUniform1i(ctx.loc_render_mode, 0);
 
-                // Texture parameters are now set once in TextureObject::Bind, so we remove the redundant settings from here.
                 switch (imode) {
                 case Cubic:
                     glFuncs->glUniform1i(ctx.loc_render_mode, 1);
@@ -662,7 +676,7 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
             auto t_draw_end = std::chrono::high_resolution_clock::now();
             t_draw_s += std::chrono::duration<double>(t_draw_end - t_draw_start).count();
 
-            // Read back this tile directly into the final image using pixel pack offsets
+            // Read back this tile directly into the final image
             glFuncs->glReadBuffer(GL_COLOR_ATTACHMENT0);
             glFuncs->glPixelStorei(GL_PACK_ALIGNMENT, 4);
             int rowPixels = textureImage->bytesPerLine() / 4;
@@ -687,7 +701,7 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
     if (filter)
         vcg::PullPush(*textureImage, qRgba(0, 0, 0, 255));
 
-    LOG_INFO << "[RENDER-PROFILE] vbo_s=" << t_vbo_s
+    LOG_VERBOSE << "[RENDER-PROFILE] vbo_s=" << t_vbo_s
              << " draw_s=" << t_draw_s
              << " readPixels_s=" << t_read_s
              << " image=" << textureWidth << "x" << textureHeight;

@@ -197,7 +197,7 @@ inline void batch_svd2x2_avx2(
     sincos_avx2(phi, sin_phi, cos_phi);
 
     // NORMALIZE PHI VECTORS: Ensure sin^2 + cos^2 = 1 to prevent scaling drift
-    __m256d normSqPhi = _mm256_add_pd(_mm256_mul_pd(sin_phi, sin_phi), _mm256_mul_pd(cos_phi, cos_phi));
+    __m256d normSqPhi = _mm256_fmadd_pd(sin_phi, sin_phi, _mm256_mul_pd(cos_phi, cos_phi));
     __m256d invNormPhi = _mm256_div_pd(_mm256_set1_pd(1.0), _mm256_sqrt_pd(normSqPhi));
     sin_phi = _mm256_mul_pd(sin_phi, invNormPhi);
     cos_phi = _mm256_mul_pd(cos_phi, invNormPhi);
@@ -206,7 +206,7 @@ inline void batch_svd2x2_avx2(
     sincos_avx2(theta, sin_theta, cos_theta);
 
     // NORMALIZE THETA VECTORS: Ensure sin^2 + cos^2 = 1
-    __m256d normSqTheta = _mm256_add_pd(_mm256_mul_pd(sin_theta, sin_theta), _mm256_mul_pd(cos_theta, cos_theta));
+    __m256d normSqTheta = _mm256_fmadd_pd(sin_theta, sin_theta, _mm256_mul_pd(cos_theta, cos_theta));
     __m256d invNormTheta = _mm256_div_pd(_mm256_set1_pd(1.0), _mm256_sqrt_pd(normSqTheta));
     sin_theta = _mm256_mul_pd(sin_theta, invNormTheta);
     cos_theta = _mm256_mul_pd(cos_theta, invNormTheta);

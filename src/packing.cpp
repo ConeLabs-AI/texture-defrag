@@ -347,7 +347,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     if (skippedTooLarge > 0) LOG_WARN << "[DIAG] Skipped " << skippedTooLarge << " items because their scaled diagonal exceeds QImage limits.";
 
     // 2. Sort Descending by Area (LPT Heuristic)
-    std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) {
+    std::sort(items.begin(), items.end(), [](const ParallelItem& a, const ParallelItem& b) {
         return a.area > b.area;
     });
 

@@ -26,10 +26,58 @@
 
 #include <vcg/space/rect_packer.h>
 #include <vcg/complex/algorithms/outline_support.h>
+#include <vcg/math/eigen.h>
 #include <omp.h>
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#pragma intrinsic(_BitScanForward64)
+static inline int vcg_ctzll(unsigned __int64 mask) {
+    unsigned long index;
+    _BitScanForward64(&index, mask);
+    return (int)index;
+}
+#else
+static inline int vcg_ctzll(unsigned long long mask) {
+    return __builtin_ctzll(mask);
+}
+#endif
 
 namespace vcg
 {
+
+class BitGrid {
+public:
+    std::vector<uint64_t> data;
+    int w = 0;
+    int h = 0;
+
+    void init(int width, int height) {
+        w = width;
+        h = height;
+        data.assign((size_t(width) * height + 63) / 64, 0);
+    }
+
+    inline void set(int x, int y) {
+        int bitIdx = y * w + x;
+        data[bitIdx >> 6] |= (1ULL << (bitIdx & 63));
+    }
+
+    inline bool get(int x, int y) const {
+        int bitIdx = y * w + x;
+        return (data[bitIdx >> 6] >> (bitIdx & 63)) & 1ULL;
+    }
+
+    void clear() {
+        data.clear();
+        w = 0;
+        h = 0;
+    }
+
+    bool empty() const {
+        return data.empty();
+    }
+};
 
 struct InnerGap {
     int pos;
@@ -46,7 +94,7 @@ class RasterizedOutline2
 private:
     //the grid is the "bounding grid" of the polygon, which is returned by the rasterization process
     //this is a vector of "bounding grids", there is one for each rasterization (different rotation or whatever)
-    std::vector < std::vector< std::vector<int> > > grids;
+    std::vector<BitGrid> grids;
 
     std::vector<int> gw;
     std::vector<int> gh;
@@ -80,7 +128,7 @@ public:
 
     std::vector<Point2f>&  getPoints()           { return points; }
     const std::vector<Point2f>&  getPointsConst() const{ return points; }
-    std::vector< std::vector<int> >& getGrids(int rast_i)  { return grids[rast_i]; }
+    BitGrid& getGrids(int rast_i)  { return grids[rast_i]; }
 
     //get top/bottom/left/right vectors of the i-th rasterization
     std::vector<int>& getDeltaY(int i) { return deltaY[i]; }
@@ -111,9 +159,29 @@ public:
     }
 
     void initFromGrid(int rast_i) {
-        std::vector< std::vector<int> >& tetrisGrid = grids[rast_i];
-        int gridWidth = tetrisGrid[0].size();
-        int gridHeight = tetrisGrid.size();
+        BitGrid& tetrisGrid = grids[rast_i];
+
+        bool empty = tetrisGrid.empty();
+        if (!empty) {
+            empty = true;
+            for (uint64_t val : tetrisGrid.data) {
+                if (val != 0) {
+                    empty = false;
+                    break;
+                }
+            }
+        }
+
+        if (empty) {
+            gw[rast_i] = 0;
+            gh[rast_i] = 0;
+            discreteAreas[rast_i] = 0;
+            tetrisGrid.clear();
+            return;
+        }
+
+        int gridWidth = tetrisGrid.w;
+        int gridHeight = tetrisGrid.h;
 
         gw[rast_i] = gridWidth;
         gh[rast_i] = gridHeight;
@@ -123,7 +191,7 @@ public:
         for (int col = 0; col < gridWidth; col++) {
             int bottom_i = 0;
             for (int row = gridHeight - 1; row >= 0; row--) {
-                if (tetrisGrid[row][col] == 0) {
+                if (!tetrisGrid.get(col, row)) {
                     bottom_i++;
                 }
                 else {
@@ -140,7 +208,7 @@ public:
         for (int col = 0; col < gridWidth; col++) {
             int deltay_i = gridHeight - bottom[rast_i][col];
             for (int row = 0; row < gridHeight; row++) {
-                if (tetrisGrid[row][col] == 0) {
+                if (!tetrisGrid.get(col, row)) {
                     deltay_i--;
                 }
                 else {
@@ -158,7 +226,7 @@ public:
             //for (int row = 0; row < gridHeight; ++row) {
             left_i = 0;
             for (int col = 0; col < gridWidth; col++) {
-                if (tetrisGrid[row][col] == 0) ++left_i;
+                if (!tetrisGrid.get(col, row)) ++left_i;
                 else {
                     left[rast_i].push_back(left_i);
                     break;
@@ -173,7 +241,7 @@ public:
             //for (int row = 0; row < gridHeight; ++row) {
             deltax_i = gridWidth - left[rast_i][gridHeight - 1 - row];
             for (int col = gridWidth - 1; col >= 0; --col) {
-                if (tetrisGrid[row][col] == 0) --deltax_i;
+                if (!tetrisGrid.get(col, row)) --deltax_i;
                 else {
                     break;
                 }
@@ -311,6 +379,10 @@ public:
       std::vector<int> mInnerLeftHorizon;
       std::vector<int> mInnerLeftExtent;
 
+      // Skyline event points (indices where the horizon changes)
+      std::vector<uint64_t> mBottomEventBits;
+      std::vector<uint64_t> mLeftEventBits;
+
       //the size of the packing grid
       vcg::Point2i mSize;
 
@@ -334,6 +406,46 @@ public:
 
           params = par;
           mSize = Point2i(size.X(), size.Y());
+
+          mBottomEventBits.assign((size.X() + 63) / 64, 0);
+          mLeftEventBits.assign((size.Y() + 63) / 64, 0);
+
+          setEvent(mBottomEventBits, 0);
+          setEvent(mLeftEventBits, 0);
+      }
+
+      inline void setEvent(std::vector<uint64_t>& bits, int x) {
+          if (x >= 0 && (size_t)(x / 64) < bits.size())
+              bits[x / 64] |= (1ULL << (x % 64));
+      }
+
+      inline void clearEvent(std::vector<uint64_t>& bits, int x) {
+          if (x >= 0 && (size_t)(x / 64) < bits.size())
+              bits[x / 64] &= ~(1ULL << (x % 64));
+      }
+
+      template<typename Lambda>
+      void forEachBottomEvent(Lambda callback) const {
+          for (size_t i = 0; i < mBottomEventBits.size(); ++i) {
+              uint64_t word = mBottomEventBits[i];
+              while (word) {
+                  int bit = vcg_ctzll(word);
+                  callback(int(i * 64 + bit));
+                  word &= ~(1ULL << bit);
+              }
+          }
+      }
+
+      template<typename Lambda>
+      void forEachLeftEvent(Lambda callback) const {
+          for (size_t i = 0; i < mLeftEventBits.size(); ++i) {
+              uint64_t word = mLeftEventBits[i];
+              while (word) {
+                  int bit = vcg_ctzll(word);
+                  callback(int(i * 64 + bit));
+                  word &= ~(1ULL << bit);
+              }
+          }
       }
 
       std::vector<int>& bottomHorizon() { return mBottomHorizon; }
@@ -365,33 +477,35 @@ public:
       //i.e. the Y at which the polygon touches the horizon
       int dropY(RasterizedOutline2& poly, int col, int rast_i) {
           std::vector<int>& bottom = poly.getBottom(rast_i);
-          int y_max = -INT_MAX;
-          for (size_t i = 0; i < bottom.size(); ++i) {
-              int y = mBottomHorizon[col + i] - bottom[i];
-              if (y > y_max) {
-                  if (y + poly.gridHeight(rast_i) >= mSize.Y())
-                      return INVALID_POSITION;
-                  y_max = y;
-              }
-          }
+          int w = bottom.size();
+          if (w == 0) return 0;
+
+          // SIMD optimization
+          Eigen::Map<const Eigen::ArrayXi> bottomVec(bottom.data(), w);
+          Eigen::Map<const Eigen::ArrayXi> horizonVec(&mBottomHorizon[col], w);
+          int y_max = (horizonVec - bottomVec).maxCoeff();
+
+          if (y_max + poly.gridHeight(rast_i) >= mSize.Y())
+              return INVALID_POSITION;
           return y_max;
       }
 
       int dropYInner(RasterizedOutline2& poly, int col, int rast_i) {
           std::vector<int>& bottom = poly.getBottom(rast_i);
           std::vector<int>& deltaY = poly.getDeltaY(rast_i);
-          int y_max = -INT_MAX;
-          for (size_t i = 0; i < bottom.size(); ++i) {
-              int y = mInnerBottomHorizon[col + i] - bottom[i];
-              if (y > y_max) {
-                  if (y + poly.gridHeight(rast_i) >= mSize.Y()) {
-                      return INVALID_POSITION;
-                  }
-                  y_max = y;
-              }
+          int w = bottom.size();
+          if (w == 0) return 0;
+
+          // SIMD optimization
+          Eigen::Map<const Eigen::ArrayXi> bottomVec(bottom.data(), w);
+          Eigen::Map<const Eigen::ArrayXi> innerHorizonVec(&mInnerBottomHorizon[col], w);
+          int y_max = (innerHorizonVec - bottomVec).maxCoeff();
+
+          if (y_max + poly.gridHeight(rast_i) >= mSize.Y()) {
+              return INVALID_POSITION;
           }
           // check if the placement is feasible
-          for (size_t i = 0; i < bottom.size(); ++i) {
+          for (int i = 0; i < w; ++i) {
               if (y_max + bottom[i] < mBottomHorizon[col + i]
                       && y_max + bottom[i] + deltaY[i] > mInnerBottomHorizon[col + i] + mInnerBottomExtent[col + i]) {
                   return INVALID_POSITION;
@@ -405,32 +519,34 @@ public:
       //i.e. the X at which the polygon touches the left horizon
       int dropX(RasterizedOutline2& poly, int row, int rast_i) {
           std::vector<int>& left = poly.getLeft(rast_i);
-          int x_max = -INT_MAX;
-          for (size_t i = 0; i < left.size(); ++i) {
-              int x = mLeftHorizon[row + i] - left[i];
-              if (x > x_max) {
-                  if (x + poly.gridWidth(rast_i) >= mSize.X())
-                      return INVALID_POSITION;
-                  x_max = x;
-              }
-          }
+          int h = left.size();
+          if (h == 0) return 0;
+
+          // SIMD optimization
+          Eigen::Map<const Eigen::ArrayXi> leftVec(left.data(), h);
+          Eigen::Map<const Eigen::ArrayXi> horizonVec(&mLeftHorizon[row], h);
+          int x_max = (horizonVec - leftVec).maxCoeff();
+
+          if (x_max + poly.gridWidth(rast_i) >= mSize.X())
+              return INVALID_POSITION;
           return x_max;
       }
 
       int dropXInner(RasterizedOutline2& poly, int row, int rast_i) {
           std::vector<int> left = poly.getLeft(rast_i);
           std::vector<int> deltaX = poly.getDeltaX(rast_i);
-          int x_max = -INT_MAX;
-          for (size_t i = 0; i < left.size(); ++i) {
-              int x = mInnerLeftHorizon[row + i] - left[i];
-              if (x > x_max) {
-                  if (x + poly.gridWidth(rast_i) >= mSize.X())
-                      return INVALID_POSITION;
-                  x_max = x;
-              }
-          }
+          int h = left.size();
+          if (h == 0) return 0;
+
+          // SIMD optimization
+          Eigen::Map<const Eigen::ArrayXi> leftVec(left.data(), h);
+          Eigen::Map<const Eigen::ArrayXi> innerHorizonVec(&mInnerLeftHorizon[row], h);
+          int x_max = (innerHorizonVec - leftVec).maxCoeff();
+
+          if (x_max + poly.gridWidth(rast_i) >= mSize.X())
+              return INVALID_POSITION;
           // sanity check
-          for (size_t i = 0; i < left.size(); ++i) {
+          for (int i = 0; i < h; ++i) {
               if (x_max + left[i] < mLeftHorizon[row + i]
                       && x_max + left[i] + deltaX[i] > mInnerLeftHorizon[row + i] + mInnerLeftExtent[row + i])
                   return INVALID_POSITION;
@@ -567,6 +683,16 @@ public:
           return score;
       }
 
+      void updateEvents(std::vector<uint64_t>& bits, const std::vector<int>& horizon, int i, int max_i) {
+          if (i <= 0 || i >= max_i) return;
+          bool isEvent = (horizon[i] != horizon[i-1]);
+          if (isEvent) {
+              setEvent(bits, i);
+          } else {
+              clearEvent(bits, i);
+          }
+      }
+
       //updates the horizons according to the chosen position
       void placePoly(RasterizedOutline2& poly, Point2i pos, int rast_i) {
 
@@ -655,6 +781,12 @@ public:
               }
           }
 
+          int x_start_b = pos.X();
+          int w = poly.gridWidth(rast_i);
+          for (int x = x_start_b; x <= x_start_b + w; ++x) {
+              updateEvents(mBottomEventBits, mBottomHorizon, x, mSize.X());
+          }
+
           //update left horizon
           for (int i = 0; i < poly.gridHeight(rast_i); i++) {
               int tmpHor = pos.X() + left[i] + deltaX[i];
@@ -720,6 +852,12 @@ public:
                   mInnerLeftExtent[pos.Y() + i] = ig.extent;
               }
 
+          }
+
+          int y_start_l = pos.Y();
+          int h = poly.gridHeight(rast_i);
+          for (int y = y_start_l; y <= y_start_l + h; ++y) {
+              updateEvents(mLeftEventBits, mLeftHorizon, y, mSize.Y());
           }
       }
   };
@@ -1010,7 +1148,7 @@ public:
             // +++ Step 2: Parallel Placement Search +++
             PlacementResult bestOverallResult;
 
-            #pragma omp parallel
+            #pragma omp parallel if(!omp_in_parallel())
             {
                 PlacementResult bestThreadResult; // Each thread has its own local best result
 
@@ -1025,7 +1163,33 @@ public:
                         int maxRow = gridSizes[grid_i].Y() - polyVec[i].gridHeight(rast_i);
 
                         //look for the best position, dropping from top
-                        for (int col = 0; col < maxCol; col++) {
+                        std::vector<uint8_t> candidateBits((maxCol + 8) / 8, 0);
+                        auto setCandidate = [&](int col) {
+                            if (col >= 0 && col <= maxCol) candidateBits[col >> 3] |= (1 << (col & 7));
+                        };
+
+                        setCandidate(0);
+                        setCandidate(maxCol);
+
+                        int poly_w = polyVec[i].gridWidth(rast_i);
+                        packingFields[grid_i].forEachBottomEvent([&](int e) {
+                            setCandidate(e);
+                            setCandidate(e - 1);
+                            setCandidate(e + 1);
+                            setCandidate(e - poly_w);
+                            setCandidate(e - poly_w + 1);
+                            setCandidate(e - poly_w - 1);
+                        });
+
+                        std::vector<int> candidateCols;
+                        candidateCols.reserve(128);
+                        for (int col = 0; col <= maxCol; ++col) {
+                            if (candidateBits[col >> 3] & (1 << (col & 7))) {
+                                candidateCols.push_back(col);
+                            }
+                        }
+
+                        for (int col : candidateCols) {
                             int currPolyY;
                             // Check primary horizon
                             currPolyY = packingFields[grid_i].dropY(polyVec[i],col, rast_i);
@@ -1065,7 +1229,33 @@ public:
                             continue;
                         
                         //look for the best position, dropping from left
-                        for (int row = 0; row < maxRow; row++) {
+                        std::vector<uint8_t> candidateBits((maxRow + 8) / 8, 0);
+                        auto setCandidate = [&](int row) {
+                            if (row >= 0 && row <= maxRow) candidateBits[row >> 3] |= (1 << (row & 7));
+                        };
+
+                        setCandidate(0);
+                        setCandidate(maxRow);
+
+                        int poly_h = polyVec[i].gridHeight(rast_i);
+                        packingFields[grid_i].forEachLeftEvent([&](int e) {
+                            setCandidate(e);
+                            setCandidate(e - 1);
+                            setCandidate(e + 1);
+                            setCandidate(e - poly_h);
+                            setCandidate(e - poly_h + 1);
+                            setCandidate(e - poly_h - 1);
+                        });
+
+                        std::vector<int> candidateRows;
+                        candidateRows.reserve(128);
+                        for (int row = 0; row <= maxRow; ++row) {
+                            if (candidateBits[row >> 3] & (1 << (row & 7))) {
+                                candidateRows.push_back(row);
+                            }
+                        }
+
+                        for (int row : candidateRows) {
                             int currPolyX;
                             // Check primary horizon
                             currPolyX = packingFields[grid_i].dropX(polyVec[i],row, rast_i);

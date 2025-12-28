@@ -19,9 +19,10 @@ class QtOutline2Rasterizer
 public:
     static void rasterize(vcg::RasterizedOutline2 &poly,
                           float scaleFactor,
-                          int rast_i, int rotationNum, int gutterWidth);
+                          int rast_i, int rotationNum, int gutterWidth,
+                          bool bypassCache = false);
 
-    static std::vector<std::vector<uint8_t> > rotateGridCWise(std::vector< std::vector<uint8_t> >& inGrid);
+    static vcg::BitGrid rotateGridCWise(const vcg::BitGrid& inGrid);
 
     // Cache control (thread-safe)
     static void setCacheMaxBytes(std::size_t bytes);

@@ -26,6 +26,7 @@
 
 #include <vcg/space/rect_packer.h>
 #include <vcg/complex/algorithms/outline_support.h>
+#include <vcg/math/eigen.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -33,8 +34,61 @@
 #include <set>
 #include <chrono>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#pragma intrinsic(_BitScanForward64)
+static inline int vcg_ctzll(unsigned __int64 mask) {
+    unsigned long index;
+    _BitScanForward64(&index, mask);
+    return (int)index;
+}
+#else
+static inline int vcg_ctzll(unsigned long long mask) {
+    return __builtin_ctzll(mask);
+}
+#endif
+
 namespace vcg
 {
+
+class BitGrid {
+public:
+    std::vector<uint64_t> data;
+    int w = 0;
+    int h = 0;
+
+    void init(int width, int height) {
+        w = width;
+        h = height;
+        data.assign((size_t(width) * height + 63) / 64, 0);
+    }
+
+    inline void set(int x, int y) {
+        int bitIdx = y * w + x;
+        data[bitIdx >> 6] |= (1ULL << (bitIdx & 63));
+    }
+
+    inline bool get(int x, int y) const {
+        int bitIdx = y * w + x;
+        return (data[bitIdx >> 6] >> (bitIdx & 63)) & 1ULL;
+    }
+
+    void clear() {
+        data.clear();
+        w = 0;
+        h = 0;
+    }
+
+    bool empty() const {
+        return data.empty();
+    }
+};
 
 
 class RasterizedOutline2
@@ -42,7 +96,7 @@ class RasterizedOutline2
 private:
     //the grid is the "bounding grid" of the polygon, which is returned by the rasterization process
     //this is a vector of "bounding grids", there is one for each rasterization (different rotation or whatever)
-    std::vector < std::vector< std::vector<uint8_t> > > grids;
+    std::vector<BitGrid> grids;
 
     std::vector<int> gw;
     std::vector<int> gh;
@@ -77,7 +131,7 @@ public:
 
     std::vector<Point2f>&  getPoints()           { return points; }
     const std::vector<Point2f>&  getPointsConst() const{ return points; }
-    std::vector< std::vector<uint8_t> >& getGrids(int rast_i)  { return grids[rast_i]; }
+    BitGrid& getGrids(int rast_i)  { return grids[rast_i]; }
 
     //get top/bottom/left/right vectors of the i-th rasterization
     std::vector<int>& getDeltaY(int i) { return deltaY[i]; }
@@ -108,18 +162,16 @@ public:
     }
 
     void initFromGrid(int rast_i) {
-        std::vector< std::vector<uint8_t> >& tetrisGrid = grids[rast_i];
+        BitGrid& tetrisGrid = grids[rast_i];
 
-        bool empty = true;
-        if (!tetrisGrid.empty()) {
-            for (const auto& row : tetrisGrid) {
-                for (uint8_t cell : row) {
-                    if (cell != 0) {
-                        empty = false;
-                        break;
-                    }
+        bool empty = tetrisGrid.empty();
+        if (!empty) {
+            empty = true;
+            for (uint64_t val : tetrisGrid.data) {
+                if (val != 0) {
+                    empty = false;
+                    break;
                 }
-                if (!empty) break;
             }
         }
 
@@ -135,14 +187,8 @@ public:
             return;
         }
 
-        size_t max_w = 0;
-        for(const auto& row : tetrisGrid)
-            if(row.size() > max_w) max_w = row.size();
-        for(auto& row : tetrisGrid)
-            row.resize(max_w, 0);
-
-        int gridWidth = tetrisGrid[0].size();
-        int gridHeight = tetrisGrid.size();
+        int gridWidth = tetrisGrid.w;
+        int gridHeight = tetrisGrid.h;
 
         gw[rast_i] = gridWidth;
         gh[rast_i] = gridHeight;
@@ -158,7 +204,7 @@ public:
         for (int col = 0; col < gridWidth; col++) {
             int bottom_i = 0;
             for (int row = gridHeight - 1; row >= 0; row--) {
-                if (tetrisGrid[row][col] == 0) {
+                if (!tetrisGrid.get(col, row)) {
                     bottom_i++;
                 }
                 else {
@@ -175,7 +221,7 @@ public:
         for (int col = 0; col < gridWidth; col++) {
             int deltay_i = gridHeight - bottom[rast_i][col];
             for (int row = 0; row < gridHeight; row++) {
-                if (tetrisGrid[row][col] == 0) {
+                if (!tetrisGrid.get(col, row)) {
                     deltay_i--;
                 }
                 else {
@@ -193,7 +239,7 @@ public:
             //for (int row = 0; row < gridHeight; ++row) {
             left_i = 0;
             for (int col = 0; col < gridWidth; col++) {
-                if (tetrisGrid[row][col] == 0) ++left_i;
+                if (!tetrisGrid.get(col, row)) ++left_i;
                 else {
                     left[rast_i].push_back(left_i);
                     break;
@@ -208,7 +254,7 @@ public:
             //for (int row = 0; row < gridHeight; ++row) {
             deltax_i = gridWidth - left[rast_i][gridHeight - 1 - row];
             for (int col = gridWidth - 1; col >= 0; --col) {
-                if (tetrisGrid[row][col] == 0) --deltax_i;
+                if (!tetrisGrid.get(col, row)) --deltax_i;
                 else {
                     break;
                 }
@@ -358,8 +404,8 @@ public:
       std::vector<int> mInnerLeftExtent;
 
       // Skyline event points (indices where the horizon changes)
-      std::set<int> mBottomEvents;
-      std::set<int> mLeftEvents;
+      std::vector<uint64_t> mBottomEventBits;
+      std::vector<uint64_t> mLeftEventBits;
 
       //the size of the packing grid
       vcg::Point2i mSize;
@@ -382,16 +428,53 @@ public:
           params = par;
           mSize = Point2i(size.X(), size.Y());
 
-          mBottomEvents.insert(0);
-          mLeftEvents.insert(0);
+          mBottomEventBits.assign((size.X() + 63) / 64, 0);
+          mLeftEventBits.assign((size.Y() + 63) / 64, 0);
+
+          setEvent(mBottomEventBits, 0);
+          setEvent(mLeftEventBits, 0);
+      }
+
+      inline void setEvent(std::vector<uint64_t>& bits, int x) {
+          if (x >= 0 && (size_t)(x / 64) < bits.size())
+              bits[x / 64] |= (1ULL << (x % 64));
+      }
+
+      inline void clearEvent(std::vector<uint64_t>& bits, int x) {
+          if (x >= 0 && (size_t)(x / 64) < bits.size())
+              bits[x / 64] &= ~(1ULL << (x % 64));
+      }
+
+      template<typename Lambda>
+      void forEachBottomEvent(Lambda callback) const {
+          for (size_t i = 0; i < mBottomEventBits.size(); ++i) {
+              uint64_t word = mBottomEventBits[i];
+              while (word) {
+                  int bit = vcg_ctzll(word);
+                  callback(int(i * 64 + bit));
+                  word &= ~(1ULL << bit);
+              }
+          }
+      }
+
+      template<typename Lambda>
+      void forEachLeftEvent(Lambda callback) const {
+          for (size_t i = 0; i < mLeftEventBits.size(); ++i) {
+              uint64_t word = mLeftEventBits[i];
+              while (word) {
+                  int bit = vcg_ctzll(word);
+                  callback(int(i * 64 + bit));
+                  word &= ~(1ULL << bit);
+              }
+          }
       }
 
       std::vector<int>& bottomHorizon() { return mBottomHorizon; }
       std::vector<int>& leftHorizon() { return mLeftHorizon; }
       vcg::Point2i& size() { return mSize; }
 
-      const std::set<int>& bottomEvents() const { return mBottomEvents; }
-      const std::set<int>& leftEvents() const { return mLeftEvents; }
+      const std::vector<uint64_t>& bottomEvents() const { return mBottomEventBits; }
+      const std::vector<uint64_t>& leftEvents() const { return mLeftEventBits; }
 
       //returns the score relative to the left horizon of that poly in that particular position, taking into account the choosen algo
       int getCostX(RasterizedOutline2& poly, Point2i pos, int rast_i) {
@@ -418,33 +501,92 @@ public:
       //i.e. the Y at which the polygon touches the horizon
       int dropY(RasterizedOutline2& poly, int col, int rast_i) {
           std::vector<int>& bottom = poly.getBottom(rast_i);
-          int y_max = -INT_MAX;
-          for (size_t i = 0; i < bottom.size(); ++i) {
-              int y = mBottomHorizon[col + i] - bottom[i];
-              if (y > y_max) {
-                  if (y + poly.gridHeight(rast_i) >= mSize.Y())
-                      return INVALID_POSITION;
-                  y_max = y;
-              }
+          int w = bottom.size();
+          if (w == 0) return 0;
+
+          int y_max = -9999999;
+          const int* b_ptr = bottom.data();
+          const int* h_ptr = &mBottomHorizon[col];
+
+#if defined(__AVX2__)
+          __m256i max_v = _mm256_set1_epi32(-9999999);
+          int i = 0;
+          for (; i <= w - 8; i += 8) {
+              __m256i b = _mm256_loadu_si256((const __m256i*)&b_ptr[i]);
+              __m256i h = _mm256_loadu_si256((const __m256i*)&h_ptr[i]);
+              max_v = _mm256_max_epi32(max_v, _mm256_sub_epi32(h, b));
           }
+          __m128i max128 = _mm_max_epi32(_mm256_extracti128_si256(max_v, 0), _mm256_extracti128_si256(max_v, 1));
+          max128 = _mm_max_epi32(max128, _mm_shuffle_epi32(max128, _MM_SHUFFLE(1, 0, 3, 2)));
+          max128 = _mm_max_epi32(max128, _mm_shuffle_epi32(max128, _MM_SHUFFLE(0, 0, 0, 1)));
+          y_max = _mm_cvtsi128_si32(max128);
+          for (; i < w; ++i) y_max = std::max(y_max, h_ptr[i] - b_ptr[i]);
+#elif defined(__aarch64__)
+          int32x4_t max_v = vdupq_n_s32(-9999999);
+          int i = 0;
+          for (; i <= w - 4; i += 4) {
+              int32x4_t b = vld1q_s32(&b_ptr[i]);
+              int32x4_t h = vld1q_s32(&h_ptr[i]);
+              max_v = vmaxq_s32(max_v, vsubq_s32(h, b));
+          }
+          y_max = vmaxvq_s32(max_v);
+          for (; i < w; ++i) y_max = std::max(y_max, h_ptr[i] - b_ptr[i]);
+#else
+          Eigen::Map<const Eigen::ArrayXi> bottomVec(b_ptr, w);
+          Eigen::Map<const Eigen::ArrayXi> horizonVec(h_ptr, w);
+          y_max = (horizonVec - bottomVec).maxCoeff();
+#endif
+
+          if (y_max + poly.gridHeight(rast_i) >= mSize.Y())
+              return INVALID_POSITION;
           return y_max;
       }
 
       int dropYInner(RasterizedOutline2& poly, int col, int rast_i) {
           std::vector<int>& bottom = poly.getBottom(rast_i);
           std::vector<int>& deltaY = poly.getDeltaY(rast_i);
-          int y_max = -INT_MAX;
-          for (size_t i = 0; i < bottom.size(); ++i) {
-              int y = mInnerBottomHorizon[col + i] - bottom[i];
-              if (y > y_max) {
-                  if (y + poly.gridHeight(rast_i) >= mSize.Y()) {
-                      return INVALID_POSITION;
-                  }
-                  y_max = y;
-              }
+          int w = bottom.size();
+          if (w == 0) return 0;
+
+          int y_max = -9999999;
+          const int* b_ptr = bottom.data();
+          const int* h_ptr = &mInnerBottomHorizon[col];
+
+#if defined(__AVX2__)
+          __m256i max_v = _mm256_set1_epi32(-9999999);
+          int i = 0;
+          for (; i <= w - 8; i += 8) {
+              __m256i b = _mm256_loadu_si256((const __m256i*)&b_ptr[i]);
+              __m256i h = _mm256_loadu_si256((const __m256i*)&h_ptr[i]);
+              max_v = _mm256_max_epi32(max_v, _mm256_sub_epi32(h, b));
           }
+          __m128i max128 = _mm_max_epi32(_mm256_extracti128_si256(max_v, 0), _mm256_extracti128_si256(max_v, 1));
+          max128 = _mm_max_epi32(max128, _mm_shuffle_epi32(max128, _MM_SHUFFLE(1, 0, 3, 2)));
+          max128 = _mm_max_epi32(max128, _mm_shuffle_epi32(max128, _MM_SHUFFLE(0, 0, 0, 1)));
+          y_max = _mm_cvtsi128_si32(max128);
+          for (; i < w; ++i) y_max = std::max(y_max, h_ptr[i] - b_ptr[i]);
+#elif defined(__aarch64__)
+          int32x4_t max_v = vdupq_n_s32(-9999999);
+          int i = 0;
+          for (; i <= w - 4; i += 4) {
+              int32x4_t b = vld1q_s32(&b_ptr[i]);
+              int32x4_t h = vld1q_s32(&h_ptr[i]);
+              max_v = vmaxq_s32(max_v, vsubq_s32(h, b));
+          }
+          y_max = vmaxvq_s32(max_v);
+          for (; i < w; ++i) y_max = std::max(y_max, h_ptr[i] - b_ptr[i]);
+#else
+          Eigen::Map<const Eigen::ArrayXi> bottomVec(b_ptr, w);
+          Eigen::Map<const Eigen::ArrayXi> innerHorizonVec(h_ptr, w);
+          y_max = (innerHorizonVec - bottomVec).maxCoeff();
+#endif
+
+          if (y_max + poly.gridHeight(rast_i) >= mSize.Y()) {
+              return INVALID_POSITION;
+          }
+
           // check if the placement is feasible
-          for (size_t i = 0; i < bottom.size(); ++i) {
+          for (int i = 0; i < w; ++i) {
               if (y_max + bottom[i] < mBottomHorizon[col + i]
                       && y_max + bottom[i] + deltaY[i] > mInnerBottomHorizon[col + i] + mInnerBottomExtent[col + i]) {
                   return INVALID_POSITION;
@@ -458,32 +600,91 @@ public:
       //i.e. the X at which the polygon touches the left horizon
       int dropX(RasterizedOutline2& poly, int row, int rast_i) {
           std::vector<int>& left = poly.getLeft(rast_i);
-          int x_max = -INT_MAX;
-          for (size_t i = 0; i < left.size(); ++i) {
-              int x = mLeftHorizon[row + i] - left[i];
-              if (x > x_max) {
-                  if (x + poly.gridWidth(rast_i) >= mSize.X())
-                      return INVALID_POSITION;
-                  x_max = x;
-              }
+          int h = left.size();
+          if (h == 0) return 0;
+
+          int x_max = -9999999;
+          const int* l_ptr = left.data();
+          const int* h_ptr = &mLeftHorizon[row];
+
+#if defined(__AVX2__)
+          __m256i max_v = _mm256_set1_epi32(-9999999);
+          int i = 0;
+          for (; i <= h - 8; i += 8) {
+              __m256i l = _mm256_loadu_si256((const __m256i*)&l_ptr[i]);
+              __m256i hv = _mm256_loadu_si256((const __m256i*)&h_ptr[i]);
+              max_v = _mm256_max_epi32(max_v, _mm256_sub_epi32(hv, l));
           }
+          __m128i max128 = _mm_max_epi32(_mm256_extracti128_si256(max_v, 0), _mm256_extracti128_si256(max_v, 1));
+          max128 = _mm_max_epi32(max128, _mm_shuffle_epi32(max128, _MM_SHUFFLE(1, 0, 3, 2)));
+          max128 = _mm_max_epi32(max128, _mm_shuffle_epi32(max128, _MM_SHUFFLE(0, 0, 0, 1)));
+          x_max = _mm_cvtsi128_si32(max128);
+          for (; i < h; ++i) x_max = std::max(x_max, h_ptr[i] - l_ptr[i]);
+#elif defined(__aarch64__)
+          int32x4_t max_v = vdupq_n_s32(-9999999);
+          int i = 0;
+          for (; i <= h - 4; i += 4) {
+              int32x4_t l = vld1q_s32(&l_ptr[i]);
+              int32x4_t hv = vld1q_s32(&h_ptr[i]);
+              max_v = vmaxq_s32(max_v, vsubq_s32(hv, l));
+          }
+          x_max = vmaxvq_s32(max_v);
+          for (; i < h; ++i) x_max = std::max(x_max, h_ptr[i] - l_ptr[i]);
+#else
+          Eigen::Map<const Eigen::ArrayXi> leftVec(l_ptr, h);
+          Eigen::Map<const Eigen::ArrayXi> horizonVec(h_ptr, h);
+          x_max = (horizonVec - leftVec).maxCoeff();
+#endif
+
+          if (x_max + poly.gridWidth(rast_i) >= mSize.X())
+              return INVALID_POSITION;
           return x_max;
       }
 
       int dropXInner(RasterizedOutline2& poly, int row, int rast_i) {
-          std::vector<int> left = poly.getLeft(rast_i);
-          std::vector<int> deltaX = poly.getDeltaX(rast_i);
-          int x_max = -INT_MAX;
-          for (size_t i = 0; i < left.size(); ++i) {
-              int x = mInnerLeftHorizon[row + i] - left[i];
-              if (x > x_max) {
-                  if (x + poly.gridWidth(rast_i) >= mSize.X())
-                      return INVALID_POSITION;
-                  x_max = x;
-              }
+          std::vector<int>& left = poly.getLeft(rast_i);
+          std::vector<int>& deltaX = poly.getDeltaX(rast_i);
+          int h = left.size();
+          if (h == 0) return 0;
+
+          int x_max = -9999999;
+          const int* l_ptr = left.data();
+          const int* h_ptr = &mInnerLeftHorizon[row];
+
+#if defined(__AVX2__)
+          __m256i max_v = _mm256_set1_epi32(-9999999);
+          int i = 0;
+          for (; i <= h - 8; i += 8) {
+              __m256i l = _mm256_loadu_si256((const __m256i*)&l_ptr[i]);
+              __m256i hv = _mm256_loadu_si256((const __m256i*)&h_ptr[i]);
+              max_v = _mm256_max_epi32(max_v, _mm256_sub_epi32(hv, l));
           }
+          __m128i max128 = _mm_max_epi32(_mm256_extracti128_si256(max_v, 0), _mm256_extracti128_si256(max_v, 1));
+          max128 = _mm_max_epi32(max128, _mm_shuffle_epi32(max128, _MM_SHUFFLE(1, 0, 3, 2)));
+          max128 = _mm_max_epi32(max128, _mm_shuffle_epi32(max128, _MM_SHUFFLE(0, 0, 0, 1)));
+          x_max = _mm_cvtsi128_si32(max128);
+          for (; i < h; ++i) x_max = std::max(x_max, h_ptr[i] - l_ptr[i]);
+#elif defined(__aarch64__)
+          int32x4_t max_v = vdupq_n_s32(-9999999);
+          int i = 0;
+          for (; i <= h - 4; i += 4) {
+              int32x4_t l = vld1q_s32(&l_ptr[i]);
+              int32x4_t hv = vld1q_s32(&h_ptr[i]);
+              max_v = vmaxq_s32(max_v, vsubq_s32(hv, l));
+          }
+          x_max = vmaxvq_s32(max_v);
+          for (; i < h; ++i) x_max = std::max(x_max, h_ptr[i] - l_ptr[i]);
+#else
+          Eigen::Map<const Eigen::ArrayXi> leftVec(l_ptr, h);
+          Eigen::Map<const Eigen::ArrayXi> innerHorizonVec(h_ptr, h);
+          x_max = (innerHorizonVec - leftVec).maxCoeff();
+#endif
+
+          if (x_max + poly.gridWidth(rast_i) >= mSize.X())
+              return INVALID_POSITION;
+
           // sanity check
-          for (size_t i = 0; i < left.size(); ++i) {
+          for (int i = 0; i < h; ++i) {
               if (x_max + left[i] < mLeftHorizon[row + i]
                       && x_max + left[i] + deltaX[i] > mInnerLeftHorizon[row + i] + mInnerLeftExtent[row + i])
                   return INVALID_POSITION;
@@ -524,14 +725,61 @@ public:
       int emptyCellBetweenPolyAndBottomHorizon(RasterizedOutline2& poly, Point2i pos, int rast_i)
       {
           std::vector<int>& bottom = poly.getBottom(rast_i);
+          int w = bottom.size();
           int score = 0;
+          const int* b_ptr = bottom.data();
+          const int* h_ptr = &mBottomHorizon[pos.X()];
+          int y_pos = pos.Y();
+
+#if defined(__AVX2__)
+          __m256i score_v = _mm256_setzero_si256();
+          __m256i y_v = _mm256_set1_epi32(y_pos);
+          int i = 0;
+          for (; i <= w - 8; i += 8) {
+              __m256i b = _mm256_loadu_si256((const __m256i*)&b_ptr[i]);
+              __m256i h = _mm256_loadu_si256((const __m256i*)&h_ptr[i]);
+              __m256i yb = _mm256_add_epi32(y_v, b);
+              __m256i mask = _mm256_cmpgt_epi32(h, yb); // h > yb
+              __m256i diff = _mm256_sub_epi32(yb, h);
+              __m256i res = _mm256_blendv_epi8(diff, _mm256_sub_epi32(_mm256_setzero_si256(), yb), mask);
+              score_v = _mm256_add_epi32(score_v, res);
+          }
+          int32_t tmp[8];
+          _mm256_storeu_si256((__m256i*)tmp, score_v);
+          for (int j = 0; j < 8; ++j) score += tmp[j];
+          for (; i < w; ++i) {
+              int yb = y_pos + b_ptr[i];
+              if (yb < h_ptr[i]) score -= yb;
+              else score += yb - h_ptr[i];
+          }
+#elif defined(__aarch64__)
+          int32x4_t score_v = vdupq_n_s32(0);
+          int32x4_t y_v = vdupq_n_s32(y_pos);
+          int i = 0;
+          for (; i <= w - 4; i += 4) {
+              int32x4_t b = vld1q_s32(&b_ptr[i]);
+              int32x4_t h = vld1q_s32(&h_ptr[i]);
+              int32x4_t yb = vaddq_s32(y_v, b);
+              uint32x4_t mask = vcgtq_s32(h, yb);
+              int32x4_t diff = vsubq_s32(yb, h);
+              int32x4_t neg_yb = vsubq_s32(vdupq_n_s32(0), yb);
+              int32x4_t res = vbslq_s32(mask, neg_yb, diff);
+              score_v = vaddq_s32(score_v, res);
+          }
+          score = vaddvq_s32(score_v);
+          for (; i < w; ++i) {
+              int yb = y_pos + b_ptr[i];
+              if (yb < h_ptr[i]) score -= yb;
+              else score += yb - h_ptr[i];
+          }
+#else
           for (size_t i = 0; i < bottom.size(); ++i) {
               if (pos.Y() + bottom[i] < mBottomHorizon[pos.X() + i])
                   score -=  pos.Y() + bottom[i];
               else
-                  //count the number of empty cells between poly's bottom side and the bottom horizon
                   score +=  pos.Y() + bottom[i] - mBottomHorizon[pos.X() + i];
           }
+#endif
           return score;
       }
 
@@ -564,42 +812,125 @@ public:
 
       int maxYofPoly(RasterizedOutline2& poly, Point2i pos, int rast_i)
       {
-          //return pos.Y() + poly.gridHeight(rast_i);
-
           int maxY = -INT_MAX;
           std::vector<int>& bottom = poly.getBottom(rast_i);
           std::vector<int>& deltaY = poly.getDeltaY(rast_i);
-          for (unsigned i = 0; i < bottom.size(); ++i) {
-              int yi = 0;
-              if (pos.Y() + bottom[i] + deltaY[i] < mBottomHorizon[pos.X() + i]) {
-                  yi = -(pos.Y() + bottom[i]);
-              } else {
-                  yi = pos.Y() + bottom[i] + deltaY[i];
-              }
-              if (yi > maxY)
-                  maxY = yi;
-          }
-          return maxY;
+          int w = bottom.size();
+          const int* b_ptr = bottom.data();
+          const int* dy_ptr = deltaY.data();
+          const int* h_ptr = &mBottomHorizon[pos.X()];
+          int y_pos = pos.Y();
 
+#if defined(__AVX2__)
+          __m256i max_v = _mm256_set1_epi32(-INT_MAX);
+          __m256i y_v = _mm256_set1_epi32(y_pos);
+          int i = 0;
+          for (; i <= w - 8; i += 8) {
+              __m256i b = _mm256_loadu_si256((const __m256i*)&b_ptr[i]);
+              __m256i dy = _mm256_loadu_si256((const __m256i*)&dy_ptr[i]);
+              __m256i h = _mm256_loadu_si256((const __m256i*)&h_ptr[i]);
+              __m256i yb = _mm256_add_epi32(y_v, b);
+              __m256i ybd = _mm256_add_epi32(yb, dy);
+              __m256i mask = _mm256_cmpgt_epi32(h, ybd); // h > ybd
+              __m256i res = _mm256_blendv_epi8(ybd, _mm256_sub_epi32(_mm256_setzero_si256(), yb), mask);
+              max_v = _mm256_max_epi32(max_v, res);
+          }
+          __m128i max128 = _mm_max_epi32(_mm256_extracti128_si256(max_v, 0), _mm256_extracti128_si256(max_v, 1));
+          max128 = _mm_max_epi32(max128, _mm_shuffle_epi32(max128, _MM_SHUFFLE(1, 0, 3, 2)));
+          max128 = _mm_max_epi32(max128, _mm_shuffle_epi32(max128, _MM_SHUFFLE(0, 0, 0, 1)));
+          maxY = _mm_cvtsi128_si32(max128);
+          for (; i < w; ++i) {
+              int yi = (y_pos + b_ptr[i] + dy_ptr[i] < h_ptr[i]) ? -(y_pos + b_ptr[i]) : (y_pos + b_ptr[i] + dy_ptr[i]);
+              if (yi > maxY) maxY = yi;
+          }
+#elif defined(__aarch64__)
+          int32x4_t max_v = vdupq_n_s32(-INT_MAX);
+          int32x4_t y_v = vdupq_n_s32(y_pos);
+          int i = 0;
+          for (; i <= w - 4; i += 4) {
+              int32x4_t b = vld1q_s32(&b_ptr[i]);
+              int32x4_t dy = vld1q_s32(&dy_ptr[i]);
+              int32x4_t h = vld1q_s32(&h_ptr[i]);
+              int32x4_t yb = vaddq_s32(y_v, b);
+              int32x4_t ybd = vaddq_s32(yb, dy);
+              uint32x4_t mask = vcgtq_s32(h, ybd);
+              int32x4_t neg_yb = vsubq_s32(vdupq_n_s32(0), yb);
+              int32x4_t res = vbslq_s32(mask, neg_yb, ybd);
+              max_v = vmaxq_s32(max_v, res);
+          }
+          maxY = vmaxvq_s32(max_v);
+          for (; i < w; ++i) {
+              int yi = (y_pos + b_ptr[i] + dy_ptr[i] < h_ptr[i]) ? -(y_pos + b_ptr[i]) : (y_pos + b_ptr[i] + dy_ptr[i]);
+              if (yi > maxY) maxY = yi;
+          }
+#else
+          for (unsigned i = 0; i < bottom.size(); ++i) {
+              int yi = (pos.Y() + bottom[i] + deltaY[i] < mBottomHorizon[pos.X() + i]) ? -(pos.Y() + bottom[i]) : (pos.Y() + bottom[i] + deltaY[i]);
+              if (yi > maxY) maxY = yi;
+          }
+#endif
+          return maxY;
       }
 
       int maxXofPoly(RasterizedOutline2& poly, Point2i pos, int rast_i)
       {
-          //return pos.X() + poly.gridWidth(rast_i);
-
           int maxX = -INT_MAX;
           std::vector<int>& left = poly.getLeft(rast_i);
           std::vector<int>& deltaX = poly.getDeltaX(rast_i);
-          for (unsigned i = 0; i < left.size(); ++i) {
-              int xi = 0;
-              if (pos.X() + left[i] + deltaX[i] < mLeftHorizon[pos.Y() + i]) {
-                  xi = -(pos.X() + left[i]);
-              } else {
-                  xi = pos.X() + left[i] + deltaX[i];
-              }
-              if (xi > maxX)
-                  maxX = xi;
+          int h = left.size();
+          const int* l_ptr = left.data();
+          const int* dx_ptr = deltaX.data();
+          const int* h_ptr = &mLeftHorizon[pos.Y()];
+          int x_pos = pos.X();
+
+#if defined(__AVX2__)
+          __m256i max_v = _mm256_set1_epi32(-INT_MAX);
+          __m256i x_v = _mm256_set1_epi32(x_pos);
+          int i = 0;
+          for (; i <= h - 8; i += 8) {
+              __m256i l = _mm256_loadu_si256((const __m256i*)&l_ptr[i]);
+              __m256i dx = _mm256_loadu_si256((const __m256i*)&dx_ptr[i]);
+              __m256i hv = _mm256_loadu_si256((const __m256i*)&h_ptr[i]);
+              __m256i xl = _mm256_add_epi32(x_v, l);
+              __m256i xld = _mm256_add_epi32(xl, dx);
+              __m256i mask = _mm256_cmpgt_epi32(hv, xld); // hv > xld
+              __m256i res = _mm256_blendv_epi8(xld, _mm256_sub_epi32(_mm256_setzero_si256(), xl), mask);
+              max_v = _mm256_max_epi32(max_v, res);
           }
+          __m128i max128 = _mm_max_epi32(_mm256_extracti128_si256(max_v, 0), _mm256_extracti128_si256(max_v, 1));
+          max128 = _mm_max_epi32(max128, _mm_shuffle_epi32(max128, _MM_SHUFFLE(1, 0, 3, 2)));
+          max128 = _mm_max_epi32(max128, _mm_shuffle_epi32(max128, _MM_SHUFFLE(0, 0, 0, 1)));
+          maxX = _mm_cvtsi128_si32(max128);
+          for (; i < h; ++i) {
+              int xi = (x_pos + l_ptr[i] + dx_ptr[i] < h_ptr[i]) ? -(x_pos + l_ptr[i]) : (x_pos + l_ptr[i] + dx_ptr[i]);
+              if (xi > maxX) maxX = xi;
+          }
+#elif defined(__aarch64__)
+          int32x4_t max_v = vdupq_n_s32(-INT_MAX);
+          int32x4_t x_v = vdupq_n_s32(x_pos);
+          int i = 0;
+          for (; i <= h - 4; i += 4) {
+              int32x4_t l = vld1q_s32(&l_ptr[i]);
+              int32x4_t dx = vld1q_s32(&dx_ptr[i]);
+              int32x4_t hv = vld1q_s32(&h_ptr[i]);
+              int32x4_t xl = vaddq_s32(x_v, l);
+              int32x4_t xld = vaddq_s32(xl, dx);
+              uint32x4_t mask = vcgtq_s32(hv, xld);
+              int32x4_t neg_xl = vsubq_s32(vdupq_n_s32(0), xl);
+              int32x4_t res = vbslq_s32(mask, neg_xl, xld);
+              max_v = vmaxq_s32(max_v, res);
+          }
+          maxX = vmaxvq_s32(max_v);
+          for (; i < h; ++i) {
+              int xi = (x_pos + l_ptr[i] + dx_ptr[i] < h_ptr[i]) ? -(x_pos + l_ptr[i]) : (x_pos + l_ptr[i] + dx_ptr[i]);
+              if (xi > maxX) maxX = xi;
+          }
+#else
+          for (unsigned i = 0; i < h; ++i) {
+              int xi = (pos.X() + left[i] + deltaX[i] < mLeftHorizon[pos.Y() + i]) ? -(pos.X() + left[i]) : (pos.X() + left[i] + deltaX[i]);
+              if (xi > maxX) maxX = xi;
+          }
+#endif
           return maxX;
       }
 
@@ -609,24 +940,71 @@ public:
       int emptyCellBetweenPolyAndLeftHorizon(RasterizedOutline2& poly, Point2i pos, int rast_i)
       {
           std::vector<int>& left = poly.getLeft(rast_i);
+          int h = left.size();
           int score = 0;
-          //count the number of empty cells between poly's left side and the left horizon
-          for (size_t i = 0; i < left.size(); ++i) {
-              if (pos.X() + left[i] < mLeftHorizon[pos.Y() + i])
-                  score -= pos.X() + left[i];
-              else
-                  score += pos.X() + left[i] - mLeftHorizon[pos.Y() + i];
+          const int* l_ptr = left.data();
+          const int* h_ptr = &mLeftHorizon[pos.Y()];
+          int x_pos = pos.X();
+
+#if defined(__AVX2__)
+          __m256i score_v = _mm256_setzero_si256();
+          __m256i x_v = _mm256_set1_epi32(x_pos);
+          int i = 0;
+          for (; i <= h - 8; i += 8) {
+              __m256i l = _mm256_loadu_si256((const __m256i*)&l_ptr[i]);
+              __m256i hv = _mm256_loadu_si256((const __m256i*)&h_ptr[i]);
+              __m256i xl = _mm256_add_epi32(x_v, l);
+              __m256i mask = _mm256_cmpgt_epi32(hv, xl); // hv > xl
+              __m256i diff = _mm256_sub_epi32(xl, hv);
+              __m256i res = _mm256_blendv_epi8(diff, _mm256_sub_epi32(_mm256_setzero_si256(), xl), mask);
+              score_v = _mm256_add_epi32(score_v, res);
           }
+          int32_t tmp[8];
+          _mm256_storeu_si256((__m256i*)tmp, score_v);
+          for (int j = 0; j < 8; ++j) score += tmp[j];
+          for (; i < h; ++i) {
+              int xl = x_pos + l_ptr[i];
+              if (xl < h_ptr[i]) score -= xl;
+              else score += xl - h_ptr[i];
+          }
+#elif defined(__aarch64__)
+          int32x4_t score_v = vdupq_n_s32(0);
+          int32x4_t x_v = vdupq_n_s32(x_pos);
+          int i = 0;
+          for (; i <= h - 4; i += 4) {
+              int32x4_t l = vld1q_s32(&l_ptr[i]);
+              int32x4_t hv = vld1q_s32(&h_ptr[i]);
+              int32x4_t xl = vaddq_s32(x_v, l);
+              uint32x4_t mask = vcgtq_s32(hv, xl);
+              int32x4_t diff = vsubq_s32(xl, hv);
+              int32x4_t neg_xl = vsubq_s32(vdupq_n_s32(0), xl);
+              int32x4_t res = vbslq_s32(mask, neg_xl, diff);
+              score_v = vaddq_s32(score_v, res);
+          }
+          score = vaddvq_s32(score_v);
+          for (; i < h; ++i) {
+              int xl = x_pos + l_ptr[i];
+              if (xl < h_ptr[i]) score -= xl;
+              else score += xl - h_ptr[i];
+          }
+#else
+          for (size_t i = 0; i < h; ++i) {
+              if (pos.X() + l_ptr[i] < mLeftHorizon[pos.Y() + i])
+                  score -= pos.X() + l_ptr[i];
+              else
+                  score += pos.X() + l_ptr[i] - mLeftHorizon[pos.Y() + i];
+          }
+#endif
           return score;
       }
 
-      void updateEvents(std::set<int>& events, const std::vector<int>& horizon, int i, int max_i) {
+      void updateEvents(std::vector<uint64_t>& bits, const std::vector<int>& horizon, int i, int max_i) {
           if (i <= 0 || i >= max_i) return;
           bool isEvent = (horizon[i] != horizon[i-1]);
           if (isEvent) {
-              events.insert(i);
+              setEvent(bits, i);
           } else {
-              events.erase(i);
+              clearEvent(bits, i);
           }
       }
 
@@ -687,7 +1065,7 @@ public:
           int x_start_b = pos.X();
           int w = poly.gridWidth(rast_i);
           for (int x = x_start_b; x <= x_start_b + w; ++x) {
-              updateEvents(mBottomEvents, mBottomHorizon, x, mSize.X());
+              updateEvents(mBottomEventBits, mBottomHorizon, x, mSize.X());
           }
 
 
@@ -728,7 +1106,7 @@ public:
           int y_start_l = pos.Y();
           int h = poly.gridHeight(rast_i);
           for (int y = y_start_l; y <= y_start_l + h; ++y) {
-              updateEvents(mLeftEvents, mLeftHorizon, y, mSize.Y());
+              updateEvents(mLeftEventBits, mLeftHorizon, y, mSize.Y());
           }
       }
   };
@@ -937,7 +1315,8 @@ public:
                           const std::vector<Point2i> &containerSizes,
                           std::vector<Similarity2x> &trVec,
                           std::vector<int> &polyToContainer,
-                          const Parameters &packingPar, float scaleFactor)
+                          const Parameters &packingPar, float scaleFactor,
+                          bool bypassCache = false)
     {
         std::vector<RasterizedOutline2> polyVec(outline2Vec.size());
         for(size_t i=0;i<polyVec.size();i++) {
@@ -954,7 +1333,7 @@ public:
         for (std::size_t i = 0; i < trials.size(); ++i) {
             std::vector<Similarity2x> trVecIter;
             std::vector<int> polyToContainerIter;
-            PolyPacking(outline2Vec, containerSizes, trVecIter, polyToContainerIter, packingPar, scaleFactor, polyVec, trials[i], true);
+            PolyPacking(outline2Vec, containerSizes, trVecIter, polyToContainerIter, packingPar, scaleFactor, polyVec, trials[i], true, bypassCache);
             int numPlaced = 0;
             double packedArea = 0;
             for (std::size_t j = 0; j < polyToContainerIter.size(); ++j) {
@@ -985,7 +1364,8 @@ public:
                             float scaleFactor,
                             std::vector<RasterizedOutline2>& polyVec,
                             const std::vector<int>& perm,
-                            bool bestEffort = false)
+                            bool bestEffort = false,
+                            bool bypassCache = false)
     {
         RasterizedOutline2Packer::ResetProfile();
         auto total_start = std::chrono::high_resolution_clock::now();
@@ -1020,10 +1400,10 @@ public:
             // Rasterize the multiple rotations for *only the current chart* in parallel.
             polyVec[i].resetState(packingPar.rotationNum);
             int num_base_rasterizations = (packingPar.rotationNum >= 4) ? packingPar.rotationNum/4 : packingPar.rotationNum;
-            //#pragma omp parallel for schedule(dynamic)
+
             for (int rast_i = 0; rast_i < num_base_rasterizations; rast_i++) {
                 //create the rasterization (i.e. fills bottom/top/grids/internalWastedCells arrays)
-                RASTERIZER_TYPE::rasterize(polyVec[i], scaleFactor, rast_i, packingPar.rotationNum, packingPar.gutterWidth);
+                RASTERIZER_TYPE::rasterize(polyVec[i], scaleFactor, rast_i, packingPar.rotationNum, packingPar.gutterWidth, bypassCache);
                 m_last_profile.rasterize_calls++;
             }
             auto rast_end = std::chrono::high_resolution_clock::now();
@@ -1076,34 +1456,41 @@ public:
                             }
                         };
 
-                        std::set<int> candidateColsSet;
-                        candidateColsSet.insert(0);
-                        if (maxCol >= 0) candidateColsSet.insert(maxCol);
+                        std::vector<uint8_t> candidateBits((maxCol + 8) / 8, 0);
+                        auto setCandidate = [&](int col) {
+                            if (col >= 0 && col <= maxCol) candidateBits[col >> 3] |= (1 << (col & 7));
+                        };
 
-                        const auto& events = packingFields[grid_i].bottomEvents();
+                        setCandidate(0);
+                        setCandidate(maxCol);
+
                         int poly_w = polyVec[i].gridWidth(rast_i);
-                        for (int e : events) {
-                            candidateColsSet.insert(e);
-                            candidateColsSet.insert(e - 1);
-                            candidateColsSet.insert(e + 1);
-                            candidateColsSet.insert(e - poly_w);
-                            candidateColsSet.insert(e - poly_w + 1);
-                            candidateColsSet.insert(e - poly_w - 1);
-                        }
-
-                        if ((int)candidateColsSet.size() < 32 && maxCol > 0) {
-                             int step = std::max(1, maxCol / 32);
-                             for (int col = 0; col <= maxCol; col += step) {
-                                candidateColsSet.insert(col);
-                            }
-                        }
+                        packingFields[grid_i].forEachBottomEvent([&](int e) {
+                            setCandidate(e);
+                            setCandidate(e - 1);
+                            setCandidate(e + 1);
+                            setCandidate(e - poly_w);
+                            setCandidate(e - poly_w + 1);
+                            setCandidate(e - poly_w - 1);
+                        });
 
                         std::vector<int> candidateCols;
-                        candidateCols.reserve(candidateColsSet.size());
-                        for (int col : candidateColsSet) {
-                            if (col >= 0 && col <= maxCol) {
+                        candidateCols.reserve(128); // heuristic
+                        for (int col = 0; col <= maxCol; ++col) {
+                            if (candidateBits[col >> 3] & (1 << (col & 7))) {
                                 candidateCols.push_back(col);
                             }
+                        }
+
+                        if ((int)candidateCols.size() < 32 && maxCol > 0) {
+                             int step = std::max(1, maxCol / 32);
+                             for (int col = 0; col <= maxCol; col += step) {
+                                 // Add if not already there (this is slightly redundant but keeps logic)
+                                 if (!(candidateBits[col >> 3] & (1 << (col & 7)))) {
+                                     candidateCols.push_back(col);
+                                 }
+                            }
+                            std::sort(candidateCols.begin(), candidateCols.end());
                         }
 
                         auto candY_end = std::chrono::high_resolution_clock::now();
@@ -1113,7 +1500,7 @@ public:
                         m_last_profile.candidateY_cols_evaluated += candidateCols.size();
 
                         if ((int)candidateCols.size() > PARALLEL_THRESHOLD) {
-                            #pragma omp parallel
+                            #pragma omp parallel if(!omp_in_parallel())
                             {
                                 PlacementResult bestThreadResult;
                                 #pragma omp for schedule(dynamic, 64)
@@ -1122,7 +1509,7 @@ public:
                                 }
                                 #pragma omp critical
                                 {
-                                    if(bestThreadResult.cost < bestResultForDropY.cost) {
+                                    if (bestThreadResult.cost < bestResultForDropY.cost) {
                                         bestResultForDropY = bestThreadResult;
                                     }
                                 }
@@ -1177,34 +1564,40 @@ public:
                             }
                         };
 
-                        std::set<int> candidateRowsSet;
-                        candidateRowsSet.insert(0);
-                        if (maxRow >= 0) candidateRowsSet.insert(maxRow);
+                        std::vector<uint8_t> candidateBits((maxRow + 8) / 8, 0);
+                        auto setCandidate = [&](int row) {
+                            if (row >= 0 && row <= maxRow) candidateBits[row >> 3] |= (1 << (row & 7));
+                        };
 
-                        const auto& events = packingFields[grid_i].leftEvents();
+                        setCandidate(0);
+                        setCandidate(maxRow);
+
                         int poly_h = polyVec[i].gridHeight(rast_i);
-                        for (int e : events) {
-                            candidateRowsSet.insert(e);
-                            candidateRowsSet.insert(e - 1);
-                            candidateRowsSet.insert(e + 1);
-                            candidateRowsSet.insert(e - poly_h);
-                            candidateRowsSet.insert(e - poly_h + 1);
-                            candidateRowsSet.insert(e - poly_h - 1);
-                        }
-
-                        if ((int)candidateRowsSet.size() < 32 && maxRow > 0) {
-                             int step = std::max(1, maxRow / 32);
-                             for (int row = 0; row <= maxRow; row += step) {
-                                candidateRowsSet.insert(row);
-                            }
-                        }
+                        packingFields[grid_i].forEachLeftEvent([&](int e) {
+                            setCandidate(e);
+                            setCandidate(e - 1);
+                            setCandidate(e + 1);
+                            setCandidate(e - poly_h);
+                            setCandidate(e - poly_h + 1);
+                            setCandidate(e - poly_h - 1);
+                        });
 
                         std::vector<int> candidateRows;
-                        candidateRows.reserve(candidateRowsSet.size());
-                        for (int row : candidateRowsSet) {
-                            if (row >= 0 && row <= maxRow) {
+                        candidateRows.reserve(128);
+                        for (int row = 0; row <= maxRow; ++row) {
+                            if (candidateBits[row >> 3] & (1 << (row & 7))) {
                                 candidateRows.push_back(row);
                             }
+                        }
+
+                        if ((int)candidateRows.size() < 32 && maxRow > 0) {
+                             int step = std::max(1, maxRow / 32);
+                             for (int row = 0; row <= maxRow; row += step) {
+                                 if (!(candidateBits[row >> 3] & (1 << (row & 7)))) {
+                                     candidateRows.push_back(row);
+                                 }
+                            }
+                            std::sort(candidateRows.begin(), candidateRows.end());
                         }
 
                         auto candX_end = std::chrono::high_resolution_clock::now();
@@ -1214,7 +1607,7 @@ public:
                         m_last_profile.candidateX_rows_evaluated += candidateRows.size();
 
                         if ((int)candidateRows.size() > PARALLEL_THRESHOLD) {
-                            #pragma omp parallel
+                            #pragma omp parallel if(!omp_in_parallel())
                             {
                                 PlacementResult bestThreadResult;
                                 #pragma omp for schedule(dynamic, 64)

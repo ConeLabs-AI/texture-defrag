@@ -1,7 +1,6 @@
 #include <wrap/qt/outline2_rasterizer.h>
 #include <wrap/qt/col_qt_convert.h>
 #include <vcg/space/color4.h>
-#include <wrap/qt/col_qt_convert.h>
 
 #include <fstream>
 #include <unordered_map>
@@ -10,6 +9,10 @@
 #include <cmath>
 #include <memory>
 #include <chrono>
+#include <atomic>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 using namespace vcg;
 using namespace std;
@@ -49,19 +52,21 @@ struct CacheKeyHash {
 struct CacheValue {
     // Base rasterization grid for (points, base orientation, scale, gutter).
     // We generate 90° rotations on demand per call.
-    shared_ptr<vector<vector<uint8_t>>> baseGrid;
-    size_t bytes; // width * height
+    shared_ptr<BitGrid> baseGrid;
+    size_t bytes; 
 };
 
-static std::mutex g_cacheMtx;
 static size_t g_cacheMaxBytes = (size_t)15ULL << 30; // default 15GB
-static size_t g_cacheCurrBytes = 0;
-static std::list<CacheKey> g_lru;
-static std::unordered_map<CacheKey, pair<std::list<CacheKey>::iterator, CacheValue>, CacheKeyHash> g_cache;
+static thread_local size_t g_cacheCurrBytes = 0;
+static std::atomic<size_t> g_cacheGlobalTotalBytes{0}; // Global atomic to track total usage across all threads
+static thread_local std::list<CacheKey> g_lru;
+static thread_local std::unordered_map<CacheKey, pair<std::list<CacheKey>::iterator, CacheValue>, CacheKeyHash> g_cache;
 
-// Stats
 static std::mutex g_statsMtx;
-static QtOutline2Rasterizer::CacheStats g_stats; // guarded by g_statsMtx
+static thread_local QtOutline2Rasterizer::CacheStats g_stats; 
+
+// Thread-local buffers to avoid frequent allocations in parallel packing
+static thread_local std::unique_ptr<QImage> t_sharedImageBuffer;
 
 inline uint32_t quantizeScale(float s) {
     double q = std::round(double(s) * 1e5);
@@ -95,16 +100,19 @@ inline void lruTouch(const CacheKey& key) {
 
 inline void lruInsert(const CacheKey& key, CacheValue val) {
     g_lru.push_front(key);
-    g_cacheCurrBytes += val.bytes;
+    size_t valBytes = val.bytes;
+    g_cacheCurrBytes += valBytes;
+    g_cacheGlobalTotalBytes += valBytes; // Update global atomic
     g_cache[key] = { g_lru.begin(), std::move(val) };
     while (g_cacheCurrBytes > g_cacheMaxBytes && !g_lru.empty()) {
         const CacheKey& oldKey = g_lru.back();
         auto oit = g_cache.find(oldKey);
         if (oit != g_cache.end()) {
-            g_cacheCurrBytes -= oit->second.second.bytes;
+            size_t evictedBytes = oit->second.second.bytes;
+            g_cacheCurrBytes -= evictedBytes;
+            g_cacheGlobalTotalBytes -= evictedBytes; // Update global atomic
             g_cache.erase(oit);
-            // Track evictions
-            std::lock_guard<std::mutex> lkStats(g_statsMtx);
+            // Track evictions (no lock needed for thread_local g_stats)
             g_stats.evictions++;
         }
         g_lru.pop_back();
@@ -113,42 +121,48 @@ inline void lruInsert(const CacheKey& key, CacheValue val) {
 } // namespace
 
 void QtOutline2Rasterizer::setCacheMaxBytes(std::size_t bytes) {
-    std::lock_guard<std::mutex> lk(g_cacheMtx);
-    g_cacheMaxBytes = bytes;
+    size_t numThreads = 1;
+#ifdef _OPENMP
+    numThreads = std::max((size_t)1, (size_t)omp_get_max_threads());
+#endif
+    // Divide total budget by thread count to prevent N * budget OOM
+    g_cacheMaxBytes = bytes / numThreads;
+
     while (g_cacheCurrBytes > g_cacheMaxBytes && !g_lru.empty()) {
         const CacheKey& oldKey = g_lru.back();
         auto oit = g_cache.find(oldKey);
         if (oit != g_cache.end()) {
-            g_cacheCurrBytes -= oit->second.second.bytes;
+            size_t evictedBytes = oit->second.second.bytes;
+            g_cacheCurrBytes -= evictedBytes;
+            g_cacheGlobalTotalBytes -= evictedBytes;
             g_cache.erase(oit);
-            {
-                std::lock_guard<std::mutex> lkStats(g_statsMtx);
-                g_stats.evictions++;
-            }
+            g_stats.evictions++;
         }
         g_lru.pop_back();
     }
 }
 
 void QtOutline2Rasterizer::clearCache() {
-    std::lock_guard<std::mutex> lk(g_cacheMtx);
     g_cache.clear();
     g_lru.clear();
+    g_cacheGlobalTotalBytes -= g_cacheCurrBytes;
     g_cacheCurrBytes = 0;
 }
 
 QtOutline2Rasterizer::CacheStats QtOutline2Rasterizer::statsSnapshot(bool resetCounters) {
-    std::lock_guard<std::mutex> lkStats(g_statsMtx);
+    // Note: Since g_stats is now thread_local, this snapshot only represents the calling thread's work.
+    // For the global byte count, we use our atomic.
     CacheStats out = g_stats;
-    // fill current/max bytes safely
-    {
-        std::lock_guard<std::mutex> lkCache(g_cacheMtx);
-        out.bytesCurrent = g_cacheCurrBytes;
-        out.bytesMax = g_cacheMaxBytes;
-    }
+    out.bytesCurrent = g_cacheGlobalTotalBytes.load();
+    
+    int numThreads = 1;
+#ifdef _OPENMP
+    numThreads = std::max(1, omp_get_max_threads());
+#endif
+    out.bytesMax = g_cacheMaxBytes * numThreads;
+
     if (resetCounters) {
         g_stats = CacheStats{};
-        // keep current/max bytes in snapshot; reset struct starts counters/timers at zero
     }
     return out;
 }
@@ -157,30 +171,29 @@ void QtOutline2Rasterizer::rasterize(RasterizedOutline2 &poly,
                                  float scale,
                                  int rast_i,
                                  int rotationNum,
-                                 int gutterWidth)
+                                 int gutterWidth,
+                                 bool bypassCache)
 {
     auto t_total_start = std::chrono::high_resolution_clock::now();
-    {
-        std::lock_guard<std::mutex> lkStats(g_statsMtx);
-        g_stats.calls++;
-    }
+    g_stats.calls++;
+
     // since the brush is centered on the outline, a gutter of N pixels requires a pen of 2*N width
     int effectiveGutter = gutterWidth * 2;
     float rotRad = M_PI*2.0f*float(rast_i) / float(rotationNum);
 
-    vector<vector<uint8_t>> tetrisGrid;
-    {
+    BitGrid tetrisGrid;
+    CacheKey key;
+    bool hit = false;
+
+    if (!bypassCache) {
         auto t_lookup_start = std::chrono::high_resolution_clock::now();
-        CacheKey key;
         key.pointsHash = hashPoints(poly.getPointsConst());
         key.scaleQ = quantizeScale(scale);
         key.rotationNum = (uint16_t)rotationNum;
         key.baseRastI = (uint16_t)rast_i;
         key.gutterWidth = (uint16_t)effectiveGutter;
 
-        bool hit = false;
         {
-            std::lock_guard<std::mutex> lk(g_cacheMtx);
             auto it = g_cache.find(key);
             if (it != g_cache.end()) {
                 hit = true;
@@ -188,119 +201,122 @@ void QtOutline2Rasterizer::rasterize(RasterizedOutline2 &poly,
                 auto t_hit_copy_start = std::chrono::high_resolution_clock::now();
                 tetrisGrid = *it->second.second.baseGrid; // Deep copy
                 auto t_hit_copy_end = std::chrono::high_resolution_clock::now();
-                {
-                    std::lock_guard<std::mutex> lkStats(g_statsMtx);
-                    g_stats.hits++;
-                    g_stats.t_hit_copy_s += std::chrono::duration<double>(t_hit_copy_end - t_hit_copy_start).count();
-                }
+                
+                g_stats.hits++;
+                g_stats.t_hit_copy_s += std::chrono::duration<double>(t_hit_copy_end - t_hit_copy_start).count();
             }
         }
         auto t_lookup_end = std::chrono::high_resolution_clock::now();
-        {
-            std::lock_guard<std::mutex> lkStats(g_statsMtx);
-            g_stats.t_lookup_s += std::chrono::duration<double>(t_lookup_end - t_lookup_start).count();
+        g_stats.t_lookup_s += std::chrono::duration<double>(t_lookup_end - t_lookup_start).count();
+    }
+
+    if (!hit) {
+        auto t_miss_start = std::chrono::high_resolution_clock::now();
+        // Cache miss (or bypass), do the rasterization
+        Box2f bb;
+        const vector<Point2f>& pointvec = poly.getPointsConst();
+        for(size_t i=0;i<pointvec.size();++i) {
+            Point2f pp=pointvec[i];
+            pp.Rotate(rotRad);
+            bb.Add(pp);
         }
 
-        if (!hit) {
-            auto t_miss_start = std::chrono::high_resolution_clock::now();
-            // Cache miss, do the rasterization
-            Box2f bb;
-            vector<Point2f> pointvec = poly.getPoints();
-            for(size_t i=0;i<pointvec.size();++i) {
-                Point2f pp=pointvec[i];
-                pp.Rotate(rotRad);
-                bb.Add(pp);
+        QVector<QPointF> points;
+        points.reserve(pointvec.size());
+        for (const auto& p : pointvec) {
+            points.push_back(QPointF(p.X(), p.Y()));
+        }
+
+        int safetyBuffer = 2;
+        int sizeX = (int)ceil(bb.DimX()*scale) + effectiveGutter + safetyBuffer;
+        int sizeY = (int)ceil(bb.DimY()*scale) + effectiveGutter + safetyBuffer;
+
+        // Optimization: Use thread-local buffer to avoid re-allocations
+        if (!t_sharedImageBuffer || t_sharedImageBuffer->width() < sizeX || t_sharedImageBuffer->height() < sizeY) {
+            // Allocate a generous buffer (e.g., 4k or slightly more than needed) to minimize future re-allocs
+            int allocW = std::max(2048, sizeX);
+            int allocH = std::max(2048, sizeY);
+            t_sharedImageBuffer = std::make_unique<QImage>(allocW, allocH, QImage::Format_Alpha8);
+        }
+
+        // We only clear the region we're going to use
+        // QImage doesn't have a clear(QRect) so we use QPainter to clear the ROI
+        QPainter painter;
+        painter.begin(t_sharedImageBuffer.get());
+        painter.setCompositionMode(QPainter::CompositionMode_Source);
+        painter.fillRect(0, 0, sizeX, sizeY, Qt::transparent);
+        painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+
+        painter.setRenderHint(QPainter::Antialiasing, false);
+        painter.setBrush(QBrush(Qt::white, Qt::SolidPattern));
+
+        QPen qp(Qt::white);
+        qp.setWidth(effectiveGutter);
+        qp.setCosmetic(false);
+        qp.setJoinStyle(Qt::MiterJoin);
+        painter.setPen(qp);
+
+        painter.resetTransform();
+        painter.translate(QPointF(-(bb.min.X()*scale) + (effectiveGutter + safetyBuffer)/2.0f, -(bb.min.Y()*scale) + (effectiveGutter + safetyBuffer)/2.0f));
+        painter.rotate(math::ToDeg(rotRad));
+        painter.scale(scale,scale);
+
+        painter.drawPolygon(QPolygonF(points));
+        painter.end();
+
+        // Extract result from the ROI of the shared buffer
+        int minX = sizeX, minY = sizeY, maxX = -1, maxY = -1;
+        for (int i = 0; i < sizeY; ++i) {
+            const uchar *line = t_sharedImageBuffer->constScanLine(i);
+            bool hasPixel = false;
+            for (int j = 0; j < sizeX; ++j) {
+                if (line[j] != 0) {
+                    if (j < minX) minX = j;
+                    if (j > maxX) maxX = j;
+                    hasPixel = true;
+                }
             }
-
-            QVector<QPointF> points;
-            points.reserve(pointvec.size());
-            for (const auto& p : poly.getPoints()) {
-                points.push_back(QPointF(p.X(), p.Y()));
+            if (hasPixel) {
+                if (i < minY) minY = i;
+                if (i > maxY) maxY = i;
             }
+        }
 
-            int safetyBuffer = 2;
-            int sizeX = (int)ceil(bb.DimX()*scale) + effectiveGutter + safetyBuffer;
-            int sizeY = (int)ceil(bb.DimY()*scale) + effectiveGutter + safetyBuffer;
-
-            QImage img(sizeX, sizeY, QImage::Format_Alpha8);
-            img.fill(0);
-
-            QPainter painter;
-            painter.begin(&img);
-            painter.setRenderHint(QPainter::Antialiasing, false);
-
-            painter.setBrush(QBrush(Qt::white, Qt::SolidPattern));
-
-            QPen qp(Qt::white);
-            qp.setWidth(effectiveGutter);
-            qp.setCosmetic(false);
-            qp.setJoinStyle(Qt::MiterJoin);
-            painter.setPen(qp);
-
-            painter.resetTransform();
-            painter.translate(QPointF(-(bb.min.X()*scale) + (effectiveGutter + safetyBuffer)/2.0f, -(bb.min.Y()*scale) + (effectiveGutter + safetyBuffer)/2.0f));
-            painter.rotate(math::ToDeg(rotRad));
-            painter.scale(scale,scale);
-
-            painter.drawPolygon(QPolygonF(points));
-            painter.end();
-
-            int minX = img.width(), minY = img.height(), maxX = -1, maxY = -1;
-            for (int i = 0; i < img.height(); ++i) {
-                const uchar *line = img.constScanLine(i);
-                bool hasPixel = false;
-                for (int j = 0; j < img.width(); ++j) {
-                    if (line[j] != 0) {
-                        if (j < minX) minX = j;
-                        if (j > maxX) maxX = j;
-                        hasPixel = true;
+        if (maxX >= minX) {
+            int cropW = (maxX - minX) + 1;
+            int cropH = (maxY - minY) + 1;
+            tetrisGrid.init(cropW, cropH);
+            for (int y = 0; y < cropH; y++) {
+                const uchar* line = t_sharedImageBuffer->constScanLine(minY + y);
+                for(int x = 0; x < cropW; ++x) {
+                    if (line[minX + x] != 0) {
+                        tetrisGrid.set(x, y);
                     }
                 }
-                if (hasPixel) {
-                    if (i < minY) minY = i;
-                    if (i > maxY) maxY = i;
-                }
             }
+        } else {
+            tetrisGrid.clear();
+        }
 
-            if (maxX >= minX) {
-                img = img.copy(minX, minY, (maxX - minX) + 1, (maxY - minY) + 1);
-                tetrisGrid.assign(img.height(), vector<uint8_t>(img.width()));
-                for (int y = 0; y < img.height(); y++) {
-                    const uchar* line = img.constScanLine(y);
-                    for(int x = 0; x < img.width(); ++x) {
-                        tetrisGrid[y][x] = (line[x] != 0) ? 1 : 0;
-                    }
-                }
-            } else {
-                tetrisGrid.clear();
-            }
-
+        if (!bypassCache) {
             // Insert into cache
-            {
-                std::lock_guard<std::mutex> lk(g_cacheMtx);
-                if (g_cache.find(key) == g_cache.end()) {
-                    CacheValue val;
-                    val.baseGrid = make_shared<vector<vector<uint8_t>>>(tetrisGrid);
-                    size_t bytes = 0;
-                    if (!tetrisGrid.empty()) {
-                        bytes = (size_t)tetrisGrid.size() * (size_t)tetrisGrid[0].size();
-                    }
-                    val.bytes = bytes;
-                    lruInsert(key, std::move(val));
-                    {
-                        std::lock_guard<std::mutex> lkStats(g_statsMtx);
-                        g_stats.inserts++;
-                    }
-                } else {
-                     lruTouch(key);
-                }
+            if (g_cache.find(key) == g_cache.end()) {
+                CacheValue val;
+                val.baseGrid = make_shared<BitGrid>(tetrisGrid);
+                val.bytes = tetrisGrid.data.size() * sizeof(uint64_t);
+                lruInsert(key, std::move(val));
+                g_stats.inserts++;
+            } else {
+                 lruTouch(key);
             }
-            auto t_miss_end = std::chrono::high_resolution_clock::now();
-            {
-                std::lock_guard<std::mutex> lkStats(g_statsMtx);
-                g_stats.misses++;
-                g_stats.t_miss_raster_s += std::chrono::duration<double>(t_miss_end - t_miss_start).count();
-            }
+        }
+        auto t_miss_end = std::chrono::high_resolution_clock::now();
+        g_stats.misses++;
+        g_stats.t_miss_raster_s += std::chrono::duration<double>(t_miss_end - t_miss_start).count();
+
+        // Memory Retention Fix: Reset if buffer grew too large (>64MB)
+        if (t_sharedImageBuffer && t_sharedImageBuffer->sizeInBytes() > 64 * 1024 * 1024) {
+            t_sharedImageBuffer.reset();
         }
     }
 
@@ -313,19 +329,13 @@ void QtOutline2Rasterizer::rasterize(RasterizedOutline2 &poly,
             poly.initFromGrid(rast_i + rotationOffset*j);
         }
         auto t_rot_end = std::chrono::high_resolution_clock::now();
-        {
-            std::lock_guard<std::mutex> lkStats(g_statsMtx);
-            g_stats.t_rotate_s += std::chrono::duration<double>(t_rot_end - t_rot_start).count();
-        }
+        g_stats.t_rotate_s += std::chrono::duration<double>(t_rot_end - t_rot_start).count();
+        
         auto t_total_end = std::chrono::high_resolution_clock::now();
-        {
-            std::lock_guard<std::mutex> lkStats(g_statsMtx);
-            g_stats.t_total_s += std::chrono::duration<double>(t_total_end - t_total_start).count();
-            // keep bytesCurrent/max fresh
-            std::lock_guard<std::mutex> lkCache(g_cacheMtx);
-            g_stats.bytesCurrent = g_cacheCurrBytes;
-            g_stats.bytesMax = g_cacheMaxBytes;
-        }
+        g_stats.t_total_s += std::chrono::duration<double>(t_total_end - t_total_start).count();
+        // Update snapshot counters for the calling thread
+        g_stats.bytesCurrent = g_cacheCurrBytes;
+        g_stats.bytesMax = g_cacheMaxBytes;
         return;
     }
 
@@ -344,30 +354,23 @@ void QtOutline2Rasterizer::rasterize(RasterizedOutline2 &poly,
         poly.initFromGrid(rast_i + rotationOffset*j);
     }
     auto t_rot_end = std::chrono::high_resolution_clock::now();
-    {
-        std::lock_guard<std::mutex> lkStats(g_statsMtx);
-        g_stats.t_rotate_s += std::chrono::duration<double>(t_rot_end - t_rot_start).count();
-    }
+    g_stats.t_rotate_s += std::chrono::duration<double>(t_rot_end - t_rot_start).count();
 
     auto t_total_end = std::chrono::high_resolution_clock::now();
-    {
-        std::lock_guard<std::mutex> lkStats(g_statsMtx);
-        g_stats.t_total_s += std::chrono::duration<double>(t_total_end - t_total_start).count();
-        // keep bytesCurrent/max fresh
-        std::lock_guard<std::mutex> lkCache(g_cacheMtx);
-        g_stats.bytesCurrent = g_cacheCurrBytes;
-        g_stats.bytesMax = g_cacheMaxBytes;
-    }
+    g_stats.t_total_s += std::chrono::duration<double>(t_total_end - t_total_start).count();
+    // Update snapshot counters for the calling thread
+    g_stats.bytesCurrent = g_cacheCurrBytes;
+    g_stats.bytesMax = g_cacheMaxBytes;
 }
 
-// rotates the grid 90 degree clockwise (by simple swap)
-// used to lower the cost of rasterization.
-vector<vector<uint8_t> > QtOutline2Rasterizer::rotateGridCWise(vector< vector<uint8_t> >& inGrid) {
-    vector<vector<uint8_t> > outGrid(inGrid[0].size());
-    for (size_t i = 0; i < inGrid[0].size(); i++) {
-        outGrid[i].reserve(inGrid.size());
-        for (size_t j = 0; j < inGrid.size(); j++) {
-            outGrid[i].push_back(inGrid[inGrid.size() - j - 1][i]);
+BitGrid QtOutline2Rasterizer::rotateGridCWise(const BitGrid& inGrid) {
+    BitGrid outGrid;
+    outGrid.init(inGrid.h, inGrid.w);
+    for (int y = 0; y < inGrid.h; y++) {
+        for (int x = 0; x < inGrid.w; x++) {
+            if (inGrid.get(x, y)) {
+                outGrid.set(inGrid.h - 1 - y, x);
+            }
         }
     }
     return outGrid;

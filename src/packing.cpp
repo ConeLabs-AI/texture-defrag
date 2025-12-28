@@ -36,12 +36,12 @@
 #include <chrono>
 #include <vcg/space/rasterized_outline2_packer.h>
 #include <wrap/qt/outline2_rasterizer.h>
-// #include <wrap/qt/Outline2ToQImage.h>
 
 #include <algorithm>
 #include <numeric>
 #include <cmath>
 #include <random>
+#include <queue>
 
 namespace vcg {
 /**
@@ -143,37 +143,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         double mul = chartScaleMul[i];
         targetUVArea += chartAreasOriginal[i] * double(mul) * double(mul);
     }
-    // If we do not have outline areas, fall back to original texture area target
     double packingScale = 1.0;
-    if (targetUVArea > 0.0) {
-        // The virtual grid area is packingArea; scale outlines by packingScale so that placed area ~= packingArea
-        // outlines are already multiplied per-chart; Rasterizer also takes packingScale. We set packingScale so that
-        // targetUVArea * packingScale^2 ~= packingArea => packingScale = sqrt(packingArea / targetUVArea)
-        packingScale = std::sqrt((double)packingArea / targetUVArea);
-    } else {
-        packingScale = (textureArea > 0) ? std::sqrt(packingArea / (double)textureArea) : 1.0;
-    }
-
-    if (!std::isfinite(packingScale) || packingScale <= 0) {
-        LOG_WARN << "[DIAG] Invalid packingScale computed: " << packingScale
-                 << ". Resetting to 1.0. (packingArea=" << packingArea << ", textureArea=" << textureArea << ")";
-        packingScale = 1.0;
-    }
-
-    // Guard: if packingScale is extremely small, output sizes will explode. Enforce a minimum.
-    // With grid size up to 16384 and QImage limit of 32767, we need textureScale <= 2, so packingScale >= 0.5
-    const double MIN_PACKING_SCALE = 0.5;
-    if (packingScale < MIN_PACKING_SCALE) {
-        LOG_WARN << "[VALIDATION] packingScale=" << packingScale << " is below minimum " << MIN_PACKING_SCALE
-                 << ". Clamping to " << MIN_PACKING_SCALE << " - output will be DOWNSAMPLED."
-                 << " (targetUVArea=" << targetUVArea << ", packingArea=" << packingArea << ")";
-        LOG_WARN << "[VALIDATION] This usually means input textures are very large relative to packing grid."
-                 << " Some texture detail may be lost due to downsampling.";
-        packingScale = MIN_PACKING_SCALE;
-    }
-
-    LOG_INFO << "[DIAG] Packing scale factor: " << packingScale
-             << " (packingArea=" << packingArea << ", targetUVArea=" << targetUVArea << ", textureArea=" << textureArea << ")";
 
     // Hierarchical Packing Step: Meso-pack micro charts into macro-tiles (bins)
     Timer mesoTimer;
@@ -328,180 +298,214 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     rpack_params.costFunction = Packer::Parameters::LowestHorizon;
     rpack_params.doubleHorizon = false;
     rpack_params.innerHorizon = false;
-    //rpack_params.permutations = false;
     rpack_params.permutations = (charts.size() < 50);
     rpack_params.rotationNum = params.rotationNum;
     rpack_params.gutterWidth = 4;
-    rpack_params.minmax = false; // not used
+    rpack_params.minmax = false;
 
-    int totPackedItems = 0;
-
-    std::vector<int> packableContainerIndices(packables.size(), -1); // -1 means not packed
-    std::vector<vcg::Similarity2f> packableTransforms(packables.size(), vcg::Similarity2f{});
-
-    auto selectSubset = [&](const std::vector<unsigned>& eligible,
-                            double targetUVArea) -> std::vector<unsigned> {
-        if (eligible.empty()) return {};
-
-        std::vector<unsigned> indices = eligible;
-        static thread_local std::mt19937 rng(std::random_device{}());
-        std::shuffle(indices.begin(), indices.end(), rng);
-
-        std::vector<unsigned> selected;
-        selected.reserve(indices.size());
-        double accum = 0.0;
-        for (unsigned idx : indices) {
-            if (accum >= targetUVArea) break;
-            selected.push_back(idx);
-            accum += packableAreas[idx];
-        }
-        if (selected.empty() && !indices.empty()) {
-            selected.push_back(indices[0]);
-        }
-
-        std::sort(selected.begin(), selected.end(), [&](unsigned a, unsigned b){
-            return packableAreas[a] > packableAreas[b];
-        });
-        return selected;
+    // Partitioned Parallel Packing Step
+    struct ParallelItem {
+        int packableIndex; // Index into the 'packables' vector
+        double area;
     };
+    std::vector<ParallelItem> items;
+    const float QIMAGE_MAX_DIM = 32766.0f;
 
-    unsigned nc = 0; // current container index
-    while (totPackedItems < (int) packables.size()) {
-        if (nc >= containerVec.size())
-            containerVec.push_back(vcg::Point2i(packingSize, packingSize));
+    int skippedEmpty = 0;
+    int skippedInvalid = 0;
+    int skippedTooLarge = 0;
 
-        std::vector<unsigned> pending;
-        for (unsigned i = 0; i < packableContainerIndices.size(); ++i) {
-            if (packableContainerIndices[i] == -1) {
-                pending.push_back(i);
-            }
-        }
-
-        if (pending.empty())
-            break;
-
-        const float QIMAGE_MAX_DIM = 32766.0f;
-        std::vector<unsigned> eligible;
-        eligible.reserve(pending.size());
-
-        int skippedEmpty = 0;
-        int skippedInvalid = 0;
-        int skippedTooLarge = 0;
-        for(unsigned origIdx : pending) {
-            if (packableOutlines[origIdx].empty()) {
-                skippedEmpty++;
-                packableContainerIndices[origIdx] = -2; // Mark as skipped
-                totPackedItems++;
-                continue;
-            }
-
-            vcg::Box2f bbox;
-            for(const auto& p : packableOutlines[origIdx]) bbox.Add(p);
-
-            if (!std::isfinite(bbox.DimX()) || !std::isfinite(bbox.DimY()) || bbox.DimX() < 0 || bbox.DimY() < 0) {
-                skippedInvalid++;
-                packableContainerIndices[origIdx] = -4; 
-                totPackedItems++;
-                continue;
-            }
-
-            float w = bbox.DimX() * (float)packingScale;
-            float h = bbox.DimY() * (float)packingScale;
-            float diagonal = std::sqrt(w * w + h * h);
-
-            if (diagonal > QIMAGE_MAX_DIM) {
-                skippedTooLarge++;
-                packableContainerIndices[origIdx] = -3;
-                totPackedItems++;
-                continue;
-            }
-            eligible.push_back(origIdx);
-        }
-        if (skippedEmpty > 0) LOG_WARN << "[DIAG] Skipped " << skippedEmpty << " items with empty outlines.";
-        if (skippedInvalid > 0) LOG_WARN << "[DIAG] Skipped " << skippedInvalid << " items due to invalid/non-finite UV bounding box.";
-        if (skippedTooLarge > 0) LOG_WARN << "[DIAG] Skipped " << skippedTooLarge << " items because their scaled diagonal exceeds QImage limits.";
-
-        if (eligible.empty()) {
-            if (totPackedItems < (int) packables.size()) continue;
-            else break;
-        }
-
-        double gridArea = double(containerVec[nc].X()) * double(containerVec[nc].Y());
-        double targetUVArea = 5 * (gridArea / (packingScale * packingScale));
-
-        std::vector<unsigned> selectedIdx = selectSubset(eligible, targetUVArea);
-        std::vector<Outline2f> outlines_iter;
-        outlines_iter.reserve(selectedIdx.size());
-        for (unsigned idx : selectedIdx) outlines_iter.push_back(packableOutlines[idx]);
-
-        LOG_VERBOSE << "[DIAG] Subset selection: pending=" << pending.size()
-                 << ", eligible=" << eligible.size()
-                 << ", selected=" << outlines_iter.size()
-                 << ", targetUVArea≈" << targetUVArea
-                 << ", grid=" << containerVec[nc].X() << "x" << containerVec[nc].Y();
-
-        if (outlines_iter.empty())
+    for (size_t i = 0; i < packables.size(); ++i) {
+        if (packables[i].outline.empty()) {
+            skippedEmpty++;
             continue;
+        }
 
-        const int MAX_SIZE = 20000;
+        vcg::Box2f bbox;
+        for (const auto& p : packables[i].outline) bbox.Add(p);
+
+        if (!std::isfinite(bbox.DimX()) || !std::isfinite(bbox.DimY()) || bbox.DimX() < 0 || bbox.DimY() < 0) {
+            skippedInvalid++;
+            continue;
+        }
+
+        float w = bbox.DimX() * (float)packingScale;
+        float h = bbox.DimY() * (float)packingScale;
+        float diagonal = std::sqrt(w * w + h * h);
+
+        if (diagonal > QIMAGE_MAX_DIM) {
+            skippedTooLarge++;
+            continue;
+        }
+
+        double a = std::abs(vcg::tri::OutlineUtil<float>::Outline2Area(packables[i].outline));
+        items.push_back({(int)i, a});
+    }
+
+    if (skippedEmpty > 0) LOG_WARN << "[DIAG] Skipped " << skippedEmpty << " items with empty outlines.";
+    if (skippedInvalid > 0) LOG_WARN << "[DIAG] Skipped " << skippedInvalid << " items due to invalid/non-finite UV bounding box.";
+    if (skippedTooLarge > 0) LOG_WARN << "[DIAG] Skipped " << skippedTooLarge << " items because their scaled diagonal exceeds QImage limits.";
+
+    // 2. Sort Descending by Area (LPT Heuristic)
+    std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) {
+        return a.area > b.area;
+    });
+
+    // 3. Estimate Sheets & Distribute
+    double totalPackableArea = 0;
+    for (const auto& item : items) totalPackableArea += item.area;
+
+    int numThreads = 1;
+#ifdef _OPENMP
+    numThreads = omp_get_max_threads();
+#endif
+    
+    double gridArea = (double)packingSize * (double)packingSize;
+    // Assume 85% packing efficiency to estimate number of sheets
+    int estimatedSheets = (int)std::ceil(totalPackableArea / (gridArea * 0.85));
+    // Ensure we have at least as many sheets as threads to maximize concurrency
+    int numSheets = std::max(numThreads, estimatedSheets);
+
+    LOG_INFO << "[PACKING] Scale fixed to 1.0. Total UV Area: " << totalPackableArea 
+             << ". Est. Sheets: " << estimatedSheets 
+             << ". Parallel bins: " << numSheets;
+
+    struct SheetBin {
+        std::vector<int> packableIndices;
+        double fill = 0;
+    };
+    std::vector<SheetBin> sheets(numSheets);
+    
+    // Priority queue to distribute items to the emptiest bin
+    using BinPair = std::pair<double, int>;
+    std::priority_queue<BinPair, std::vector<BinPair>, std::greater<BinPair>> pq;
+    for (int i = 0; i < numSheets; ++i) pq.push({0.0, i});
+
+    for (const auto& item : items) {
+        auto best = pq.top();
+        pq.pop();
+        sheets[best.second].packableIndices.push_back(item.packableIndex);
+        sheets[best.second].fill += item.area;
+        pq.push({sheets[best.second].fill, best.second});
+    }
+
+    // 4. Parallel Pack
+    struct ThreadResult {
+        std::vector<TextureSize> sizes;
         std::vector<vcg::Similarity2f> transforms;
-        std::vector<int> polyToContainer;
-        int n = 0;
-        int packAttempts = 0;
-        const int MAX_PACK_ATTEMPTS = 50;
-        do {
-            if (++packAttempts > MAX_PACK_ATTEMPTS) {
-                LOG_ERR << "[DIAG] FATAL: Packing loop exceeded " << MAX_PACK_ATTEMPTS << " attempts. Aborting.";
-                std::exit(-1);
-            }
-            transforms.clear();
-            polyToContainer.clear();
-            LOG_VERBOSE << "Packing " << outlines_iter.size() << " items into grid of size " << containerVec[nc].X() << " " << containerVec[nc].Y() << " (Attempt " << packAttempts << ")";
-            n = RasterizationBasedPacker::PackBestEffortAtScale(outlines_iter, {containerVec[nc]}, transforms, polyToContainer, rpack_params, packingScale);
-            LOG_VERBOSE << "[DIAG] Packing attempt finished. Items packed: " << n << ".";
-            if (n == 0 && !outlines_iter.empty()) {
-                containerVec[nc].X() *= 1.1;
-                containerVec[nc].Y() *= 1.1;
-            }
-        } while (n == 0 && !outlines_iter.empty() && containerVec[nc].X() <= MAX_SIZE && containerVec[nc].Y() <= MAX_SIZE);
+        std::vector<int> containerIndices;
+        std::vector<int> originalPackableIndices; // Track which packable index this result belongs to
+    };
+    std::vector<ThreadResult> results(numSheets);
 
-        if (n > 0) totPackedItems += n;
+    LOG_INFO << "[DIAG] Starting parallel packing of " << items.size() << " items into " << numSheets << " sheets using " << numThreads << " threads.";
 
-        if (n == 0) // no items were packed, stop
-            break;
-        else {
-            double textureScale = 1.0 / packingScale;
-            double w_d = static_cast<double>(containerVec[nc].X()) * textureScale;
-            double h_d = static_cast<double>(containerVec[nc].Y()) * textureScale;
-            if (!std::isfinite(w_d) || !std::isfinite(h_d) || w_d <= 0.0 || h_d <= 0.0) {
-                LOG_ERR << "[VALIDATION] Invalid scaled container size (w=" << w_d << ", h=" << h_d << "). Aborting.";
-                std::exit(-1);
-            }
-            const int MAX_QIMAGE_SIZE = 32767;
-            if (w_d > MAX_QIMAGE_SIZE || h_d > MAX_QIMAGE_SIZE) {
-                LOG_WARN << "[VALIDATION] Computed output container exceeds QImage limit: " << w_d << "x" << h_d
-                         << ". Clamping to " << MAX_QIMAGE_SIZE << " - output will be DOWNSAMPLED.";
-                w_d = std::min(w_d, static_cast<double>(MAX_QIMAGE_SIZE));
-                h_d = std::min(h_d, static_cast<double>(MAX_QIMAGE_SIZE));
-            }
-            TextureSize outTsz;
-            outTsz.w = static_cast<int>(std::ceil(w_d));
-            outTsz.h = static_cast<int>(std::ceil(h_d));
-            texszVec.push_back(outTsz);
-            for (unsigned i = 0; i < outlines_iter.size(); ++i) {
-                if (polyToContainer[i] != -1) {
-                    ensure(polyToContainer[i] == 0);
-                    int packableInd = selectedIdx[i];
-                    ensure(packableContainerIndices[packableInd] == -1);
-                    packableContainerIndices[packableInd] = nc;
-                    packableTransforms[packableInd] = transforms[i];
+    #pragma omp parallel for schedule(dynamic)
+    for (int i = 0; i < numSheets; ++i) {
+        if (sheets[i].packableIndices.empty()) continue;
+
+        // 1. Setup Input
+        std::vector<Outline2f> subsetOutlines;
+        std::vector<int> subsetIndices;
+        subsetOutlines.reserve(sheets[i].packableIndices.size());
+        subsetIndices.reserve(sheets[i].packableIndices.size());
+        for (int pIdx : sheets[i].packableIndices) {
+            subsetOutlines.push_back(packables[pIdx].outline);
+            subsetIndices.push_back(pIdx);
+        }
+
+        // 2. Setup Containers - Start with ONE
+        std::vector<vcg::Point2i> localCont = { vcg::Point2i(packingSize, packingSize) };
+        std::vector<vcg::Similarity2f> localTr;
+        std::vector<int> localPolyToCont;
+
+        // 3. Dynamic Packing Loop
+        bool fullyPacked = false;
+        int safetyCounter = 0;
+
+        while (!fullyPacked) {
+            localTr.clear();
+            localPolyToCont.clear();
+
+            // Call Packer with FIXED scale 1.0
+            // We set bypassCache to false now because we will make it thread-local later
+            int nPacked = RasterizationBasedPacker::PackBestEffortAtScale(
+                subsetOutlines, 
+                localCont, 
+                localTr, 
+                localPolyToCont, 
+                rpack_params, 
+                1.0f, 
+                false
+            );
+
+            if (nPacked == (int)subsetOutlines.size()) {
+                fullyPacked = true;
+            } else {
+                // overflow detected: add another texture page
+                localCont.push_back(vcg::Point2i(packingSize, packingSize));
+                
+                // Safety break for giant/degenerate charts
+                if (++safetyCounter > 50) {
+                     LOG_WARN << "Thread " << i << " infinite growth detected. Giant chart?";
+                     // Fallback: Try one last time with downscaling just for this bucket
+                     RasterizationBasedPacker::PackBestEffortAtScale(
+                        subsetOutlines, localCont, localTr, localPolyToCont, rpack_params, 0.5f, false);
+                     fullyPacked = true; 
                 }
             }
         }
-        nc++;
+
+        // 4. Save Results
+        int maxUsedCont = -1;
+        for (int contIdx : localPolyToCont) {
+            if (contIdx > maxUsedCont) maxUsedCont = contIdx;
+        }
+
+        for (int k = 0; k <= maxUsedCont; ++k) {
+            TextureSize tsz;
+            tsz.w = packingSize;
+            tsz.h = packingSize;
+            results[i].sizes.push_back(tsz);
+        }
+
+        for (size_t k = 0; k < localPolyToCont.size(); ++k) {
+            int contIdx = localPolyToCont[k];
+            if (contIdx != -1) {
+                results[i].transforms.push_back(localTr[k]);
+                results[i].containerIndices.push_back(contIdx);
+                results[i].originalPackableIndices.push_back(subsetIndices[k]);
+            }
+        }
     }
 
-    // After main packing loop, finalize the container indices and transforms for all charts
+    // 5. Global Reconstruction (Serialized)
+    std::vector<int> packableContainerIndices(packables.size(), -1);
+    std::vector<vcg::Similarity2f> packableTransforms(packables.size(), vcg::Similarity2f{});
+    std::vector<Point2i> containerVec;
+    
+    int globalTexOffset = 0;
+    for (int i = 0; i < numSheets; ++i) {
+        // Append sizes
+        texszVec.insert(texszVec.end(), results[i].sizes.begin(), results[i].sizes.end());
+        for (size_t k = 0; k < results[i].sizes.size(); ++k) {
+            containerVec.push_back(Point2i(packingSize, packingSize));
+        }
+
+        // Map transforms back using the stored original indices
+        for (size_t k = 0; k < results[i].transforms.size(); ++k) {
+            int pIdx = results[i].originalPackableIndices[k];
+            int localC = results[i].containerIndices[k];
+            
+            if (pIdx >= 0 && pIdx < (int)packableContainerIndices.size()) {
+                packableContainerIndices[pIdx] = globalTexOffset + localC;
+                packableTransforms[pIdx] = results[i].transforms[k];
+            }
+        }
+        globalTexOffset += results[i].sizes.size();
+    }
+
+    // After parallel packing, finalize the container indices and transforms for all charts
     std::vector<int> chartContainerIndices(charts.size(), -1);
     std::vector<vcg::Similarity2f> chartPackingTransforms(charts.size(), vcg::Similarity2f{});
 
@@ -524,6 +528,10 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         }
     }
 
+    int totPackedCharts = 0;
+    for (int idx : chartContainerIndices) if (idx >= 0) totPackedCharts++;
+    int nc = (int)containerVec.size();
+
     // Helper function to round up to nearest power of two
     auto roundUpToPowerOfTwo = [](int v) -> int {
         if (v <= 0) return 1;
@@ -545,7 +553,6 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         }
     }
     
-    int totPackedCharts = (int)charts.size() - (int)remainingUnpacked.size();
     if (!remainingUnpacked.empty()) {
         LOG_INFO << "[DIAG] Creating individual containers for " << remainingUnpacked.size() << " unpacked charts.";
         

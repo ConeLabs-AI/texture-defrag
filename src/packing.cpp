@@ -19,6 +19,8 @@
     along with TextureDefrag. If not, see <https://www.gnu.org/licenses/>.
 *******************************************************************************/
 
+#include <vcg/space/rasterized_outline2_packer.h>
+#include <wrap/qt/outline2_rasterizer.h>
 #include "packing.h"
 #include "texture_object.h"
 #include "mesh_graph.h"
@@ -34,8 +36,6 @@
 #include <cstdint>
 #include <set>
 #include <chrono>
-#include <vcg/space/rasterized_outline2_packer.h>
-#include <wrap/qt/outline2_rasterizer.h>
 
 #include <algorithm>
 #include <numeric>
@@ -482,14 +482,14 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     // 5. Global Reconstruction (Serialized)
     std::vector<int> packableContainerIndices(packables.size(), -1);
     std::vector<vcg::Similarity2f> packableTransforms(packables.size(), vcg::Similarity2f{});
-    std::vector<Point2i> containerVec;
+    std::vector<Point2i> atlasContainerSizes;
     
     int globalTexOffset = 0;
     for (int i = 0; i < numSheets; ++i) {
         // Append sizes
         texszVec.insert(texszVec.end(), results[i].sizes.begin(), results[i].sizes.end());
         for (size_t k = 0; k < results[i].sizes.size(); ++k) {
-            containerVec.push_back(Point2i(packingSize, packingSize));
+            atlasContainerSizes.push_back(Point2i(packingSize, packingSize));
         }
 
         // Map transforms back using the stored original indices
@@ -530,7 +530,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
 
     int totPackedCharts = 0;
     for (int idx : chartContainerIndices) if (idx >= 0) totPackedCharts++;
-    int nc = (int)containerVec.size();
+    int nc = (int)atlasContainerSizes.size();
 
     // Helper function to round up to nearest power of two
     auto roundUpToPowerOfTwo = [](int v) -> int {
@@ -611,7 +611,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
                 tsz.w = (int)std::max(1.0f, std::ceil(w_f));
                 tsz.h = (int)std::max(1.0f, std::ceil(h_f));
                 texszVec.push_back(tsz);
-                containerVec.push_back(containerSize);
+                atlasContainerSizes.push_back(containerSize);
                 nc++;
                 totPackedCharts++;
              }
@@ -630,7 +630,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
                 }
             }
             else {
-                Point2i gridSize = containerVec[ic];
+                Point2i gridSize = atlasContainerSizes[ic];
                 for (int j = 0; j < fptr->VN(); ++j) {
                     Point2d uv = fptr->WT(j).P();
                     float mul = chartScaleMul[i];
@@ -690,7 +690,7 @@ Outline2d ExtractOutline2d(FaceGroup& chart)
         for (int i = 0; i < 3; ++i) {
             if (!fptr->IsV() && face::IsBorder(*fptr, i)) {
                 face::Pos<Mesh::FaceType> p(fptr, i);
-                face::Pos<Mesh::FaceType> startPos = p;
+                face::Pos<Mesh::FaceType> startPos(p.F(), p.E(), p.V());
                 ensure(p.IsBorder());
                 do {
                     ensure(p.IsManifold());

@@ -457,12 +457,135 @@ void ARAP::ComputeRHSSIMD(Mesh& m, const std::vector<Cot>& cotan, Eigen::VectorX
     bu.setZero(n_free_verts);
     bv.setZero(n_free_verts);
 
+    const int nf = m.FN();
+
+#ifdef ARAP_USE_AVX2
+    constexpr int batch_size = 4;
+    const int nf_aligned = (nf / batch_size) * batch_size;
+#endif
+
     #pragma omp parallel
     {
         Eigen::VectorXd bu_private = Eigen::VectorXd::Zero(n_free_verts);
         Eigen::VectorXd bv_private = Eigen::VectorXd::Zero(n_free_verts);
+
+#ifdef ARAP_USE_AVX2
+        alignas(32) double fx_buf[4], fy_buf[4];
+        alignas(32) double w_ij_scalar_buf[4], w_ik_scalar_buf[4];
+        
         #pragma omp for nowait
-        for (int fi = 0; fi < m.FN(); ++fi) {
+        for (int fi = 0; fi < nf_aligned; fi += batch_size) {
+            // Load rotations for the batch
+            __m256d r00 = _mm256_loadu_pd(&soa_rotations.r00[fi]);
+            __m256d r01 = _mm256_loadu_pd(&soa_rotations.r01[fi]);
+            __m256d r10 = _mm256_loadu_pd(&soa_rotations.r10[fi]);
+            __m256d r11 = _mm256_loadu_pd(&soa_rotations.r11[fi]);
+
+            // Load local coordinates
+            __m256d tx0 = _mm256_setzero_pd();
+            __m256d ty0 = _mm256_setzero_pd();
+            __m256d tx1 = _mm256_loadu_pd(&soa_local_coords.x1[fi]);
+            __m256d ty1 = _mm256_loadu_pd(&soa_local_coords.y1[fi]);
+            __m256d tx2 = _mm256_loadu_pd(&soa_local_coords.x2[fi]);
+            __m256d ty2 = _mm256_loadu_pd(&soa_local_coords.y2[fi]);
+
+            for (int i = 0; i < 3; ++i) {
+                int j_local_idx = (i+1)%3;
+                int k_local_idx = (i+2)%3;
+
+                // Determine ti, tj, tk vectors based on i
+                __m256d tix, tiy, tjx, tjy, tkx, tky;
+                if (i == 0) { tix = tx0; tiy = ty0; }
+                else if (i == 1) { tix = tx1; tiy = ty1; }
+                else { tix = tx2; tiy = ty2; }
+
+                if (j_local_idx == 0) { tjx = tx0; tjy = ty0; }
+                else if (j_local_idx == 1) { tjx = tx1; tjy = ty1; }
+                else { tjx = tx2; tjy = ty2; }
+
+                if (k_local_idx == 0) { tkx = tx0; tky = ty0; }
+                else if (k_local_idx == 1) { tkx = tx1; tky = ty1; }
+                else { tkx = tx2; tky = ty2; }
+
+                // Gather weights safely (sanitizing NaNs/Infs)
+                for (int k = 0; k < batch_size; ++k) {
+                    double wj = cotan[fi+k].v[k_local_idx];
+                    if (!std::isfinite(wj)) wj = 1e-8;
+                    w_ij_scalar_buf[k] = wj;
+                    
+                    double wk = cotan[fi+k].v[j_local_idx];
+                    if (!std::isfinite(wk)) wk = 1e-8;
+                    w_ik_scalar_buf[k] = wk;
+                }
+                
+                // Pack sanitized weights
+                // Note: set_pd is high-to-low arguments, so index 3, 2, 1, 0
+                __m256d wij = _mm256_set_pd(w_ij_scalar_buf[3], w_ij_scalar_buf[2], w_ij_scalar_buf[1], w_ij_scalar_buf[0]);
+                __m256d wik = _mm256_set_pd(w_ik_scalar_buf[3], w_ik_scalar_buf[2], w_ik_scalar_buf[1], w_ik_scalar_buf[0]);
+
+                // Edge vectors
+                __m256d xij_x = _mm256_sub_pd(tix, tjx);
+                __m256d xij_y = _mm256_sub_pd(tiy, tjy);
+                __m256d xik_x = _mm256_sub_pd(tix, tkx);
+                __m256d xik_y = _mm256_sub_pd(tiy, tky);
+
+                // Force computation (vectorized)
+                // rhs_rot = wij * (R * xij) + wik * (R * xik)
+                
+                __m256d rot_ij_x = _mm256_fmadd_pd(r00, xij_x, _mm256_mul_pd(r01, xij_y));
+                __m256d rot_ij_y = _mm256_fmadd_pd(r10, xij_x, _mm256_mul_pd(r11, xij_y));
+                
+                __m256d rot_ik_x = _mm256_fmadd_pd(r00, xik_x, _mm256_mul_pd(r01, xik_y));
+                __m256d rot_ik_y = _mm256_fmadd_pd(r10, xik_x, _mm256_mul_pd(r11, xik_y));
+
+                __m256d fx = _mm256_fmadd_pd(wij, rot_ij_x, _mm256_mul_pd(wik, rot_ik_x));
+                __m256d fy = _mm256_fmadd_pd(wij, rot_ij_y, _mm256_mul_pd(wik, rot_ik_y));
+
+                _mm256_storeu_pd(fx_buf, fx);
+                _mm256_storeu_pd(fy_buf, fy);
+
+                // Scatter / Accumulate results
+                for (int k = 0; k < batch_size; ++k) {
+                    int idx = fi + k;
+                    auto &f = m.face[idx];
+                    int global_i = (int) tri::Index(m, f.V0(i));
+                    int local_i = global_to_local_idx[global_i];
+
+                    if (local_i != -1) {
+                        bu_private(local_i) += fx_buf[k];
+                        bv_private(local_i) += fy_buf[k];
+
+                        // Fixed vertex handling (sparse, so kept scalar)
+                        // Use sanitized weights from buffer
+                        double w_ij_scalar = w_ij_scalar_buf[k];
+                        int global_j = (int) tri::Index(m, f.V1(i));
+                        int local_j = global_to_local_idx[global_j];
+                        
+                        if (local_j == -1) {
+                            vcg::Point2d fixed_pos_j = m.vert[global_j].T().P();
+                            bu_private(local_i) += w_ij_scalar * fixed_pos_j.X();
+                            bv_private(local_i) += w_ij_scalar * fixed_pos_j.Y();
+                        }
+
+                        double w_ik_scalar = w_ik_scalar_buf[k];
+                        int global_k = (int) tri::Index(m, f.V2(i));
+                        int local_k = global_to_local_idx[global_k];
+
+                        if (local_k == -1) {
+                            vcg::Point2d fixed_pos_k = m.vert[global_k].T().P();
+                            bu_private(local_i) += w_ik_scalar * fixed_pos_k.X();
+                            bv_private(local_i) += w_ik_scalar * fixed_pos_k.Y();
+                        }
+                    }
+                }
+            }
+        }
+#else
+        int nf_aligned = 0; 
+#endif
+
+        // Remainder loop
+        for (int fi = nf_aligned; fi < nf; ++fi) {
             auto &f = m.face[fi];
 
             // Get rotation from SoA storage
@@ -472,7 +595,7 @@ void ARAP::ComputeRHSSIMD(Mesh& m, const std::vector<Cot>& cotan, Eigen::VectorX
             double rf11 = soa_rotations.r11[fi];
 
             // Get local frame coordinates
-            double t0_x = 0.0, t0_y = 0.0;  // vertex 0 at origin
+            double t0_x = 0.0, t0_y = 0.0;
             double t1_x = soa_local_coords.x1[fi];
             double t1_y = soa_local_coords.y1[fi];
             double t2_x = soa_local_coords.x2[fi];
@@ -518,7 +641,6 @@ void ARAP::ComputeRHSSIMD(Mesh& m, const std::vector<Cot>& cotan, Eigen::VectorX
                     double x_ik_y = ti_y - tk_y;
 
                     // rhs_rot = (weight_ij * Rf) * x_ij + (weight_ik * Rf) * x_ik
-                    // (scalar * 2x2 matrix) * 2x1 vector
                     double rhs_rot_x = weight_ij * (rf00 * x_ij_x + rf01 * x_ij_y)
                                      + weight_ik * (rf00 * x_ik_x + rf01 * x_ik_y);
                     double rhs_rot_y = weight_ij * (rf10 * x_ij_x + rf11 * x_ij_y)
@@ -661,44 +783,84 @@ double ARAP::CurrentEnergySIMD()
 
         #pragma omp for nowait
         for (int fi = 0; fi < nf_aligned; fi += batch_size) {
-            double batch_e = 0;
-            double batch_area = 0;
+            
+            // Gather input vectors
+            __m256d x10_x = _mm256_loadu_pd(&soa_local_coords.x1[fi]);
+            __m256d x10_y = _mm256_loadu_pd(&soa_local_coords.y1[fi]);
+            __m256d x20_x = _mm256_loadu_pd(&soa_local_coords.x2[fi]);
+            __m256d x20_y = _mm256_loadu_pd(&soa_local_coords.y2[fi]);
 
-            // Load and compute Jacobians for 4 faces
-            for (int k = 0; k < batch_size; ++k) {
-                int idx = fi + k;
-                auto& f = m.face[idx];
+            // Gather UV coordinates (AoS -> registers)
+            auto& f0 = m.face[fi+0];
+            auto& f1 = m.face[fi+1];
+            auto& f2 = m.face[fi+2];
+            auto& f3 = m.face[fi+3];
 
-                double x10_x = soa_local_coords.x1[idx];
-                double x10_y = soa_local_coords.y1[idx];
-                double x20_x = soa_local_coords.x2[idx];
-                double x20_y = soa_local_coords.y2[idx];
+            // Note: set_pd is high-to-low arguments
+            __m256d u10_x = _mm256_set_pd(f3.WT(1).P().X() - f3.WT(0).P().X(), f2.WT(1).P().X() - f2.WT(0).P().X(), f1.WT(1).P().X() - f1.WT(0).P().X(), f0.WT(1).P().X() - f0.WT(0).P().X());
+            __m256d u10_y = _mm256_set_pd(f3.WT(1).P().Y() - f3.WT(0).P().Y(), f2.WT(1).P().Y() - f2.WT(0).P().Y(), f1.WT(1).P().Y() - f1.WT(0).P().Y(), f0.WT(1).P().Y() - f0.WT(0).P().Y());
+            __m256d u20_x = _mm256_set_pd(f3.WT(2).P().X() - f3.WT(0).P().X(), f2.WT(2).P().X() - f2.WT(0).P().X(), f1.WT(2).P().X() - f1.WT(0).P().X(), f0.WT(2).P().X() - f0.WT(0).P().X());
+            __m256d u20_y = _mm256_set_pd(f3.WT(2).P().Y() - f3.WT(0).P().Y(), f2.WT(2).P().Y() - f2.WT(0).P().Y(), f1.WT(2).P().Y() - f1.WT(0).P().Y(), f0.WT(2).P().Y() - f0.WT(0).P().Y());
 
-                double u10_x = f.WT(1).P().X() - f.WT(0).P().X();
-                double u10_y = f.WT(1).P().Y() - f.WT(0).P().Y();
-                double u20_x = f.WT(2).P().X() - f.WT(0).P().X();
-                double u20_y = f.WT(2).P().Y() - f.WT(0).P().Y();
+            // Compute Jacobian J = U * F^-1
+            // F^-1 = 1/det * [[x20_y, -x20_x], [-x10_y, x10_x]]
+            __m256d det = _mm256_sub_pd(_mm256_mul_pd(x10_x, x20_y), _mm256_mul_pd(x20_x, x10_y));
+            // Protect small det
+            __m256d eps = _mm256_set1_pd(1e-300);
+            __m256d mask = _mm256_cmp_pd(_mm256_andnot_pd(_mm256_set1_pd(-0.0), det), eps, _CMP_LT_OQ);
+            det = _mm256_blendv_pd(det, eps, mask); 
+            __m256d inv_det = _mm256_div_pd(_mm256_set1_pd(1.0), det);
 
-                double det = x10_x * x20_y - x20_x * x10_y;
-                if (std::abs(det) < 1e-300) det = 1e-300;
-                double inv_det = 1.0 / det;
+            __m256d finv00 = _mm256_mul_pd(x20_y, inv_det);
+            __m256d finv01 = _mm256_mul_pd(_mm256_sub_pd(_mm256_setzero_pd(), x20_x), inv_det);
+            __m256d finv10 = _mm256_mul_pd(_mm256_sub_pd(_mm256_setzero_pd(), x10_y), inv_det);
+            __m256d finv11 = _mm256_mul_pd(x10_x, inv_det);
 
-                double f_inv00 = x20_y * inv_det;
-                double f_inv01 = -x20_x * inv_det;
-                double f_inv10 = -x10_y * inv_det;
-                double f_inv11 = x10_x * inv_det;
+            // J = [[a,b],[c,d]]
+            __m256d ja = _mm256_add_pd(_mm256_mul_pd(u10_x, finv00), _mm256_mul_pd(u20_x, finv10));
+            __m256d jb = _mm256_add_pd(_mm256_mul_pd(u10_x, finv01), _mm256_mul_pd(u20_x, finv11));
+            __m256d jc = _mm256_add_pd(_mm256_mul_pd(u10_y, finv00), _mm256_mul_pd(u20_y, finv10));
+            __m256d jd = _mm256_add_pd(_mm256_mul_pd(u10_y, finv01), _mm256_mul_pd(u20_y, finv11));
 
-                jf_a[k] = u10_x * f_inv00 + u20_x * f_inv10;
-                jf_b[k] = u10_x * f_inv01 + u20_x * f_inv11;
-                jf_c[k] = u10_y * f_inv00 + u20_y * f_inv10;
-                jf_d[k] = u10_y * f_inv01 + u20_y * f_inv11;
+            _mm256_storeu_pd(jf_a, ja);
+            _mm256_storeu_pd(jf_b, jb);
+            _mm256_storeu_pd(jf_c, jc);
+            _mm256_storeu_pd(jf_d, jd);
 
-                // Compute face area
-                double area_f = 0.5 * ((tsa[f].P[1] - tsa[f].P[0]) ^ (tsa[f].P[2] - tsa[f].P[0])).Norm();
-                batch_area += area_f;
+            // Compute Area
+            // area = 0.5 * norm( (p1-p0) ^ (p2-p0) ) using target shape
+            // (p1-p0) etc are 3D. tsa is AoS.
+            __m256d p0x = _mm256_set_pd(tsa[f3].P[0].X(), tsa[f2].P[0].X(), tsa[f1].P[0].X(), tsa[f0].P[0].X());
+            __m256d p0y = _mm256_set_pd(tsa[f3].P[0].Y(), tsa[f2].P[0].Y(), tsa[f1].P[0].Y(), tsa[f0].P[0].Y());
+            __m256d p0z = _mm256_set_pd(tsa[f3].P[0].Z(), tsa[f2].P[0].Z(), tsa[f1].P[0].Z(), tsa[f0].P[0].Z());
 
-                // We'll compute energy after SVD
-            }
+            __m256d p1x = _mm256_set_pd(tsa[f3].P[1].X(), tsa[f2].P[1].X(), tsa[f1].P[1].X(), tsa[f0].P[1].X());
+            __m256d p1y = _mm256_set_pd(tsa[f3].P[1].Y(), tsa[f2].P[1].Y(), tsa[f1].P[1].Y(), tsa[f0].P[1].Y());
+            __m256d p1z = _mm256_set_pd(tsa[f3].P[1].Z(), tsa[f2].P[1].Z(), tsa[f1].P[1].Z(), tsa[f0].P[1].Z());
+
+            __m256d p2x = _mm256_set_pd(tsa[f3].P[2].X(), tsa[f2].P[2].X(), tsa[f1].P[2].X(), tsa[f0].P[2].X());
+            __m256d p2y = _mm256_set_pd(tsa[f3].P[2].Y(), tsa[f2].P[2].Y(), tsa[f1].P[2].Y(), tsa[f0].P[2].Y());
+            __m256d p2z = _mm256_set_pd(tsa[f3].P[2].Z(), tsa[f2].P[2].Z(), tsa[f1].P[2].Z(), tsa[f0].P[2].Z());
+
+            __m256d v1x = _mm256_sub_pd(p1x, p0x);
+            __m256d v1y = _mm256_sub_pd(p1y, p0y);
+            __m256d v1z = _mm256_sub_pd(p1z, p0z);
+            __m256d v2x = _mm256_sub_pd(p2x, p0x);
+            __m256d v2y = _mm256_sub_pd(p2y, p0y);
+            __m256d v2z = _mm256_sub_pd(p2z, p0z);
+
+            // Cross product
+            __m256d cx = _mm256_sub_pd(_mm256_mul_pd(v1y, v2z), _mm256_mul_pd(v1z, v2y));
+            __m256d cy = _mm256_sub_pd(_mm256_mul_pd(v1z, v2x), _mm256_mul_pd(v1x, v2z));
+            __m256d cz = _mm256_sub_pd(_mm256_mul_pd(v1x, v2y), _mm256_mul_pd(v1y, v2x));
+
+            __m256d normSq = _mm256_add_pd(_mm256_mul_pd(cx,cx), _mm256_add_pd(_mm256_mul_pd(cy,cy), _mm256_mul_pd(cz,cz)));
+            __m256d area = _mm256_mul_pd(_mm256_set1_pd(0.5), _mm256_sqrt_pd(normSq));
+
+            // Accumulate area
+            alignas(32) double tmp_area[4];
+            _mm256_storeu_pd(tmp_area, area);
+            total_area += tmp_area[0] + tmp_area[1] + tmp_area[2] + tmp_area[3];
 
             // Batched SVD
             arap_simd::batch_svd2x2_avx2(jf_a, jf_b, jf_c, jf_d,
@@ -706,18 +868,17 @@ double ARAP::CurrentEnergySIMD()
                                           v00, v01, v10, v11,
                                           sigma0, sigma1);
 
-            // Compute energy for each face in batch
-            for (int k = 0; k < batch_size; ++k) {
-                int idx = fi + k;
-                auto& f = m.face[idx];
-                double area_f = 0.5 * ((tsa[f].P[1] - tsa[f].P[0]) ^ (tsa[f].P[2] - tsa[f].P[0])).Norm();
-                double s0_diff = sigma0[k] - 1.0;
-                double s1_diff = sigma1[k] - 1.0;
-                batch_e += area_f * (s0_diff * s0_diff + s1_diff * s1_diff);
-            }
+            // Calculate Energy: area * ((s0-1)^2 + (s1-1)^2)
+            __m256d s0 = _mm256_loadu_pd(sigma0);
+            __m256d s1 = _mm256_loadu_pd(sigma1);
+            __m256d one = _mm256_set1_pd(1.0);
+            __m256d d0 = _mm256_sub_pd(s0, one);
+            __m256d d1 = _mm256_sub_pd(s1, one);
+            __m256d e_vec = _mm256_mul_pd(area, _mm256_add_pd(_mm256_mul_pd(d0, d0), _mm256_mul_pd(d1, d1)));
 
-            e += batch_e;
-            total_area += batch_area;
+            alignas(32) double tmp_e[4];
+            _mm256_storeu_pd(tmp_e, e_vec);
+            e += tmp_e[0] + tmp_e[1] + tmp_e[2] + tmp_e[3];
         }
     }
 
@@ -968,6 +1129,17 @@ ARAPSolveInfo ARAP::Solve()
     }
 
     LOG_DEBUG << "ARAP: Energy after optimization is " << CurrentEnergySIMD() << " (" << iter << " iterations)";
+
+#ifdef ARAP_ENABLE_TIMING
+    if (iter > 0) {
+        LOG_INFO << "ARAP Timing (total " << iter << " iterations):";
+        LOG_INFO << "  Precompute: " << si.timePrecompute_ms << " ms";
+        LOG_INFO << "  Rotations:  " << si.timeRotations_ms << " ms (" << si.timeRotations_ms / iter << " ms/iter)";
+        LOG_INFO << "  RHS:        " << si.timeRHS_ms << " ms (" << si.timeRHS_ms / iter << " ms/iter)";
+        LOG_INFO << "  Solve:      " << si.timeSolve_ms << " ms (" << si.timeSolve_ms / iter << " ms/iter)";
+        LOG_INFO << "  Energy:     " << si.timeEnergy_ms << " ms (" << si.timeEnergy_ms / (iter + 1) << " ms/iter)";
+    }
+#endif
 
     // Final update for wedges
     for (auto& f : m.face) {

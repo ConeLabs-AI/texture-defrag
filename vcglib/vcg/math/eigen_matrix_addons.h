@@ -26,7 +26,7 @@
 #endif
 
 enum {Dimension = SizeAtCompileTime};
-typedef typename ei_to_vcgtype<Matrix>::type EquivVcgType;
+typedef typename ei_to_vcgtype_t<Matrix>::type EquivVcgType;
 typedef vcg::VoidType   ParamType;
 typedef Matrix          PointType;
 using Base::V;
@@ -43,7 +43,7 @@ operator const EquivVcgType& () const { return *reinterpret_cast<const EquivVcgT
 template<typename OtherDerived>
 inline void Import(const MatrixBase<OtherDerived>& b)
 {
-	ei_import_selector<Matrix,OtherDerived>::run(*this,b.derived());
+	ei_import_selector_t<Matrix,OtherDerived>::run(*this,b.derived());
 }
 
 /// constructor for points with different scalar type and-or dimensionality
@@ -135,7 +135,7 @@ void ToPolar(Scalar &ro, Scalar &theta, Scalar &phi) const
 void FromPolar(const Scalar &ro, const Scalar &theta, const Scalar &phi)
 {
 	EIGEN_STATIC_ASSERT_VECTOR_SPECIFIC_SIZE(Matrix,3);
-	data()[0]= ro*ei_cos(theta)*ei_cos(phi);
-	data()[1]= ro*ei_sin(phi);
-	data()[2]= ro*ei_sin(theta)*ei_cos(phi);
+	data()[0]= ro*std::cos(theta)*std::cos(phi);
+	data()[1]= ro*std::sin(phi);
+	data()[2]= ro*std::sin(theta)*std::cos(phi);
 }

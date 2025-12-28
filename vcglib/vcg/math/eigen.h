@@ -36,23 +36,9 @@
 // forward declarations
 namespace Eigen {
 
-template<typename T> struct ei_traits;
-template<typename A,typename B> struct ei_is_same_type;
-
 template<typename Derived1, typename Derived2, int Size> struct ei_lexi_comparison;
-
-template<typename Derived1, typename Derived2,
-	bool SameType = ei_is_same_type<Derived1,Derived2>::ret,
-	bool SameSize = Derived1::SizeAtCompileTime==Derived2::SizeAtCompileTime>
-struct ei_import_selector;
-
-template<typename XprType,
-	int Rows = ei_traits<XprType>::RowsAtCompileTime,
-	int Cols = ei_traits<XprType>::ColsAtCompileTime,
-	int StorageOrder = ei_traits<XprType>::Flags&1,
-	int MRows = ei_traits<XprType>::MaxRowsAtCompileTime,
-	int MCols = ei_traits<XprType>::MaxColsAtCompileTime>
-struct ei_to_vcgtype;
+template<typename Derived1, typename Derived2, bool SameType, bool SameSize> struct ei_import_selector;
+template<typename XprType, int Rows, int Cols, int StorageOrder, int MRows, int MCols> struct ei_to_vcgtype;
 
 }
 
@@ -63,6 +49,21 @@ struct ei_to_vcgtype;
 
 // add support for unsigned char and short int
 namespace Eigen {
+
+// Helper alias template for ei_to_vcgtype with default arguments (must be after Eigen includes)
+template<typename XprType>
+using ei_to_vcgtype_t = ei_to_vcgtype<XprType,
+	internal::traits<XprType>::RowsAtCompileTime,
+	internal::traits<XprType>::ColsAtCompileTime,
+	internal::traits<XprType>::Flags&1,
+	internal::traits<XprType>::MaxRowsAtCompileTime,
+	internal::traits<XprType>::MaxColsAtCompileTime>;
+
+// Helper alias template for ei_import_selector with default arguments
+template<typename Derived1, typename Derived2>
+using ei_import_selector_t = ei_import_selector<Derived1, Derived2,
+	std::is_same<Derived1,Derived2>::value,
+	Derived1::SizeAtCompileTime==Derived2::SizeAtCompileTime>;
 
 template<> struct NumTraits<unsigned char>
 {
@@ -251,7 +252,7 @@ struct ei_to_vcgtype { typedef Matrix<typename XprType::Scalar,Rows,Cols,Storage
 namespace vcg {
 
 template<typename Derived1, typename Derived2>
-typename Eigen::ei_traits<Derived1>::Scalar
+typename Eigen::internal::traits<Derived1>::Scalar
 Angle(const Eigen::MatrixBase<Derived1>& p1, const Eigen::MatrixBase<Derived2> & p2)
 {
 	EIGEN_STATIC_ASSERT_VECTOR_ONLY(Derived1)
@@ -259,7 +260,7 @@ Angle(const Eigen::MatrixBase<Derived1>& p1, const Eigen::MatrixBase<Derived2> &
 	EIGEN_STATIC_ASSERT_FIXED_SIZE(Derived1)
 	EIGEN_STATIC_ASSERT_FIXED_SIZE(Derived2)
 	EIGEN_STATIC_ASSERT_SAME_VECTOR_SIZE(Derived1,Derived2)
-	typedef typename Eigen::ei_traits<Derived1>::Scalar Scalar;
+	typedef typename Eigen::internal::traits<Derived1>::Scalar Scalar;
 
 	Scalar w = p1.norm()*p2.norm();
 	if(w==0) return Scalar(-1);
@@ -270,7 +271,7 @@ Angle(const Eigen::MatrixBase<Derived1>& p1, const Eigen::MatrixBase<Derived2> &
 }
 
 template<typename Derived1, typename Derived2>
-typename Eigen::ei_traits<Derived1>::Scalar
+typename Eigen::internal::traits<Derived1>::Scalar
 AngleN(const Eigen::MatrixBase<Derived1>& p1, const Eigen::MatrixBase<Derived2> & p2)
 {
 	EIGEN_STATIC_ASSERT_VECTOR_ONLY(Derived1)
@@ -278,7 +279,7 @@ AngleN(const Eigen::MatrixBase<Derived1>& p1, const Eigen::MatrixBase<Derived2> 
 	EIGEN_STATIC_ASSERT_FIXED_SIZE(Derived1)
 	EIGEN_STATIC_ASSERT_FIXED_SIZE(Derived2)
 	EIGEN_STATIC_ASSERT_SAME_VECTOR_SIZE(Derived1,Derived2)
-	typedef typename Eigen::ei_traits<Derived1>::Scalar Scalar;
+	typedef typename Eigen::internal::traits<Derived1>::Scalar Scalar;
 
 	Scalar t = (p1.dot(p2));
 	if(t>1) t = 1;
@@ -287,27 +288,26 @@ AngleN(const Eigen::MatrixBase<Derived1>& p1, const Eigen::MatrixBase<Derived2> 
 }
 
 template<typename Derived1>
-inline typename Eigen::ei_traits<Derived1>::Scalar Norm( const Eigen::MatrixBase<Derived1>& p)
+inline typename Eigen::internal::traits<Derived1>::Scalar Norm( const Eigen::MatrixBase<Derived1>& p)
 { return p.norm(); }
 
 template<typename Derived1>
-inline typename Eigen::ei_traits<Derived1>::Scalar SquaredNorm( const Eigen::MatrixBase<Derived1>& p)
+inline typename Eigen::internal::traits<Derived1>::Scalar SquaredNorm( const Eigen::MatrixBase<Derived1>& p)
 { return p.squaredNorm(); }
 
 template<typename Derived1, typename Derived2>
-inline typename Eigen::ei_traits<Derived1>::Scalar
+inline typename Eigen::internal::traits<Derived1>::Scalar
 Distance(const Eigen::MatrixBase<Derived1>& p1, const Eigen::MatrixBase<Derived2> & p2)
 { return (p1-p2).norm(); }
 
 template<typename Derived1, typename Derived2>
-inline typename Eigen::ei_traits<Derived1>::Scalar
+inline typename Eigen::internal::traits<Derived1>::Scalar
 SquaredDistance(const Eigen::MatrixBase<Derived1>& p1, const Eigen::MatrixBase<Derived2> & p2)
 { return (p1-p2).squaredNorm(); }
 
 template<typename Derived>
-inline const Eigen::CwiseUnaryOp<Eigen::ei_scalar_abs_op<typename Eigen::ei_traits<Derived>::Scalar>, Derived>
-Abs(const Eigen::MatrixBase<Derived>& p)
-{ return p.cwise().abs(); }
+inline auto Abs(const Eigen::MatrixBase<Derived>& p) -> decltype(p.cwiseAbs())
+{ return p.cwiseAbs(); }
 
 /** \deprecated use transposeInPlace() or transpose() */
 template<typename Scalar,int Size,int StorageOrder>
@@ -316,11 +316,8 @@ Transpose(const Eigen::Matrix<Scalar,Size,Size,StorageOrder>& m)
 { return m.transposeInPlace(); return m; }
 
 template<typename Derived>
-inline const Eigen::CwiseBinaryOp<Eigen::ei_scalar_max_op<typename Eigen::ei_traits<Derived>::Scalar>,
-																	Derived,
-																	Eigen::NestByValue<typename Derived::ConstantReturnType> >
-LowClampToZero(const Eigen::MatrixBase<Derived>& p)
-{ return p.cwise().max(Derived::Zero().nestByValue()); }
+inline auto LowClampToZero(const Eigen::MatrixBase<Derived>& p) -> decltype(p.cwiseMax(Derived::Zero()))
+{ return p.cwiseMax(Derived::Zero()); }
 
 }
 

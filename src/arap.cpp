@@ -243,40 +243,49 @@ void ARAP::ComputeRotationsSIMD(Mesh& m)
 
     #pragma omp parallel for firstprivate(jf_a, jf_b, jf_c, jf_d, u00, u01, u10, u11, v00, v01, v10, v11, sigma0, sigma1, r00, r01, r10, r11)
     for (int fi = 0; fi < nf_aligned; fi += batch_size) {
-        // Load and compute Jacobians for 4 faces
-        for (int k = 0; k < batch_size; ++k) {
-            int idx = fi + k;
-            auto& f = m.face[idx];
+        // Gather input vectors (Local Frame Coords) - Vectorized Load
+        __m256d x10_x = _mm256_loadu_pd(&soa_local_coords.x1[fi]);
+        __m256d x10_y = _mm256_loadu_pd(&soa_local_coords.y1[fi]);
+        __m256d x20_x = _mm256_loadu_pd(&soa_local_coords.x2[fi]);
+        __m256d x20_y = _mm256_loadu_pd(&soa_local_coords.y2[fi]);
 
-            // Get local frame coordinates
-            double x10_x = soa_local_coords.x1[idx];
-            double x10_y = soa_local_coords.y1[idx];
-            double x20_x = soa_local_coords.x2[idx];
-            double x20_y = soa_local_coords.y2[idx];
+        // Gather UV coordinates (AoS -> registers) - Vectorized Gather
+        auto& f0 = m.face[fi+0];
+        auto& f1 = m.face[fi+1];
+        auto& f2 = m.face[fi+2];
+        auto& f3 = m.face[fi+3];
 
-            // Current UV coordinates
-            double u10_x = f.WT(1).P().X() - f.WT(0).P().X();
-            double u10_y = f.WT(1).P().Y() - f.WT(0).P().Y();
-            double u20_x = f.WT(2).P().X() - f.WT(0).P().X();
-            double u20_y = f.WT(2).P().Y() - f.WT(0).P().Y();
+        // Note: set_pd is high-to-low (3,2,1,0)
+        __m256d u10_x = _mm256_set_pd(f3.WT(1).P().X() - f3.WT(0).P().X(), f2.WT(1).P().X() - f2.WT(0).P().X(), f1.WT(1).P().X() - f1.WT(0).P().X(), f0.WT(1).P().X() - f0.WT(0).P().X());
+        __m256d u10_y = _mm256_set_pd(f3.WT(1).P().Y() - f3.WT(0).P().Y(), f2.WT(1).P().Y() - f2.WT(0).P().Y(), f1.WT(1).P().Y() - f1.WT(0).P().Y(), f0.WT(1).P().Y() - f0.WT(0).P().Y());
+        __m256d u20_x = _mm256_set_pd(f3.WT(2).P().X() - f3.WT(0).P().X(), f2.WT(2).P().X() - f2.WT(0).P().X(), f1.WT(2).P().X() - f1.WT(0).P().X(), f0.WT(2).P().X() - f0.WT(0).P().X());
+        __m256d u20_y = _mm256_set_pd(f3.WT(2).P().Y() - f3.WT(0).P().Y(), f2.WT(2).P().Y() - f2.WT(0).P().Y(), f1.WT(2).P().Y() - f1.WT(0).P().Y(), f0.WT(2).P().Y() - f0.WT(0).P().Y());
 
-            // Compute Jacobian: J = G * F^-1 where F = [x10, x20], G = [u10, u20]
-            // F^-1 = (1/det) * [[x20_y, -x20_x], [-x10_y, x10_x]]
-            double det = x10_x * x20_y - x20_x * x10_y;
-            if (std::abs(det) < 1e-300) det = 1e-300;
-            double inv_det = 1.0 / det;
+        // Compute Jacobian J = U * F^-1 (Vectorized)
+        // F^-1 = (1/det) * [[x20_y, -x20_x], [-x10_y, x10_x]]
+        __m256d det = _mm256_sub_pd(_mm256_mul_pd(x10_x, x20_y), _mm256_mul_pd(x20_x, x10_y));
 
-            double f_inv00 = x20_y * inv_det;
-            double f_inv01 = -x20_x * inv_det;
-            double f_inv10 = -x10_y * inv_det;
-            double f_inv11 = x10_x * inv_det;
+        // Protect small det
+        __m256d eps = _mm256_set1_pd(1e-300);
+        __m256d mask = _mm256_cmp_pd(_mm256_andnot_pd(_mm256_set1_pd(-0.0), det), eps, _CMP_LT_OQ);
+        det = _mm256_blendv_pd(det, eps, mask); 
+        __m256d inv_det = _mm256_div_pd(_mm256_set1_pd(1.0), det);
 
-            // J = G * F^-1
-            jf_a[k] = u10_x * f_inv00 + u20_x * f_inv10;
-            jf_b[k] = u10_x * f_inv01 + u20_x * f_inv11;
-            jf_c[k] = u10_y * f_inv00 + u20_y * f_inv10;
-            jf_d[k] = u10_y * f_inv01 + u20_y * f_inv11;
-        }
+        __m256d finv00 = _mm256_mul_pd(x20_y, inv_det);
+        __m256d finv01 = _mm256_mul_pd(_mm256_sub_pd(_mm256_setzero_pd(), x20_x), inv_det);
+        __m256d finv10 = _mm256_mul_pd(_mm256_sub_pd(_mm256_setzero_pd(), x10_y), inv_det);
+        __m256d finv11 = _mm256_mul_pd(x10_x, inv_det);
+
+        // J = G * F^-1
+        __m256d ja = _mm256_add_pd(_mm256_mul_pd(u10_x, finv00), _mm256_mul_pd(u20_x, finv10));
+        __m256d jb = _mm256_add_pd(_mm256_mul_pd(u10_x, finv01), _mm256_mul_pd(u20_x, finv11));
+        __m256d jc = _mm256_add_pd(_mm256_mul_pd(u10_y, finv00), _mm256_mul_pd(u20_y, finv10));
+        __m256d jd = _mm256_add_pd(_mm256_mul_pd(u10_y, finv01), _mm256_mul_pd(u20_y, finv11));
+
+        _mm256_storeu_pd(jf_a, ja);
+        _mm256_storeu_pd(jf_b, jb);
+        _mm256_storeu_pd(jf_c, jc);
+        _mm256_storeu_pd(jf_d, jd);
 
         // Batched SVD
         arap_simd::batch_svd2x2_avx2(jf_a, jf_b, jf_c, jf_d,
@@ -386,70 +395,6 @@ void ARAP::ComputeRotationsSIMD(Mesh& m)
                                               soa_rotations.r10[fi], soa_rotations.r11[fi]);
     }
 #endif
-}
-
-void ARAP::ComputeRHS(Mesh& m, const std::vector<Eigen::Matrix2d>& rotations, const std::vector<Cot>& cotan, Eigen::VectorXd& bu, Eigen::VectorXd& bv)
-{
-    bu.setZero(n_free_verts);
-    bv.setZero(n_free_verts);
-
-    #pragma omp parallel
-    {
-        Eigen::VectorXd bu_private = Eigen::VectorXd::Zero(n_free_verts);
-        Eigen::VectorXd bv_private = Eigen::VectorXd::Zero(n_free_verts);
-        #pragma omp for nowait
-        for (int fi = 0; fi < m.FN(); ++fi) {
-            auto &f = m.face[fi];
-            const Eigen::Matrix2d& Rf = rotations[fi];
-            const auto& t = local_frame_coords[fi];
-
-            for (int i = 0; i < 3; ++i) {
-                int global_i = (int) tri::Index(m, f.V0(i));
-                int local_i = global_to_local_idx[global_i];
-
-                if (local_i != -1) {
-                    int j_local_idx = (i+1)%3;
-                    int k_local_idx = (i+2)%3;
-
-                    int global_j = (int) tri::Index(m, f.V1(i));
-                    int global_k = (int) tri::Index(m, f.V2(i));
-                    int local_j = global_to_local_idx[global_j];
-                    int local_k = global_to_local_idx[global_k];
-
-                    double weight_ij = cotan[fi].v[k_local_idx];
-                    double weight_ik = cotan[fi].v[j_local_idx];
-
-                    if (!std::isfinite(weight_ij)) weight_ij = 1e-8;
-                    if (!std::isfinite(weight_ik)) weight_ik = 1e-8;
-
-                    // 1. Standard ARAP Rotation Forces
-                    Eigen::Vector2d x_ij = t[i] - t[j_local_idx];
-                    Eigen::Vector2d x_ik = t[i] - t[k_local_idx];
-                    Eigen::Vector2d rhs_rot = (weight_ij * Rf) * x_ij + (weight_ik * Rf) * x_ik;
-
-                    bu_private(local_i) += rhs_rot.x();
-                    bv_private(local_i) += rhs_rot.y();
-
-                    // 2. Fixed Vertex Pull (Boundary Conditions)
-                    if (local_j == -1) {
-                        vcg::Point2d fixed_pos_j = m.vert[global_j].T().P();
-                        bu_private(local_i) += weight_ij * fixed_pos_j.X();
-                        bv_private(local_i) += weight_ij * fixed_pos_j.Y();
-                    }
-                    if (local_k == -1) {
-                        vcg::Point2d fixed_pos_k = m.vert[global_k].T().P();
-                        bu_private(local_i) += weight_ik * fixed_pos_k.X();
-                        bv_private(local_i) += weight_ik * fixed_pos_k.Y();
-                    }
-                }
-            }
-        }
-        #pragma omp critical
-        {
-            bu += bu_private;
-            bv += bv_private;
-        }
-    }
 }
 
 void ARAP::ComputeRHSSIMD(Mesh& m, const std::vector<Cot>& cotan, Eigen::VectorXd& bu, Eigen::VectorXd& bv)
@@ -1163,7 +1108,6 @@ ARAPSolveInfo ARAP::Solve()
 void ARAP::PrecomputeData()
 {
     const int nf = m.FN();
-    local_frame_coords.resize(nf);
 
     // Allocate SoA structures
     soa_local_coords.resize(nf);
@@ -1175,11 +1119,6 @@ void ARAP::PrecomputeData()
         auto& f = m.face[fi];
         Eigen::Vector2d x_10, x_20;
         LocalIsometry(tsa[f].P[1] - tsa[f].P[0], tsa[f].P[2] - tsa[f].P[0], x_10, x_20);
-
-        // Store in AoS format (for legacy code compatibility)
-        local_frame_coords[fi][0] = Eigen::Vector2d::Zero();
-        local_frame_coords[fi][1] = x_10;
-        local_frame_coords[fi][2] = x_20;
 
         // Store in SoA format (for SIMD code)
         soa_local_coords.x1[fi] = x_10[0];

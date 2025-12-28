@@ -114,8 +114,6 @@ private:
     // The Solver (Persistent)
     Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
 
-    std::vector<std::array<Eigen::Vector2d, 3>> local_frame_coords;
-
     // SoA data for SIMD-optimized processing
     SoALocalCoords soa_local_coords;
     SoARotations soa_rotations;
@@ -124,7 +122,6 @@ private:
     bool verbose = false;
 
     void ComputeSystemMatrix(Mesh& m, const std::vector<Cot>& cotan, Eigen::SparseMatrix<double>& L);
-    void ComputeRHS(Mesh& m, const std::vector<Eigen::Matrix2d>& rotations, const std::vector<Cot>& cotan, Eigen::VectorXd& bu, Eigen::VectorXd& bv);
     void ComputeRHSSIMD(Mesh& m, const std::vector<Cot>& cotan, Eigen::VectorXd& bu, Eigen::VectorXd& bv);
     void PrecomputeData();
     void ComputeRotationsSIMD(Mesh& m);

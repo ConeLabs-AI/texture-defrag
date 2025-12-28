@@ -33,6 +33,26 @@
 #include <chrono>
 #define ARAP_TIMER_START(name) auto timer_##name = std::chrono::high_resolution_clock::now()
 #define ARAP_TIMER_END(name, var) var = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - timer_##name).count()
+
+ARAP::AggregateStats ARAP::globalStats;
+
+void ARAP::PrintAggregateStats() {
+    if (globalStats.call_count == 0) return;
+    LOG_INFO << "======= ARAP AGGREGATE STATS (" << globalStats.call_count << " calls) =======";
+    LOG_INFO << "Total Time:  " << std::fixed << std::setprecision(3) << globalStats.total_time_ms << " ms";
+    LOG_INFO << "  Precompute: " << globalStats.precompute_ms << " ms";
+    if (globalStats.total_iterations > 0) {
+        LOG_INFO << "  Rotations:  " << globalStats.rotations_ms << " ms (" << (globalStats.rotations_ms / globalStats.total_iterations) << " ms/iter)";
+        LOG_INFO << "  RHS:        " << globalStats.rhs_ms << " ms (" << (globalStats.rhs_ms / globalStats.total_iterations) << " ms/iter)";
+        LOG_INFO << "  Solve:      " << globalStats.solve_ms << " ms (" << (globalStats.solve_ms / globalStats.total_iterations) << " ms/iter)";
+    }
+    LOG_INFO << "  Energy:     " << globalStats.energy_ms << " ms";
+    LOG_INFO << "Total Iters: " << globalStats.total_iterations;
+    LOG_INFO << "Problem Sizes: <100: " << globalStats.count_small 
+             << ", 100-1k: " << globalStats.count_medium 
+             << ", >1k: " << globalStats.count_large;
+    LOG_INFO << "=================================================";
+}
 #else
 #define ARAP_TIMER_START(name)
 #define ARAP_TIMER_END(name, var)
@@ -914,6 +934,10 @@ ARAPSolveInfo ARAP::Solve()
         si.finalEnergy = e_curr;
 
         double delta_e = e - e_curr;
+        if (verbose && iter < 50) {
+            LOG_INFO << "    [ARAP] Iteration " << iter << ": energy " << e_curr << " (delta " << delta_e << ")";
+        }
+
         if (delta_e < 1e-8) {
             LOG_DEBUG << "ARAP: convergence reached (change in the energy value is too small)";
             converged = true;
@@ -945,17 +969,6 @@ ARAPSolveInfo ARAP::Solve()
 
     LOG_DEBUG << "ARAP: Energy after optimization is " << CurrentEnergySIMD() << " (" << iter << " iterations)";
 
-#ifdef ARAP_ENABLE_TIMING
-    if (iter > 0) {
-        LOG_INFO << "ARAP Timing (total " << iter << " iterations):";
-        LOG_INFO << "  Precompute: " << si.timePrecompute_ms << " ms";
-        LOG_INFO << "  Rotations:  " << si.timeRotations_ms << " ms (" << si.timeRotations_ms / iter << " ms/iter)";
-        LOG_INFO << "  RHS:        " << si.timeRHS_ms << " ms (" << si.timeRHS_ms / iter << " ms/iter)";
-        LOG_INFO << "  Solve:      " << si.timeSolve_ms << " ms (" << si.timeSolve_ms / iter << " ms/iter)";
-        LOG_INFO << "  Energy:     " << si.timeEnergy_ms << " ms (" << si.timeEnergy_ms / (iter + 1) << " ms/iter)";
-    }
-#endif
-
     // Final update for wedges
     for (auto& f : m.face) {
         for (int i = 0; i < 3; ++i) {
@@ -965,7 +978,19 @@ ARAPSolveInfo ARAP::Solve()
 
 #ifdef ARAP_ENABLE_TIMING
     ARAP_TIMER_END(total, si.timeTotal_ms);
-    LOG_INFO << "  Total:      " << si.timeTotal_ms << " ms";
+
+    globalStats.total_time_ms += si.timeTotal_ms;
+    globalStats.precompute_ms += si.timePrecompute_ms;
+    globalStats.rotations_ms += si.timeRotations_ms;
+    globalStats.rhs_ms += si.timeRHS_ms;
+    globalStats.solve_ms += si.timeSolve_ms;
+    globalStats.energy_ms += si.timeEnergy_ms;
+    globalStats.total_iterations += si.iterations;
+    globalStats.call_count++;
+
+    if (n_free_verts < 100) globalStats.count_small++;
+    else if (n_free_verts < 1000) globalStats.count_medium++;
+    else globalStats.count_large++;
 #endif
 
     return si;

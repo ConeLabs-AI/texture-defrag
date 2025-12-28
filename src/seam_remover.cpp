@@ -86,7 +86,7 @@ static void ComputeOptimizationArea(SeamData& sd, Mesh& mesh, OffsetMap& om);
 static std::unordered_set<Mesh::VertexPointer> ComputeVerticesWithinOffsetThreshold(Mesh& m, const OffsetMap& om, const SeamData& sd);
 static CheckStatus CheckBoundaryAfterAlignment(SeamData& sd);
 static CheckStatus CheckAfterLocalOptimization(SeamData& sd, AlgoStateHandle state, const AlgoParameters& params);
-static CheckStatus OptimizeChart(SeamData& sd, GraphHandle graph, bool fixIntersectingEdges);
+static CheckStatus OptimizeChart(SeamData& sd, GraphHandle graph, bool fixIntersectingEdges, bool verbose = false);
 static void AcceptMove(const SeamData& sd, AlgoStateHandle state, GraphHandle graph, const AlgoParameters& params);
 static void RejectMove(const SeamData& sd, AlgoStateHandle state, GraphHandle graph, CheckStatus status);
 static void EraseSeam(ClusteredSeamHandle csh, AlgoStateHandle state, GraphHandle graph);
@@ -228,7 +228,7 @@ static void LogMemoryUsage()
 #endif
 }
 
-void LogExecutionStats()
+void LogExecutionStats(bool final = false)
 {
     LogMemoryUsage();
     LOG_INFO    << "======== EXECUTION STATS ========";
@@ -250,15 +250,30 @@ void LogExecutionStats()
     LOG_INFO    << "REJECT     " << std::fixed << std::setprecision(3) << perf.t_reject / perf.timer.TimeElapsed()                              << " , " << std::defaultfloat << std::setprecision(6)<< perf.t_reject << " secs";
     LOG_INFO    << "  count:                    " << reject;
     LOG_INFO    << "  with retry:               " << num_retry - retry_success;
-    LOG_VERBOSE << "  local overlaps            " << statsCheck[FAIL_LOCAL_OVERLAP];
-    LOG_VERBOSE << "  global overlaps before    " << statsCheck[FAIL_GLOBAL_OVERLAP_BEFORE];
-    LOG_VERBOSE << "  global overlaps after opt " << statsCheck[FAIL_GLOBAL_OVERLAP_AFTER_OPT];
-    LOG_VERBOSE << "  global overlaps after bnd " << statsCheck[FAIL_GLOBAL_OVERLAP_AFTER_BND];
-    LOG_VERBOSE << "  global overlaps unfixable " << statsCheck[FAIL_GLOBAL_OVERLAP_UNFIXABLE];
-    LOG_VERBOSE << "  distortion (local)        " << statsCheck[FAIL_DISTORTION_LOCAL];
-    LOG_VERBOSE << "  distortion (global)       " << statsCheck[FAIL_DISTORTION_GLOBAL];
-    LOG_VERBOSE << "  topology                  " << statsCheck[FAIL_TOPOLOGY];
-    LOG_VERBOSE << "  numerical error           " << statsCheck[FAIL_NUMERICAL_ERROR];
+
+    if (final) {
+        LOG_INFO << "REJECTION REASONS:";
+        LOG_INFO << "  local overlaps            " << statsCheck[FAIL_LOCAL_OVERLAP];
+        LOG_INFO << "  global overlaps before    " << statsCheck[FAIL_GLOBAL_OVERLAP_BEFORE];
+        LOG_INFO << "  global overlaps after opt " << statsCheck[FAIL_GLOBAL_OVERLAP_AFTER_OPT];
+        LOG_INFO << "  global overlaps after bnd " << statsCheck[FAIL_GLOBAL_OVERLAP_AFTER_BND];
+        LOG_INFO << "  global overlaps unfixable " << statsCheck[FAIL_GLOBAL_OVERLAP_UNFIXABLE];
+        LOG_INFO << "  distortion (local)        " << statsCheck[FAIL_DISTORTION_LOCAL];
+        LOG_INFO << "  distortion (global)       " << statsCheck[FAIL_DISTORTION_GLOBAL];
+        LOG_INFO << "  topology                  " << statsCheck[FAIL_TOPOLOGY];
+        LOG_INFO << "  numerical error           " << statsCheck[FAIL_NUMERICAL_ERROR];
+    } else {
+        LOG_VERBOSE << "  local overlaps            " << statsCheck[FAIL_LOCAL_OVERLAP];
+        LOG_VERBOSE << "  global overlaps before    " << statsCheck[FAIL_GLOBAL_OVERLAP_BEFORE];
+        LOG_VERBOSE << "  global overlaps after opt " << statsCheck[FAIL_GLOBAL_OVERLAP_AFTER_OPT];
+        LOG_VERBOSE << "  global overlaps after bnd " << statsCheck[FAIL_GLOBAL_OVERLAP_AFTER_BND];
+        LOG_VERBOSE << "  global overlaps unfixable " << statsCheck[FAIL_GLOBAL_OVERLAP_UNFIXABLE];
+        LOG_VERBOSE << "  distortion (local)        " << statsCheck[FAIL_DISTORTION_LOCAL];
+        LOG_VERBOSE << "  distortion (global)       " << statsCheck[FAIL_DISTORTION_GLOBAL];
+        LOG_VERBOSE << "  topology                  " << statsCheck[FAIL_TOPOLOGY];
+        LOG_VERBOSE << "  numerical error           " << statsCheck[FAIL_NUMERICAL_ERROR];
+    }
+
     LOG_VERBOSE << "    FEASIBILITY";
     LOG_VERBOSE << "      feasible              " << feasibility[CostInfo::FEASIBLE];
     LOG_VERBOSE << "      unfeasible boundary   " << feasibility[CostInfo::UNFEASIBLE_BOUNDARY];
@@ -267,6 +282,9 @@ void LogExecutionStats()
     LOG_VERBOSE << "Minimum computed cost is " << mincost;
     LOG_VERBOSE << "Maximum computed cost is " << maxcost;
     LOG_INFO    << "===================================";
+#ifdef ARAP_ENABLE_TIMING
+    ARAP::PrintAggregateStats();
+#endif
 }
 
 static void PrintStateInfo(AlgoStateHandle state, GraphHandle graph, const AlgoParameters& params)
@@ -408,15 +426,16 @@ void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoPara
     LOG_INFO << "Atlas energy before optimization is " << ARAP::ComputeEnergyFromStoredWedgeTC(graph->mesh, nullptr, nullptr);
     LOG_INFO << "Starting greedy optimization loop with " << state->queue.size() << " operations...";
 
-    // Use a relative logging frequency (e.g., every 5% of estimated total, or min 5000)
+    // Use a relative logging frequency (e.g., every 1% of estimated total, or min 2500)
     // to avoid excessive logs on very large models (1M+ charts).
     size_t nCharts = graph->Count();
-    int logInterval = std::max(5000, (int)(nCharts / 20));
+    int logInterval = std::max(1000, (int)(nCharts / 100));
     LOG_INFO << "Log frequency set to every " << logInterval << " iterations (based on " << nCharts << " charts).";
 
+    const int DETAILED_LOG_THRESHOLD = 50;
     int k = 0;
     while (state->queue.size() > 0) {
-        if (k < 100) {
+        if (k < DETAILED_LOG_THRESHOLD) {
             LOG_INFO << "Iteration " << k << " - Queue size: " << state->queue.size();
         }
 
@@ -464,7 +483,7 @@ void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoPara
             SeamData sd;
             ComputeSeamData(sd, ws.first, graph, state);
 
-            if (k <= 100) {
+            if (k <= DETAILED_LOG_THRESHOLD) {
                 LOG_INFO << "  [Iter " << k << "] Processing charts " << sd.a->id << " and " << sd.b->id
                          << " (areas UV: " << sd.a->AreaUV() << ", " << sd.b->AreaUV() << ")";
             }
@@ -475,7 +494,7 @@ void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoPara
 
             ComputeOptimizationArea(sd, graph->mesh, om);
 
-            if (k <= 100) {
+            if (k <= DETAILED_LOG_THRESHOLD) {
                 LOG_INFO << "  [Iter " << k << "] Optimization area size: " << sd.optimizationArea.size() << " faces";
             }
 
@@ -483,21 +502,22 @@ void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoPara
 
             CheckStatus status = (sd.a != sd.b) ? CheckBoundaryAfterAlignment(sd) : PASS;
 
-            if (k <= 100 && status != PASS) {
+            if (k <= DETAILED_LOG_THRESHOLD && status != PASS) {
                 LOG_INFO << "  [Iter " << k << "] CheckBoundaryAfterAlignment failed: " << status;
             }
 
             if (status == PASS) {
-                if (k <= 100) LOG_INFO << "  [Iter " << k << "] Using OptimizeChart";
-                status = OptimizeChart(sd, graph, false);
+                bool verbose = (k <= DETAILED_LOG_THRESHOLD);
+                if (verbose) LOG_INFO << "  [Iter " << k << "] Using OptimizeChart";
+                status = OptimizeChart(sd, graph, false, verbose);
 
                 if (status == PASS) {
                     status = CheckAfterLocalOptimization(sd, state, params);
 
-                    if (k <= 100 && status != PASS) {
+                    if (k <= DETAILED_LOG_THRESHOLD && status != PASS) {
                         LOG_INFO << "  [Iter " << k << "] CheckAfterLocalOptimization failed: " << status;
                     }
-                } else if (k <= 100) {
+                } else if (k <= DETAILED_LOG_THRESHOLD) {
                     LOG_INFO << "  [Iter " << k << "] Optimization failed: " << status;
                 }
             }
@@ -507,8 +527,8 @@ void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoPara
             while ((status == FAIL_GLOBAL_OVERLAP_AFTER_OPT || status == FAIL_GLOBAL_OVERLAP_AFTER_BND) && retryCount < MAX_RETRIES) {
                 retryCount++;
                 LOG_DEBUG << "Global overlaps detected after ARAP optimization, fixing edges";
-                if (k <= 100) LOG_INFO << "  [Iter " << k << "] Global overlap detected, retrying with edge fixing (" << retryCount << ")";
-                CheckStatus iterStatus = OptimizeChart(sd, graph, true);
+                if (k <= DETAILED_LOG_THRESHOLD) LOG_INFO << "  [Iter " << k << "] Global overlap detected, retrying with edge fixing (" << retryCount << ")";
+                CheckStatus iterStatus = OptimizeChart(sd, graph, true, (k <= DETAILED_LOG_THRESHOLD));
                 if (iterStatus == _END)
                     break;
                 if (iterStatus != PASS) {
@@ -529,12 +549,12 @@ void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoPara
                 ColorizeSeam(sd.csh, vcg::Color4b(255, 69, 0, 255));
                 accept++;
                 LOG_DEBUG << "Accepted operation";
-                if (k <= 100) LOG_INFO << "  [Iter " << k << "] ACCEPTED";
+                if (k <= DETAILED_LOG_THRESHOLD) LOG_INFO << "  [Iter " << k << "] ACCEPTED";
             } else {
                 RejectMove(sd, state, graph, status);
                 reject++;
                 LOG_DEBUG << "Rejected operation";
-                if (k <= 100) LOG_INFO << "  [Iter " << k << "] REJECTED (status: " << status << ")";
+                if (k <= DETAILED_LOG_THRESHOLD) LOG_INFO << "  [Iter " << k << "] REJECTED (status: " << status << ")";
             }
 
             if (iterTimer.TimeElapsed() > 5.0) {
@@ -547,7 +567,7 @@ void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoPara
 
     PrintStateInfo(state, graph, params);
 
-    LogExecutionStats();
+    LogExecutionStats(true);
 
     Mesh shell;
 
@@ -1291,7 +1311,7 @@ static CheckStatus CheckAfterLocalOptimization(SeamData& sd, AlgoStateHandle sta
     return status;
 }
 
-static CheckStatus OptimizeChart(SeamData& sd, GraphHandle graph, bool fixIntersectingEdges)
+static CheckStatus OptimizeChart(SeamData& sd, GraphHandle graph, bool fixIntersectingEdges, bool verbose)
 {
     PERF_TIMER_START;
 
@@ -1372,6 +1392,7 @@ static CheckStatus OptimizeChart(SeamData& sd, GraphHandle graph, bool fixInters
     LOG_DEBUG << "Optimizing...";
     ARAP arap(sd.shell);
     arap.SetMaxIterations(100);
+    arap.SetVerbose(verbose);
 
     // select the vertices, using the fact that the faces are mirrored in
     // the support object
@@ -2289,7 +2310,8 @@ static CheckStatus CheckBoundary_Virtual(const MergeJobResult& result, const Top
 static CheckStatus OptimizeChart_Virtual(MergeJobResult& result, TopologyDiff& diff,
                                          const std::vector<Mesh::FacePointer>& supportFaces, Mesh& mesh,
                                          const AlgoParameters& params,
-                                         const std::unordered_set<Mesh::VertexPointer>& additionalFixedVertices = {})
+                                         const std::unordered_set<Mesh::VertexPointer>& additionalFixedVertices = {},
+                                         bool verbose = false)
 {
     if (supportFaces.empty()) {
         return FAIL_TOPOLOGY;
@@ -2434,6 +2456,7 @@ static CheckStatus OptimizeChart_Virtual(MergeJobResult& result, TopologyDiff& d
     // Setup ARAP solver
     ARAP arap(shell);
     arap.SetMaxIterations(100);
+    arap.SetVerbose(verbose);
 
     // Select vertices to fix:
     // 1. Those outside the threshold
@@ -3063,13 +3086,14 @@ void GreedyOptimization_Parallel(GraphHandle graph, AlgoStateHandle state, const
     // Use relative logging for batches
     size_t nCharts = graph->Count();
     int estimatedBatches = std::max(1, (int)(nCharts / BASE_BATCH_SIZE));
-    int logBatchInterval = std::max(100, estimatedBatches / 20);
+    int logBatchInterval = std::max(20, estimatedBatches / 100);
     LOG_INFO << "Log batch frequency set to every " << logBatchInterval << " batches.";
 
+    const int DETAILED_BATCH_LOG_THRESHOLD = 5;
     while (state->queue.size() > 0) {
         batchNumber++;
 
-        if (batchNumber <= 100 || (batchNumber % logBatchInterval) == 0) {
+        if (batchNumber <= DETAILED_BATCH_LOG_THRESHOLD || (batchNumber % logBatchInterval) == 0) {
             LOG_INFO << "Batch " << batchNumber << " - Queue size: " << state->queue.size()
                      << ", Accepted: " << totalAccepted.load() << ", Rejected: " << totalRejected.load();
         }
@@ -3403,7 +3427,7 @@ void GreedyOptimization_Parallel(GraphHandle graph, AlgoStateHandle state, const
         deferredOps.clear();
 
         // Log batch stats
-        if (batchNumber <= 100 || (batchNumber % 100) == 0 || batchTimer.TimeElapsed() > 5.0) {
+        if (batchNumber <= DETAILED_BATCH_LOG_THRESHOLD || (batchNumber % 20) == 0 || batchTimer.TimeElapsed() > 5.0) {
             LOG_INFO << "  Batch " << batchNumber << ": size=" << currentBatch.size()
                      << ", accepted=" << batchAccepted << ", rejected=" << batchRejected
                      << ", collisions=" << batchCollisions
@@ -3417,7 +3441,7 @@ void GreedyOptimization_Parallel(GraphHandle graph, AlgoStateHandle state, const
              << totalRejected.load() << " rejected, " << totalCollisions.load() << " spatial collisions";
 
     PrintStateInfo(state, graph, params);
-    LogExecutionStats();
+    LogExecutionStats(true);
 
     LOG_INFO << "Atlas energy after optimization is " << ARAP::ComputeEnergyFromStoredWedgeTC(graph->mesh, nullptr, nullptr);
 }

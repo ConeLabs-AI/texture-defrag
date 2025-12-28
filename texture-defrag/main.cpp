@@ -95,6 +95,12 @@ int main(int argc, char *argv[])
 
     Args args = ParseArgs(argc, argv);
 
+#ifdef ARAP_USE_AVX2
+    LOG_INFO << "SIMD: AVX2 optimizations enabled";
+#else
+    LOG_INFO << "SIMD: AVX2 not available, using scalar fallback";
+#endif
+
     ap.matchingThreshold = args.m;
     ap.boundaryTolerance = args.b;
     ap.distortionTolerance = args.d;

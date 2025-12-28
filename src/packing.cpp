@@ -423,7 +423,9 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
 
     Timer parallelTimer;
     int sheetsProcessed = 0;
+    int chartsProcessedInBins = 0;
     int lastReportedProgress = -1;
+    int totalPackablesCount = (int)packables.size();
 
     #pragma omp parallel for schedule(dynamic)
     for (int i = 0; i < numSheets; ++i) {
@@ -512,9 +514,10 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         #pragma omp critical
         {
             sheetsProcessed++;
-            int progress = (sheetsProcessed * 100) / numSheets;
-            if (progress / 5 > lastReportedProgress / 5) {
-                LOG_INFO << "[PACKING] Progress: " << progress << "% (" << sheetsProcessed << "/" << numSheets << " parallel bins)";
+            chartsProcessedInBins += subsetIndices.size();
+            int progress = (chartsProcessedInBins * 100) / totalPackablesCount;
+            if (progress / 10 > lastReportedProgress / 10) {
+                LOG_INFO << "[PACKING] Progress: " << progress << "% (" << chartsProcessedInBins << "/" << totalPackablesCount << " items)";
                 lastReportedProgress = progress;
             }
         }

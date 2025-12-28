@@ -468,7 +468,6 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
         t_total_savequeue_enqueue_s += std::chrono::duration<double>(t_enqueue_end - t_enqueue_start).count();
     }
 
-    // Ensure all pending saves are complete before restoring working directory
     if (saveQueue.statsSnapshot().saved < nTex) {
         LOG_INFO << "[RENDERING] Finalizing background image saves...";
     }
@@ -478,25 +477,28 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
     t_save_wait_s += std::chrono::duration<double>(t_save_finish_end - t_save_finish_start).count();
     QDir::setCurrent(wd);
 
-    // Snapshot queue save stats
     auto saveStats = saveQueue.statsSnapshot();
     t_total_png_save_s = saveStats.totalSaveS;
 
     auto t_total_end = std::chrono::high_resolution_clock::now();
     double t_total_s = std::chrono::duration<double>(t_total_end - t_total_start).count();
 
-    // Log performance summary
     LOG_INFO << "------- Rendering Phase Statistics -------";
     LOG_INFO << "Sheets: " << nTex << ", Total Pixels: " << total_pixels_rendered;
     LOG_INFO << "Total Time: " << t_total_s << "s";
     LOG_INFO << "  - Rasterization (GL): " << t_total_render_s << "s";
     LOG_INFO << "  - Enqueueing tasks: " << t_total_savequeue_enqueue_s << "s";
     LOG_INFO << "  - IO wait (finalizing): " << t_save_wait_s << "s";
+
+    double total_io_wait = t_total_savequeue_enqueue_s + t_save_wait_s;
+    if (t_total_s > 0 && (total_io_wait / t_total_s) > 0.2) {
+        LOG_WARN << "[PERF] Significant IO wait detected: " << std::fixed << std::setprecision(1) << (total_io_wait / t_total_s) * 100 << "% of total time.";
+    }
+
     LOG_INFO << "  - PNG Encoding (background total): " << t_total_png_save_s << "s";
     LOG_INFO << "PNG encoding speed: min=" << saveStats.minSaveS << "s, max=" << saveStats.maxSaveS << "s per sheet";
     LOG_INFO << "-------------------------------------------";
 
-    // Log GPU texture cache stats
     if (textureObject) {
         auto cs = textureObject->GetCacheStats();
         uint64_t lookups = cs.hits + cs.misses;

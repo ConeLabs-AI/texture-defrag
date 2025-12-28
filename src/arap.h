@@ -121,6 +121,7 @@ private:
     SoARotations soa_rotations;
 
     int max_iter;
+    bool verbose = false;
 
     void ComputeSystemMatrix(Mesh& m, const std::vector<Cot>& cotan, Eigen::SparseMatrix<double>& L);
     void ComputeRHS(Mesh& m, const std::vector<Eigen::Matrix2d>& rotations, const std::vector<Cot>& cotan, Eigen::VectorXd& bu, Eigen::VectorXd& bv);
@@ -139,8 +140,29 @@ public:
     int FixSelectedVertices();
     int FixRandomEdgeWithinTolerance(double tol);
     void SetMaxIterations(int n);
+    void SetVerbose(bool v) { verbose = v; }
 
     ARAPSolveInfo Solve();
+
+#ifdef ARAP_ENABLE_TIMING
+    struct AggregateStats {
+        double total_time_ms = 0;
+        double precompute_ms = 0;
+        double rotations_ms = 0;
+        double rhs_ms = 0;
+        double solve_ms = 0;
+        double energy_ms = 0;
+        long long total_iterations = 0;
+        int call_count = 0;
+
+        // Problem scale histograms
+        long long count_small = 0;  // < 100 vertices
+        long long count_medium = 0; // 100-1000 vertices
+        long long count_large = 0;  // > 1000 vertices
+    };
+    static AggregateStats globalStats;
+    static void PrintAggregateStats();
+#endif
 
     static double ComputeEnergyFromStoredWedgeTC(Mesh& m, double *num, double *denom);
     static double ComputeEnergyFromStoredWedgeTC(const std::vector<Mesh::FacePointer>& fpVec, Mesh& m, double *num, double *denom);

@@ -1469,7 +1469,7 @@ static CheckStatus OptimizeChart(SeamData& sd, GraphHandle graph, bool fixInters
     // Hard guard: reject if ARAP blows up the local UV scale beyond a reasonable factor
     const double MAX_LOCAL_SCALE_RATIO = 50.0;
     if (!std::isfinite(scaleRatio) || scaleRatio > MAX_LOCAL_SCALE_RATIO) {
-        LOG_WARN << "[VALIDATION] ARAP produced extreme UV scale explosion (ratio=" << scaleRatio
+        LOG_DEBUG << "[VALIDATION] ARAP produced extreme UV scale explosion (ratio=" << scaleRatio
                  << ") for charts " << sd.a->id
                  << (sd.a != sd.b ? ("/" + std::to_string(sd.b->id)) : "")
                  << ". Rejecting move to prevent packing failure.";
@@ -2537,7 +2537,7 @@ static CheckStatus OptimizeChart_Virtual(MergeJobResult& result, TopologyDiff& d
 
     const double MAX_LOCAL_SCALE_RATIO = 50.0;
     if (!std::isfinite(scaleRatio) || scaleRatio > MAX_LOCAL_SCALE_RATIO) {
-        LOG_WARN << "[Parallel] ARAP produced extreme UV scale explosion (ratio=" << scaleRatio << ")";
+        LOG_DEBUG << "[Parallel] ARAP produced extreme UV scale explosion (ratio=" << scaleRatio << ")";
         return FAIL_DISTORTION_LOCAL;
     }
 

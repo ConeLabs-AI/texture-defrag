@@ -1095,12 +1095,15 @@ ARAPSolveInfo ARAP::Solve()
         si.finalEnergy = e_curr;
 
         double delta_e = e - e_curr;
-        if (verbose && iter < 50) {
+        if (verbose && iter < 75) {
             LOG_INFO << "    [ARAP] Iteration " << iter << ": energy " << e_curr << " (delta " << delta_e << ")";
         }
 
-        if (delta_e < 1e-8) {
+        if (delta_e >= 0 && delta_e < 1e-8) {
             LOG_DEBUG << "ARAP: convergence reached (change in the energy value is too small)";
+            converged = true;
+        } else if (delta_e < 0) {
+            LOG_DEBUG << "ARAP: energy increased (numerical instability), stopping.";
             converged = true;
         }
 
@@ -1129,17 +1132,6 @@ ARAPSolveInfo ARAP::Solve()
     }
 
     LOG_DEBUG << "ARAP: Energy after optimization is " << CurrentEnergySIMD() << " (" << iter << " iterations)";
-
-#ifdef ARAP_ENABLE_TIMING
-    if (iter > 0) {
-        LOG_INFO << "ARAP Timing (total " << iter << " iterations):";
-        LOG_INFO << "  Precompute: " << si.timePrecompute_ms << " ms";
-        LOG_INFO << "  Rotations:  " << si.timeRotations_ms << " ms (" << si.timeRotations_ms / iter << " ms/iter)";
-        LOG_INFO << "  RHS:        " << si.timeRHS_ms << " ms (" << si.timeRHS_ms / iter << " ms/iter)";
-        LOG_INFO << "  Solve:      " << si.timeSolve_ms << " ms (" << si.timeSolve_ms / iter << " ms/iter)";
-        LOG_INFO << "  Energy:     " << si.timeEnergy_ms << " ms (" << si.timeEnergy_ms / (iter + 1) << " ms/iter)";
-    }
-#endif
 
     // Final update for wedges
     for (auto& f : m.face) {

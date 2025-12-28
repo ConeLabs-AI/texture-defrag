@@ -99,14 +99,14 @@ int RotateChartForResampling(ChartHandle chart, const std::set<Mesh::FacePointer
         
         // Optimize: Use closed-form SVD instead of iterative Eigen::JacobiSVD
         double a = Jf(0,0), b = Jf(0,1), c = Jf(1,0), d = Jf(1,1);
-        double u00, u01, u10, u11, v00, v01, v10, v11, s0, s1;
-        arap_simd::scalar::svd2x2(a, b, c, d, u00, u01, u10, u11, v00, v01, v10, v11, s0, s1);
+        double u00_s, u01_s, u10_s, u11_s, v00_s, v01_s, v10_s, v11_s, s0, s1;
+        arap_simd::scalar::svd2x2(a, b, c, d, u00_s, u01_s, u10_s, u11_s, v00_s, v01_s, v10_s, v11_s, s0, s1);
 
         // Check if nearly rigid (isometry)
         if (std::abs(s0 - 1.0) < RIGID_TOLERANCE && std::abs(s1 - 1.0) < RIGID_TOLERANCE) {
             
             double r00, r01, r10, r11;
-            arap_simd::scalar::rotation_from_svd(u00, u01, u10, u11, v00, v01, v10, v11, r00, r01, r10, r11);
+            arap_simd::scalar::rotation_from_svd(u00_s, u01_s, u10_s, u11_s, v00_s, v01_s, v10_s, v11_s, r00, r01, r10, r11);
             
             // R = [[r00, r01], [r10, r11]]
             // angle = atan2(R[1,0], R[0,0])

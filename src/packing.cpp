@@ -19,8 +19,6 @@
     along with TextureDefrag. If not, see <https://www.gnu.org/licenses/>.
 *******************************************************************************/
 
-#include <vcg/space/rasterized_outline2_packer.h>
-#include <wrap/qt/outline2_rasterizer.h>
 #include "packing.h"
 #include "texture_object.h"
 #include "mesh_graph.h"
@@ -29,6 +27,8 @@
 #include "mesh_attribute.h"
 #include "timer.h"
 
+#include <vcg/space/rasterized_outline2_packer.h>
+#include <wrap/qt/outline2_rasterizer.h>
 #include <vcg/complex/algorithms/outline_support.h>
 #ifdef _OPENMP
 #include <omp.h>

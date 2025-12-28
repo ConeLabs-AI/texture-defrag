@@ -24,6 +24,10 @@
 #ifndef EIGEN_VCGLIB
 #define EIGEN_VCGLIB
 
+#ifndef EIGEN2_SUPPORT
+#define EIGEN2_SUPPORT
+#endif
+
 // TODO enable the vectorization
 // #define EIGEN_DONT_VECTORIZE
 #define EIGEN_MATRIXBASE_PLUGIN <vcg/math/eigen_matrixbase_addons.h>
@@ -53,12 +57,13 @@ struct ei_to_vcgtype;
 }
 
 #include "base.h"
-#include "../../eigenlib/Eigen/Core"
 #include "../../eigenlib/Eigen/LU"
 #include "../../eigenlib/Eigen/Geometry"
+#include "../../eigenlib/Eigen/Core"
 
 // add support for unsigned char and short int
 namespace Eigen {
+
 template<> struct NumTraits<unsigned char>
 {
   typedef unsigned char Real;
@@ -88,6 +93,7 @@ template<> struct NumTraits<short int>
 // WARNING this is a default version provided so that Intersection() stuff can compile.
 // Indeed, the compiler try to instanciate all versions of Intersection() leading to
 // the instanciation of Eigen::Matrix<Face,...> !!!
+#if EIGEN_WORLD_VERSION < 3
 template<typename T> struct NumTraits
 {
 	struct wrong_type
@@ -105,6 +111,7 @@ template<typename T> struct NumTraits
 		MulCost = 0
 	};
 };
+#endif
 
 // implementation of Lexicographic order comparison
 // TODO should use meta unrollers

@@ -1697,12 +1697,12 @@ public:
     }
 
 private:
-    static ProfileData m_last_profile;
+    static thread_local ProfileData m_last_profile;
 
 }; // end class
 
 template<class S, class R>
-typename RasterizedOutline2Packer<S,R>::ProfileData RasterizedOutline2Packer<S,R>::m_last_profile;
+thread_local typename RasterizedOutline2Packer<S,R>::ProfileData RasterizedOutline2Packer<S,R>::m_last_profile;
 
 
 } // end namespace vcg

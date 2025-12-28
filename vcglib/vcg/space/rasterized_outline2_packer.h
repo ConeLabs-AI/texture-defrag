@@ -24,9 +24,9 @@
 #ifndef __RASTERIZED_OUTLINE2_PACKER_H__
 #define __RASTERIZED_OUTLINE2_PACKER_H__
 
+#include <vcg/math/eigen.h>
 #include <vcg/space/rect_packer.h>
 #include <vcg/complex/algorithms/outline_support.h>
-#include <vcg/math/eigen.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif

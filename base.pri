@@ -1,7 +1,7 @@
 VCGPATH = $$PWD/vcglib
 
 CONFIG += console
-CONFIG += c++11
+CONFIG += c++14
 CONFIG += release
 CONFIG -= app_bundle
 
@@ -21,9 +21,11 @@ DEFINES += EIGEN_MAX_STATIC_ALIGN_BYTES=0
 
 unix|mingw-g++ {
     # For GCC and Clang on Unix-like systems (including MinGW-g++)
-    QMAKE_CXXFLAGS += -fopenmp
+    !macx {
+        QMAKE_CXXFLAGS += -fopenmp
+        LIBS += -fopenmp
+    }
     QMAKE_CXXFLAGS += -march=native
-    LIBS += -fopenmp
     QMAKE_CXXFLAGS_RELEASE -= -O
     QMAKE_CXXFLAGS_RELEASE -= -O1
     QMAKE_CXXFLAGS_RELEASE -= -O2

@@ -832,6 +832,19 @@ double ARAP::CurrentEnergySIMD()
             // Compute Jacobian J = U * F^-1
             __m256d det = _mm256_sub_pd(_mm256_mul_pd(x10_x, x20_y), _mm256_mul_pd(x20_x, x10_y));
 
+            // [DIAGNOSTIC] Check for scale mismatch at Iteration 0 (or generally)
+            if (verbose && fi == 0) {
+                 alignas(32) double tmp_x1[4], tmp_u1[4];
+                 _mm256_storeu_pd(tmp_x1, x10_x);
+                 _mm256_storeu_pd(tmp_u1, u10_x);
+                 // Log only the first face in the batch
+                 LOG_INFO << "[ARAP DIAG] Scale Check Face " << fi 
+                          << ": RestEdgeX=" << tmp_x1[0] 
+                          << ", CurrEdgeX=" << tmp_u1[0]
+                          << ". Ratio=" << (std::abs(tmp_x1[0]) > 1e-9 ? tmp_u1[0]/tmp_x1[0] : 0.0);
+            }
+            // [END DIAGNOSTIC]
+
             // 1. Create Mask: Only process faces with valid area
             __m256d abs_det_real = _mm256_andnot_pd(_mm256_set1_pd(-0.0), det);
             __m256d valid_mask = _mm256_cmp_pd(abs_det_real, _mm256_set1_pd(1e-20), _CMP_GT_OQ);
@@ -850,11 +863,7 @@ double ARAP::CurrentEnergySIMD()
             __m256d ja = _mm256_add_pd(_mm256_mul_pd(u10_x, finv00), _mm256_mul_pd(u20_x, finv10));
             __m256d jb = _mm256_add_pd(_mm256_mul_pd(u10_x, finv01), _mm256_mul_pd(u20_x, finv11));
             __m256d jc = _mm256_add_pd(_mm256_mul_pd(u10_y, finv00), _mm256_mul_pd(u20_y, finv10));
-            __m256d jd = _mm256_add_pd(_mm256_mul_pd(u10_y, inv_det), _mm256_mul_pd(u20_y, finv11)); // Note: this line in user prompt had jd = ...u10_y * finv01 + u20_y * finv11... I will fix it.
-            // Wait, let me re-check the user prompt's jd line.
-            // It was: __m256d jd = _mm256_add_pd(_mm256_mul_pd(u10_y, finv01), _mm256_mul_pd(u20_y, finv11));
-            // My previous manual fix was wrong.
-            jd = _mm256_add_pd(_mm256_mul_pd(u10_y, finv01), _mm256_mul_pd(u20_y, finv11));
+            __m256d jd = _mm256_add_pd(_mm256_mul_pd(u10_y, finv01), _mm256_mul_pd(u20_y, finv11));
 
             _mm256_storeu_pd(jf_a, ja);
             _mm256_storeu_pd(jf_b, jb);
@@ -883,6 +892,21 @@ double ARAP::CurrentEnergySIMD()
             __m256d d1 = _mm256_sub_pd(s1, one);
             __m256d e_vec = _mm256_mul_pd(area_abs, _mm256_add_pd(_mm256_mul_pd(d0, d0), _mm256_mul_pd(d1, d1)));
             e_vec = _mm256_and_pd(e_vec, valid_mask);
+
+            // [DIAGNOSTIC] Log Energy components for exploding faces
+            alignas(32) double tmp_e_check[4];
+            _mm256_storeu_pd(tmp_e_check, e_vec);
+            for(int k=0; k<4; ++k) {
+                if (tmp_e_check[k] > 1e6) {
+                    alignas(32) double ts0[4], ts1[4], tarea[4];
+                    _mm256_storeu_pd(ts0, s0); _mm256_storeu_pd(ts1, s1); _mm256_storeu_pd(tarea, area_abs);
+                    LOG_WARN << "[ARAP DIAG] EXPLOSION Face " << (fi+k) 
+                             << " E=" << tmp_e_check[k]
+                             << " Area=" << tarea[k]
+                             << " Sigma0=" << ts0[k] << " Sigma1=" << ts1[k];
+                }
+            }
+            // [END DIAGNOSTIC]
 
             alignas(32) double tmp_e[4];
             _mm256_storeu_pd(tmp_e, e_vec);
@@ -1239,4 +1263,17 @@ void ARAP::PrecomputeData()
         soa_local_coords.x2[fi] = x_20[0];
         soa_local_coords.y2[fi] = x_20[1];
     }
+    
+    // [DIAGNOSTIC] Compare Target Source vs Mesh Data
+    if (verbose && nf > 0) {
+        auto& f = m.face[0];
+        vcg::Point3d p10_3d = f.P(1) - f.P(0);
+        vcg::Point2d u10_uv = f.WT(1).P() - f.WT(0).P();
+        
+        LOG_INFO << "[ARAP DIAG] Source Data Check (Face 0):"
+                 << "\n  Target Edge X (Rest)  : " << soa_local_coords.x1[0]
+                 << "\n  Mesh 3D Edge X        : " << p10_3d.X() << " (Length: " << p10_3d.Norm() << ")"
+                 << "\n  Mesh UV Edge X        : " << u10_uv.X() << " (Length: " << u10_uv.Norm() << ")";
+    }
+    // [END DIAGNOSTIC]
 }

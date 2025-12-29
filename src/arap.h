@@ -1,19 +1,19 @@
 /*******************************************************************************
-    Copyright (c) 2021, Andrea Maggiordomo, Paolo Cignoni and Marco Tarini
+Copyright (c) 2021, Andrea Maggiordomo, Paolo Cignoni and Marco Tarini
 
-    This file is part of TextureDefrag, a reference implementation for
-    the paper ``Texture Defragmentation for Photo-Reconstructed 3D Models''
-    by Andrea Maggiordomo, Paolo Cignoni and Marco Tarini.
+This file is part of TextureDefrag, a reference implementation for
+the paper ``Texture Defragmentation for Photo-Reconstructed 3D Models''
+by Andrea Maggiordomo, Paolo Cignoni and Marco Tarini.
 
-    TextureDefrag is free software: you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
+TextureDefrag is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-    TextureDefrag is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
+TextureDefrag is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
 
     You should have received a copy of the GNU General Public License
     along with TextureDefrag. If not, see <https://www.gnu.org/licenses/>.
@@ -31,7 +31,6 @@
 #include <vector>
 #include <array>
 #include <chrono>
-
 
 struct ARAPSolveInfo {
     double initialEnergy;
@@ -67,8 +66,8 @@ struct SoARotations {
 struct SoALocalCoords {
     // Local frame coordinates per face (3 vertices, 2D each)
     // Vertex 0 is always at origin, so we only store vertices 1 and 2
-    std::vector<double> x1, y1;  // vertex 1
-    std::vector<double> x2, y2;  // vertex 2
+    std::vector<double> x1, y1; // vertex 1
+    std::vector<double> x2, y2; // vertex 2
 
     void resize(size_t n) {
         x1.resize(n); y1.resize(n);
@@ -121,6 +120,11 @@ private:
     int max_iter;
     bool verbose = false;
 
+    // Internal diagnostics
+    void LogDegenerateFaces();
+    void LogInfiniteWeights(const std::vector<Cot>& cotan);
+    void LogSolverState(int iter, const Eigen::VectorXd& solution);
+
     void ComputeSystemMatrix(Mesh& m, const std::vector<Cot>& cotan, Eigen::SparseMatrix<double>& L);
     void ComputeRHSSIMD(Mesh& m, const std::vector<Cot>& cotan, Eigen::VectorXd& bu, Eigen::VectorXd& bv);
     void PrecomputeData();
@@ -159,6 +163,7 @@ public:
     };
     static AggregateStats globalStats;
     static void PrintAggregateStats();
+
 #endif
 
     static double ComputeEnergyFromStoredWedgeTC(Mesh& m, double *num, double *denom);
@@ -167,6 +172,5 @@ public:
                                 const vcg::Point2d& u10, const vcg::Point2d& u20,
                                 double *area);
 };
-
 
 #endif // ARAP_H

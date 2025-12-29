@@ -1,22 +1,23 @@
 /*******************************************************************************
-    Copyright (c) 2021, Andrea Maggiordomo, Paolo Cignoni and Marco Tarini
+Copyright (c) 2021, Andrea Maggiordomo, Paolo Cignoni and Marco Tarini
 
-    This file is part of TextureDefrag, a reference implementation for
-    the paper ``Texture Defragmentation for Photo-Reconstructed 3D Models''
-    by Andrea Maggiordomo, Paolo Cignoni and Marco Tarini.
+This file is part of TextureDefrag, a reference implementation for
+the paper ``Texture Defragmentation for Photo-Reconstructed 3D Models''
+by Andrea Maggiordomo, Paolo Cignoni and Marco Tarini.
 
-    TextureDefrag is free software: you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
+TextureDefrag is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-    TextureDefrag is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
+TextureDefrag is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
 
-    You should have received a copy of the GNU General Public License
-    along with TextureDefrag. If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU General Public License
+along with TextureDefrag. If not, see <https://www.gnu.org/licenses/>.
+
 *******************************************************************************/
 
 #include "arap.h"
@@ -28,6 +29,7 @@
 #include <iomanip>
 #include <unordered_set>
 #include <omp.h>
+#include <atomic>
 
 #ifdef ARAP_ENABLE_TIMING
 #include <chrono>
@@ -39,17 +41,17 @@ ARAP::AggregateStats ARAP::globalStats;
 void ARAP::PrintAggregateStats() {
     if (globalStats.call_count == 0) return;
     LOG_INFO << "======= ARAP AGGREGATE STATS (" << globalStats.call_count << " calls) =======";
-    LOG_INFO << "Total Time:  " << std::fixed << std::setprecision(3) << globalStats.total_time_ms << " ms";
-    LOG_INFO << "  Precompute: " << globalStats.precompute_ms << " ms";
+    LOG_INFO << "Total Time: " << std::fixed << std::setprecision(3) << globalStats.total_time_ms << " ms";
+    LOG_INFO << " Precompute: " << globalStats.precompute_ms << " ms";
     if (globalStats.total_iterations > 0) {
-        LOG_INFO << "  Rotations:  " << globalStats.rotations_ms << " ms (" << (globalStats.rotations_ms / globalStats.total_iterations) << " ms/iter)";
-        LOG_INFO << "  RHS:        " << globalStats.rhs_ms << " ms (" << (globalStats.rhs_ms / globalStats.total_iterations) << " ms/iter)";
-        LOG_INFO << "  Solve:      " << globalStats.solve_ms << " ms (" << (globalStats.solve_ms / globalStats.total_iterations) << " ms/iter)";
+        LOG_INFO << " Rotations: " << globalStats.rotations_ms << " ms (" << (globalStats.rotations_ms / globalStats.total_iterations) << " ms/iter )";
+        LOG_INFO << " RHS: " << globalStats.rhs_ms << " ms (" << (globalStats.rhs_ms / globalStats.total_iterations) << " ms/iter )";
+        LOG_INFO << " Solve: " << globalStats.solve_ms << " ms (" << (globalStats.solve_ms / globalStats.total_iterations) << " ms/iter )";
     }
-    LOG_INFO << "  Energy:     " << globalStats.energy_ms << " ms";
+    LOG_INFO << " Energy: " << globalStats.energy_ms << " ms";
     LOG_INFO << "Total Iters: " << globalStats.total_iterations;
-    LOG_INFO << "Problem Sizes: <100: " << globalStats.count_small 
-             << ", 100-1k: " << globalStats.count_medium 
+    LOG_INFO << "Problem Sizes: <100: " << globalStats.count_small
+             << ", 100-1k: " << globalStats.count_medium
              << ", >1k: " << globalStats.count_large;
     LOG_INFO << "=================================================";
 }
@@ -57,7 +59,6 @@ void ARAP::PrintAggregateStats() {
 #define ARAP_TIMER_START(name)
 #define ARAP_TIMER_END(name, var)
 #endif
-
 
 ARAP::ARAP(Mesh& mesh)
     : m{mesh},
@@ -95,7 +96,7 @@ int ARAP::FixSelectedVertices()
 }
 
 /* This function fixes the vertices of an edge that is within 2pct of the target
- * edge length */
+edge length */
 int ARAP::FixRandomEdgeWithinTolerance(double tol)
 {
     std::unordered_set<int> fixed;
@@ -111,7 +112,7 @@ int ARAP::FixRandomEdgeWithinTolerance(double tol)
                 if (fixed.count(tri::Index(m, f.V(i))) == 0 && fixed.count(tri::Index(m, f.V(f.Next(i)))) == 0) {
                     FixVertex(f.V(i), f.WT(i).P());
                     FixVertex(f.V(f.Next(i)), f.WT(f.Next(i)).P());
-                    LOG_DEBUG << "Fixing vertices " << tri::Index(m, f.V(i)) << "   " << tri::Index(m, f.V(f.Next(i)));
+                    LOG_DEBUG << "Fixing vertices " << tri::Index(m, f.V(i)) << " " << tri::Index(m, f.V(f.Next(i)));
                     return 2;
                 }
             }
@@ -123,6 +124,50 @@ int ARAP::FixRandomEdgeWithinTolerance(double tol)
 void ARAP::SetMaxIterations(int n)
 {
     max_iter = n;
+}
+
+void ARAP::LogDegenerateFaces() {
+    int degenerate_count = 0;
+    auto tsa = GetTargetShapeAttribute(m);
+    for (int i = 0; i < m.FN(); ++i) {
+        auto& f = m.face[i];
+        double area3d = ((tsa[f].P[1] - tsa[f].P[0]) ^ (tsa[f].P[2] - tsa[f].P[0])).Norm();
+        if (area3d < 1e-12) {
+            degenerate_count++;
+            if (degenerate_count <= 5) { // Limit log spam
+                LOG_WARN << " [ARAP DIAG] Degenerate Face #" << i
+                         << " (V:" << tri::Index(m, f.V(0)) << "," << tri::Index(m, f.V(1)) << "," << tri::Index(m, f.V(2))
+                         << ") Area3D=" << area3d;
+            }
+        }
+    }
+    if (degenerate_count > 0) {
+        LOG_WARN << " [ARAP DIAG] Total degenerate faces detected: " << degenerate_count;
+    }
+}
+
+void ARAP::LogInfiniteWeights(const std::vector<Cot>& cotan) {
+    int inf_count = 0;
+    int huge_count = 0;
+    for (size_t i = 0; i < cotan.size(); ++i) {
+        bool bad = false;
+        for (int j=0; j<3; ++j) {
+            if (!std::isfinite(cotan[i].v[j])) {
+                inf_count++;
+                bad = true;
+            } else if (std::abs(cotan[i].v[j]) > 1e4) {
+                huge_count++;
+                bad = true;
+            }
+        }
+        if (bad && (inf_count + huge_count) <= 5) {
+            LOG_WARN << " [ARAP DIAG] Bad Cotan Weight Face #" << i
+                     << " w=[" << cotan[i].v[0] << "," << cotan[i].v[1] << "," << cotan[i].v[2] << "]";
+        }
+    }
+    if (inf_count > 0 || huge_count > 0) {
+        LOG_WARN << " [ARAP DIAG] Weight issues: Inf/NaN=" << inf_count << ", Huge (>1e4)=" << huge_count;
+    }
 }
 
 static std::vector<ARAP::Cot> ComputeCotangentVector(Mesh& m)
@@ -175,8 +220,11 @@ void ARAP::ComputeSystemMatrix(Mesh& m, const std::vector<Cot>& cotan, Eigen::Sp
                     double weight_ij = cotan[fi].v[k_idx];
                     double weight_ik = cotan[fi].v[j_idx];
 
+                    // Clamp huge weights to prevent numerical explosion
                     if (!std::isfinite(weight_ij)) weight_ij = 1e-8;
                     if (!std::isfinite(weight_ik)) weight_ik = 1e-8;
+                    if (std::abs(weight_ij) > 1e6) weight_ij = 1e6 * (weight_ij > 0 ? 1.0 : -1.0);
+                    if (std::abs(weight_ik) > 1e6) weight_ik = 1e6 * (weight_ik > 0 ? 1.0 : -1.0);
 
                     // i is Free, check j and k
                     if (local_j != -1) {
@@ -197,37 +245,10 @@ void ARAP::ComputeSystemMatrix(Mesh& m, const std::vector<Cot>& cotan, Eigen::Sp
     L.makeCompressed();
 }
 
-static void ComputeRotations(Mesh& m, std::vector<Eigen::Matrix2d>& rotations)
-{
-    auto tsa = GetTargetShapeAttribute(m);
-    rotations.resize(m.FN());
-    #pragma omp parallel for
-    for (int fi = 0; fi < m.FN(); ++fi) {
-        auto& f = m.face[fi];
-        vcg::Point2d x10, x20;
-        LocalIsometry(tsa[f].P[1] - tsa[f].P[0], tsa[f].P[2] - tsa[f].P[0], x10, x20);
-        Eigen::Matrix2d Jf = ComputeTransformationMatrix(x10, x20, f.WT(1).P() - f.WT(0).P(), f.WT(2).P() - f.WT(0).P());
-        Eigen::Matrix2d U, V;
-        Eigen::Vector2d sigma;
-        Eigen::JacobiSVD<Eigen::Matrix2d> svd;
-        svd.compute(Jf, Eigen::ComputeFullU | Eigen::ComputeFullV);
-        U = svd.matrixU(); V = svd.matrixV(); sigma = svd.singularValues();
-        Eigen::MatrixXd R = U * V.transpose();
-        if (R.determinant() < 0) {
-            U.col(U.cols() - 1) *= -1;
-            R = U * V.transpose();
-        }
-
-        rotations[fi] = R;
-    }
-}
-
 void ARAP::ComputeRotationsSIMD(Mesh& m)
 {
     const int nf = m.FN();
     soa_rotations.resize(nf);
-
-    auto tsa = GetTargetShapeAttribute(m);
 
 #ifdef ARAP_USE_AVX2
     // Process 4 faces at a time with AVX2
@@ -243,32 +264,42 @@ void ARAP::ComputeRotationsSIMD(Mesh& m)
 
     #pragma omp parallel for firstprivate(jf_a, jf_b, jf_c, jf_d, u00, u01, u10, u11, v00, v01, v10, v11, sigma0, sigma1, r00, r01, r10, r11)
     for (int fi = 0; fi < nf_aligned; fi += batch_size) {
-        // Gather input vectors (Local Frame Coords) - Vectorized Load
+        // Gather input vectors (Local Frame Coords)
         __m256d x10_x = _mm256_loadu_pd(&soa_local_coords.x1[fi]);
         __m256d x10_y = _mm256_loadu_pd(&soa_local_coords.y1[fi]);
         __m256d x20_x = _mm256_loadu_pd(&soa_local_coords.x2[fi]);
         __m256d x20_y = _mm256_loadu_pd(&soa_local_coords.y2[fi]);
 
-        // Gather UV coordinates (AoS -> registers) - Vectorized Gather
+        // Gather UV coordinates
         auto& f0 = m.face[fi+0];
         auto& f1 = m.face[fi+1];
         auto& f2 = m.face[fi+2];
         auto& f3 = m.face[fi+3];
 
-        // Note: set_pd is high-to-low (3,2,1,0)
         __m256d u10_x = _mm256_set_pd(f3.WT(1).P().X() - f3.WT(0).P().X(), f2.WT(1).P().X() - f2.WT(0).P().X(), f1.WT(1).P().X() - f1.WT(0).P().X(), f0.WT(1).P().X() - f0.WT(0).P().X());
         __m256d u10_y = _mm256_set_pd(f3.WT(1).P().Y() - f3.WT(0).P().Y(), f2.WT(1).P().Y() - f2.WT(0).P().Y(), f1.WT(1).P().Y() - f1.WT(0).P().Y(), f0.WT(1).P().Y() - f0.WT(0).P().Y());
         __m256d u20_x = _mm256_set_pd(f3.WT(2).P().X() - f3.WT(0).P().X(), f2.WT(2).P().X() - f2.WT(0).P().X(), f1.WT(2).P().X() - f1.WT(0).P().X(), f0.WT(2).P().X() - f0.WT(0).P().X());
         __m256d u20_y = _mm256_set_pd(f3.WT(2).P().Y() - f3.WT(0).P().Y(), f2.WT(2).P().Y() - f2.WT(0).P().Y(), f1.WT(2).P().Y() - f1.WT(0).P().Y(), f0.WT(2).P().Y() - f0.WT(0).P().Y());
 
+        // Sanitize inputs
+        __m256d mask_valid = _mm256_and_pd(
+            _mm256_and_pd(_mm256_cmp_pd(u10_x, u10_x, _CMP_EQ_OQ), _mm256_cmp_pd(u10_y, u10_y, _CMP_EQ_OQ)),
+            _mm256_and_pd(_mm256_cmp_pd(u20_x, u20_x, _CMP_EQ_OQ), _mm256_cmp_pd(u20_y, u20_y, _CMP_EQ_OQ))
+        );
+        u10_x = _mm256_and_pd(u10_x, mask_valid);
+        u10_y = _mm256_and_pd(u10_y, mask_valid);
+        u20_x = _mm256_and_pd(u20_x, mask_valid);
+        u20_y = _mm256_and_pd(u20_y, mask_valid);
+
         // Compute Jacobian J = U * F^-1 (Vectorized)
-        // F^-1 = (1/det) * [[x20_y, -x20_x], [-x10_y, x10_x]]
         __m256d det = _mm256_sub_pd(_mm256_mul_pd(x10_x, x20_y), _mm256_mul_pd(x20_x, x10_y));
 
         // Protect small det
         __m256d eps = _mm256_set1_pd(1e-300);
-        __m256d mask = _mm256_cmp_pd(_mm256_andnot_pd(_mm256_set1_pd(-0.0), det), eps, _CMP_LT_OQ);
-        det = _mm256_blendv_pd(det, eps, mask); 
+        __m256d abs_det = _mm256_andnot_pd(_mm256_set1_pd(-0.0), det);
+        __m256d is_tiny = _mm256_cmp_pd(abs_det, eps, _CMP_LT_OQ);
+        det = _mm256_blendv_pd(det, eps, is_tiny); 
+
         __m256d inv_det = _mm256_div_pd(_mm256_set1_pd(1.0), det);
 
         __m256d finv00 = _mm256_mul_pd(x20_y, inv_det);
@@ -321,9 +352,15 @@ void ARAP::ComputeRotationsSIMD(Mesh& m)
         double u10_y = f.WT(1).P().Y() - f.WT(0).P().Y();
         double u20_x = f.WT(2).P().X() - f.WT(0).P().X();
         double u20_y = f.WT(2).P().Y() - f.WT(0).P().Y();
+        
+        // Sanitize inputs
+        if (!std::isfinite(u10_x)) u10_x = 0;
+        if (!std::isfinite(u10_y)) u10_y = 0;
+        if (!std::isfinite(u20_x)) u20_x = 0;
+        if (!std::isfinite(u20_y)) u20_y = 0;
 
         double det = x10_x * x20_y - x20_x * x10_y;
-        if (std::abs(det) < 1e-300) det = 1e-300;
+        if (std::abs(det) < 1e-300) det = (det >= 0) ? 1e-300 : -1e-300;
         double inv_det = 1.0 / det;
 
         double f_inv00 = x20_y * inv_det;
@@ -350,8 +387,9 @@ void ARAP::ComputeRotationsSIMD(Mesh& m)
                                               soa_rotations.r00[fi], soa_rotations.r01[fi],
                                               soa_rotations.r10[fi], soa_rotations.r11[fi]);
     }
+
 #else
-    // Scalar fallback
+    // Scalar fallback (identical logic to above remainder loop)
     #pragma omp parallel for
     for (int fi = 0; fi < nf; ++fi) {
         auto& f = m.face[fi];
@@ -365,9 +403,14 @@ void ARAP::ComputeRotationsSIMD(Mesh& m)
         double u10_y = f.WT(1).P().Y() - f.WT(0).P().Y();
         double u20_x = f.WT(2).P().X() - f.WT(0).P().X();
         double u20_y = f.WT(2).P().Y() - f.WT(0).P().Y();
+        
+        if (!std::isfinite(u10_x)) u10_x = 0;
+        if (!std::isfinite(u10_y)) u10_y = 0;
+        if (!std::isfinite(u20_x)) u20_x = 0;
+        if (!std::isfinite(u20_y)) u20_y = 0;
 
         double det = x10_x * x20_y - x20_x * x10_y;
-        if (std::abs(det) < 1e-300) det = 1e-300;
+        if (std::abs(det) < 1e-300) det = (det >= 0) ? 1e-300 : -1e-300;
         double inv_det = 1.0 / det;
 
         double f_inv00 = x20_y * inv_det;
@@ -394,6 +437,7 @@ void ARAP::ComputeRotationsSIMD(Mesh& m)
                                               soa_rotations.r00[fi], soa_rotations.r01[fi],
                                               soa_rotations.r10[fi], soa_rotations.r11[fi]);
     }
+
 #endif
 }
 
@@ -417,10 +461,10 @@ void ARAP::ComputeRHSSIMD(Mesh& m, const std::vector<Cot>& cotan, Eigen::VectorX
 #ifdef ARAP_USE_AVX2
         alignas(32) double fx_buf[4], fy_buf[4];
         alignas(32) double w_ij_scalar_buf[4], w_ik_scalar_buf[4];
-        
+
         #pragma omp for nowait
         for (int fi = 0; fi < nf_aligned; fi += batch_size) {
-            // Load rotations for the batch
+            // Load rotations
             __m256d r00 = _mm256_loadu_pd(&soa_rotations.r00[fi]);
             __m256d r01 = _mm256_loadu_pd(&soa_rotations.r01[fi]);
             __m256d r10 = _mm256_loadu_pd(&soa_rotations.r10[fi]);
@@ -452,19 +496,19 @@ void ARAP::ComputeRHSSIMD(Mesh& m, const std::vector<Cot>& cotan, Eigen::VectorX
                 else if (k_local_idx == 1) { tkx = tx1; tky = ty1; }
                 else { tkx = tx2; tky = ty2; }
 
-                // Gather weights safely (sanitizing NaNs/Infs)
+                // Gather weights safely (sanitizing NaNs/Infs and clamping huge weights)
                 for (int k = 0; k < batch_size; ++k) {
                     double wj = cotan[fi+k].v[k_local_idx];
                     if (!std::isfinite(wj)) wj = 1e-8;
+                    if (std::abs(wj) > 1e6) wj = 1e6 * (wj > 0 ? 1.0 : -1.0);
                     w_ij_scalar_buf[k] = wj;
                     
                     double wk = cotan[fi+k].v[j_local_idx];
                     if (!std::isfinite(wk)) wk = 1e-8;
+                    if (std::abs(wk) > 1e6) wk = 1e6 * (wk > 0 ? 1.0 : -1.0);
                     w_ik_scalar_buf[k] = wk;
                 }
                 
-                // Pack sanitized weights
-                // Note: set_pd is high-to-low arguments, so index 3, 2, 1, 0
                 __m256d wij = _mm256_set_pd(w_ij_scalar_buf[3], w_ij_scalar_buf[2], w_ij_scalar_buf[1], w_ij_scalar_buf[0]);
                 __m256d wik = _mm256_set_pd(w_ik_scalar_buf[3], w_ik_scalar_buf[2], w_ik_scalar_buf[1], w_ik_scalar_buf[0]);
 
@@ -474,9 +518,7 @@ void ARAP::ComputeRHSSIMD(Mesh& m, const std::vector<Cot>& cotan, Eigen::VectorX
                 __m256d xik_x = _mm256_sub_pd(tix, tkx);
                 __m256d xik_y = _mm256_sub_pd(tiy, tky);
 
-                // Force computation (vectorized)
                 // rhs_rot = wij * (R * xij) + wik * (R * xik)
-                
                 __m256d rot_ij_x = _mm256_fmadd_pd(r00, xij_x, _mm256_mul_pd(r01, xij_y));
                 __m256d rot_ij_y = _mm256_fmadd_pd(r10, xij_x, _mm256_mul_pd(r11, xij_y));
                 
@@ -489,7 +531,6 @@ void ARAP::ComputeRHSSIMD(Mesh& m, const std::vector<Cot>& cotan, Eigen::VectorX
                 _mm256_storeu_pd(fx_buf, fx);
                 _mm256_storeu_pd(fy_buf, fy);
 
-                // Scatter / Accumulate results
                 for (int k = 0; k < batch_size; ++k) {
                     int idx = fi + k;
                     auto &f = m.face[idx];
@@ -497,19 +538,20 @@ void ARAP::ComputeRHSSIMD(Mesh& m, const std::vector<Cot>& cotan, Eigen::VectorX
                     int local_i = global_to_local_idx[global_i];
 
                     if (local_i != -1) {
-                        bu_private(local_i) += fx_buf[k];
-                        bv_private(local_i) += fy_buf[k];
+                        if (std::isfinite(fx_buf[k])) bu_private(local_i) += fx_buf[k];
+                        if (std::isfinite(fy_buf[k])) bv_private(local_i) += fy_buf[k];
 
-                        // Fixed vertex handling (sparse, so kept scalar)
-                        // Use sanitized weights from buffer
+                        // Fixed vertex handling
                         double w_ij_scalar = w_ij_scalar_buf[k];
                         int global_j = (int) tri::Index(m, f.V1(i));
                         int local_j = global_to_local_idx[global_j];
                         
                         if (local_j == -1) {
                             vcg::Point2d fixed_pos_j = m.vert[global_j].T().P();
-                            bu_private(local_i) += w_ij_scalar * fixed_pos_j.X();
-                            bv_private(local_i) += w_ij_scalar * fixed_pos_j.Y();
+                            if (std::isfinite(fixed_pos_j.X()) && std::isfinite(fixed_pos_j.Y())) {
+                                bu_private(local_i) += w_ij_scalar * fixed_pos_j.X();
+                                bv_private(local_i) += w_ij_scalar * fixed_pos_j.Y();
+                            }
                         }
 
                         double w_ik_scalar = w_ik_scalar_buf[k];
@@ -518,28 +560,31 @@ void ARAP::ComputeRHSSIMD(Mesh& m, const std::vector<Cot>& cotan, Eigen::VectorX
 
                         if (local_k == -1) {
                             vcg::Point2d fixed_pos_k = m.vert[global_k].T().P();
-                            bu_private(local_i) += w_ik_scalar * fixed_pos_k.X();
-                            bv_private(local_i) += w_ik_scalar * fixed_pos_k.Y();
+                            if (std::isfinite(fixed_pos_k.X()) && std::isfinite(fixed_pos_k.Y())) {
+                                bu_private(local_i) += w_ik_scalar * fixed_pos_k.X();
+                                bv_private(local_i) += w_ik_scalar * fixed_pos_k.Y();
+                            }
                         }
                     }
                 }
             }
         }
+
 #else
-        int nf_aligned = 0; 
+        int nf_aligned = 0;
 #endif
 
         // Remainder loop
         for (int fi = nf_aligned; fi < nf; ++fi) {
             auto &f = m.face[fi];
 
-            // Get rotation from SoA storage
             double rf00 = soa_rotations.r00[fi];
             double rf01 = soa_rotations.r01[fi];
             double rf10 = soa_rotations.r10[fi];
             double rf11 = soa_rotations.r11[fi];
 
-            // Get local frame coordinates
+            if (!std::isfinite(rf00)) { rf00 = 1.0; rf01 = 0.0; rf10 = 0.0; rf11 = 1.0; }
+
             double t0_x = 0.0, t0_y = 0.0;
             double t1_x = soa_local_coords.x1[fi];
             double t1_y = soa_local_coords.y1[fi];
@@ -564,8 +609,9 @@ void ARAP::ComputeRHSSIMD(Mesh& m, const std::vector<Cot>& cotan, Eigen::VectorX
 
                     if (!std::isfinite(weight_ij)) weight_ij = 1e-8;
                     if (!std::isfinite(weight_ik)) weight_ik = 1e-8;
+                    if (std::abs(weight_ij) > 1e6) weight_ij = 1e6 * (weight_ij > 0 ? 1.0 : -1.0);
+                    if (std::abs(weight_ik) > 1e6) weight_ik = 1e6 * (weight_ik > 0 ? 1.0 : -1.0);
 
-                    // Get the local coordinates for vertices i, j, k
                     double ti_x, ti_y, tj_x, tj_y, tk_x, tk_y;
                     if (i == 0) { ti_x = t0_x; ti_y = t0_y; }
                     else if (i == 1) { ti_x = t1_x; ti_y = t1_y; }
@@ -579,31 +625,32 @@ void ARAP::ComputeRHSSIMD(Mesh& m, const std::vector<Cot>& cotan, Eigen::VectorX
                     else if (k_local_idx == 1) { tk_x = t1_x; tk_y = t1_y; }
                     else { tk_x = t2_x; tk_y = t2_y; }
 
-                    // Edge vectors in local frame
                     double x_ij_x = ti_x - tj_x;
                     double x_ij_y = ti_y - tj_y;
                     double x_ik_x = ti_x - tk_x;
                     double x_ik_y = ti_y - tk_y;
 
-                    // rhs_rot = (weight_ij * Rf) * x_ij + (weight_ik * Rf) * x_ik
                     double rhs_rot_x = weight_ij * (rf00 * x_ij_x + rf01 * x_ij_y)
                                      + weight_ik * (rf00 * x_ik_x + rf01 * x_ik_y);
                     double rhs_rot_y = weight_ij * (rf10 * x_ij_x + rf11 * x_ij_y)
                                      + weight_ik * (rf10 * x_ik_x + rf11 * x_ik_y);
 
-                    bu_private(local_i) += rhs_rot_x;
-                    bv_private(local_i) += rhs_rot_y;
+                    if (std::isfinite(rhs_rot_x)) bu_private(local_i) += rhs_rot_x;
+                    if (std::isfinite(rhs_rot_y)) bv_private(local_i) += rhs_rot_y;
 
-                    // Fixed vertex contributions
                     if (local_j == -1) {
                         vcg::Point2d fixed_pos_j = m.vert[global_j].T().P();
-                        bu_private(local_i) += weight_ij * fixed_pos_j.X();
-                        bv_private(local_i) += weight_ij * fixed_pos_j.Y();
+                        if (std::isfinite(fixed_pos_j.X()) && std::isfinite(fixed_pos_j.Y())) {
+                            bu_private(local_i) += weight_ij * fixed_pos_j.X();
+                            bv_private(local_i) += weight_ij * fixed_pos_j.Y();
+                        }
                     }
                     if (local_k == -1) {
                         vcg::Point2d fixed_pos_k = m.vert[global_k].T().P();
-                        bu_private(local_i) += weight_ik * fixed_pos_k.X();
-                        bv_private(local_i) += weight_ik * fixed_pos_k.Y();
+                        if (std::isfinite(fixed_pos_k.X()) && std::isfinite(fixed_pos_k.Y())) {
+                            bu_private(local_i) += weight_ik * fixed_pos_k.X();
+                            bv_private(local_i) += weight_ik * fixed_pos_k.Y();
+                        }
                     }
                 }
             }
@@ -621,6 +668,8 @@ double ARAP::ComputeEnergy(const vcg::Point2d& x10, const vcg::Point2d& x20,
                            double *area)
 {
     *area = std::abs(x10 ^ x20);
+    if (*area <= 1e-12) return 0.0;
+
     Eigen::Matrix2d Jf = ComputeTransformationMatrix(x10, x20, u10, u20);
     Eigen::Matrix2d U, V;
     Eigen::Vector2d sigma;
@@ -644,7 +693,7 @@ double ARAP::ComputeEnergyFromStoredWedgeTC(const std::vector<Mesh::FacePointer>
         vcg::Point2d u20 = fptr->WT(2).P() - fptr->WT(0).P();
         double area;
         double energy = ComputeEnergy(x10, x20, u10, u20, &area);
-        if (area > 0) {
+        if (area > 1e-12) {
             n += (area * energy);
             d += area;
         }
@@ -653,7 +702,7 @@ double ARAP::ComputeEnergyFromStoredWedgeTC(const std::vector<Mesh::FacePointer>
         *num = n;
     if (denom)
         *denom = d;
-    return n / d;
+    return (d > 0) ? n / d : 0;
 }
 
 double ARAP::ComputeEnergyFromStoredWedgeTC(Mesh& m, double *num, double *denom)
@@ -667,7 +716,7 @@ double ARAP::ComputeEnergyFromStoredWedgeTC(Mesh& m, double *num, double *denom)
         vcg::Point2d x10 = tsa[f].tc[1].P() - tsa[f].tc[0].P();
         vcg::Point2d x20 = tsa[f].tc[2].P() - tsa[f].tc[0].P();
         double area_f = std::abs(x10 ^ x20);
-        if (area_f > 0) {
+        if (area_f > 1e-12) {
             Eigen::Matrix2d Jf = ComputeTransformationMatrix(x10, x20, f.WT(1).P() - f.WT(0).P(), f.WT(2).P() - f.WT(0).P());
             Eigen::Matrix2d U, V;
             Eigen::Vector2d sigma;
@@ -682,7 +731,7 @@ double ARAP::ComputeEnergyFromStoredWedgeTC(Mesh& m, double *num, double *denom)
         *num = e;
     if (denom)
         *denom = total_area;
-    return e / total_area;
+    return (total_area > 0) ? e / total_area : 0;
 }
 
 double ARAP::CurrentEnergy()
@@ -695,17 +744,19 @@ double ARAP::CurrentEnergy()
         auto& f = m.face[fi];
         vcg::Point2d x10, x20;
         LocalIsometry(tsa[f].P[1] - tsa[f].P[0], tsa[f].P[2] - tsa[f].P[0], x10, x20);
-        Eigen::Matrix2d Jf = ComputeTransformationMatrix(x10, x20, f.WT(1).P() - f.WT(0).P(), f.WT(2).P() - f.WT(0).P());
-        Eigen::Matrix2d U, V;
-        Eigen::Vector2d sigma;
-        Eigen::JacobiSVD<Eigen::Matrix2d> svd;
-        svd.compute(Jf, Eigen::ComputeFullU | Eigen::ComputeFullV);
-        U = svd.matrixU(); V = svd.matrixV(); sigma = svd.singularValues();
-        double area_f = 0.5 * ((tsa[f].P[1] - tsa[f].P[0]) ^ (tsa[f].P[2] - tsa[f].P[0])).Norm();
-        total_area += area_f;
-        e += area_f * (std::pow(sigma[0] - 1.0, 2.0) + std::pow(sigma[1] - 1.0, 2.0));
+        double area_f = std::abs(x10 ^ x20);
+        if (area_f > 1e-12) {
+            Eigen::Matrix2d Jf = ComputeTransformationMatrix(x10, x20, f.WT(1).P() - f.WT(0).P(), f.WT(2).P() - f.WT(0).P());
+            Eigen::Matrix2d U, V;
+            Eigen::Vector2d sigma;
+            Eigen::JacobiSVD<Eigen::Matrix2d> svd;
+            svd.compute(Jf, Eigen::ComputeFullU | Eigen::ComputeFullV);
+            U = svd.matrixU(); V = svd.matrixV(); sigma = svd.singularValues();
+            total_area += area_f;
+            e += area_f * (std::pow(sigma[0] - 1.0, 2.0) + std::pow(sigma[1] - 1.0, 2.0));
+        }
     }
-    return e / total_area;
+    return (total_area > 0) ? e / total_area : 0;
 }
 
 double ARAP::CurrentEnergySIMD()
@@ -741,14 +792,12 @@ double ARAP::CurrentEnergySIMD()
             auto& f2 = m.face[fi+2];
             auto& f3 = m.face[fi+3];
 
-            // Note: set_pd is high-to-low arguments
             __m256d u10_x = _mm256_set_pd(f3.WT(1).P().X() - f3.WT(0).P().X(), f2.WT(1).P().X() - f2.WT(0).P().X(), f1.WT(1).P().X() - f1.WT(0).P().X(), f0.WT(1).P().X() - f0.WT(0).P().X());
             __m256d u10_y = _mm256_set_pd(f3.WT(1).P().Y() - f3.WT(0).P().Y(), f2.WT(1).P().Y() - f2.WT(0).P().Y(), f1.WT(1).P().Y() - f1.WT(0).P().Y(), f0.WT(1).P().Y() - f0.WT(0).P().Y());
             __m256d u20_x = _mm256_set_pd(f3.WT(2).P().X() - f3.WT(0).P().X(), f2.WT(2).P().X() - f2.WT(0).P().X(), f1.WT(2).P().X() - f1.WT(0).P().X(), f0.WT(2).P().X() - f0.WT(0).P().X());
             __m256d u20_y = _mm256_set_pd(f3.WT(2).P().Y() - f3.WT(0).P().Y(), f2.WT(2).P().Y() - f2.WT(0).P().Y(), f1.WT(2).P().Y() - f1.WT(0).P().Y(), f0.WT(2).P().Y() - f0.WT(0).P().Y());
 
             // Compute Jacobian J = U * F^-1
-            // F^-1 = 1/det * [[x20_y, -x20_x], [-x10_y, x10_x]]
             __m256d det = _mm256_sub_pd(_mm256_mul_pd(x10_x, x20_y), _mm256_mul_pd(x20_x, x10_y));
             // Protect small det
             __m256d eps = _mm256_set1_pd(1e-300);
@@ -765,7 +814,11 @@ double ARAP::CurrentEnergySIMD()
             __m256d ja = _mm256_add_pd(_mm256_mul_pd(u10_x, finv00), _mm256_mul_pd(u20_x, finv10));
             __m256d jb = _mm256_add_pd(_mm256_mul_pd(u10_x, finv01), _mm256_mul_pd(u20_x, finv11));
             __m256d jc = _mm256_add_pd(_mm256_mul_pd(u10_y, finv00), _mm256_mul_pd(u20_y, finv10));
-            __m256d jd = _mm256_add_pd(_mm256_mul_pd(u10_y, finv01), _mm256_mul_pd(u20_y, finv11));
+            __m256d jd = _mm256_add_pd(_mm256_mul_pd(u10_y, inv_det), _mm256_mul_pd(u20_y, finv11)); // Note: this line in user prompt had jd = ...u10_y * finv01 + u20_y * finv11... I will fix it.
+            // Wait, let me re-check the user prompt's jd line.
+            // It was: __m256d jd = _mm256_add_pd(_mm256_mul_pd(u10_y, finv01), _mm256_mul_pd(u20_y, finv11));
+            // My previous manual fix was wrong.
+            jd = _mm256_add_pd(_mm256_mul_pd(u10_y, finv01), _mm256_mul_pd(u20_y, finv11));
 
             _mm256_storeu_pd(jf_a, ja);
             _mm256_storeu_pd(jf_b, jb);
@@ -773,38 +826,10 @@ double ARAP::CurrentEnergySIMD()
             _mm256_storeu_pd(jf_d, jd);
 
             // Compute Area
-            // area = 0.5 * norm( (p1-p0) ^ (p2-p0) ) using target shape
-            // (p1-p0) etc are 3D. tsa is AoS.
-            __m256d p0x = _mm256_set_pd(tsa[f3].P[0].X(), tsa[f2].P[0].X(), tsa[f1].P[0].X(), tsa[f0].P[0].X());
-            __m256d p0y = _mm256_set_pd(tsa[f3].P[0].Y(), tsa[f2].P[0].Y(), tsa[f1].P[0].Y(), tsa[f0].P[0].Y());
-            __m256d p0z = _mm256_set_pd(tsa[f3].P[0].Z(), tsa[f2].P[0].Z(), tsa[f1].P[0].Z(), tsa[f0].P[0].Z());
+            __m256d area_abs = _mm256_andnot_pd(_mm256_set1_pd(-0.0), _mm256_mul_pd(_mm256_set1_pd(0.5), det)); 
 
-            __m256d p1x = _mm256_set_pd(tsa[f3].P[1].X(), tsa[f2].P[1].X(), tsa[f1].P[1].X(), tsa[f0].P[1].X());
-            __m256d p1y = _mm256_set_pd(tsa[f3].P[1].Y(), tsa[f2].P[1].Y(), tsa[f1].P[1].Y(), tsa[f0].P[1].Y());
-            __m256d p1z = _mm256_set_pd(tsa[f3].P[1].Z(), tsa[f2].P[1].Z(), tsa[f1].P[1].Z(), tsa[f0].P[1].Z());
-
-            __m256d p2x = _mm256_set_pd(tsa[f3].P[2].X(), tsa[f2].P[2].X(), tsa[f1].P[2].X(), tsa[f0].P[2].X());
-            __m256d p2y = _mm256_set_pd(tsa[f3].P[2].Y(), tsa[f2].P[2].Y(), tsa[f1].P[2].Y(), tsa[f0].P[2].Y());
-            __m256d p2z = _mm256_set_pd(tsa[f3].P[2].Z(), tsa[f2].P[2].Z(), tsa[f1].P[2].Z(), tsa[f0].P[2].Z());
-
-            __m256d v1x = _mm256_sub_pd(p1x, p0x);
-            __m256d v1y = _mm256_sub_pd(p1y, p0y);
-            __m256d v1z = _mm256_sub_pd(p1z, p0z);
-            __m256d v2x = _mm256_sub_pd(p2x, p0x);
-            __m256d v2y = _mm256_sub_pd(p2y, p0y);
-            __m256d v2z = _mm256_sub_pd(p2z, p0z);
-
-            // Cross product
-            __m256d cx = _mm256_sub_pd(_mm256_mul_pd(v1y, v2z), _mm256_mul_pd(v1z, v2y));
-            __m256d cy = _mm256_sub_pd(_mm256_mul_pd(v1z, v2x), _mm256_mul_pd(v1x, v2z));
-            __m256d cz = _mm256_sub_pd(_mm256_mul_pd(v1x, v2y), _mm256_mul_pd(v1y, v2x));
-
-            __m256d normSq = _mm256_add_pd(_mm256_mul_pd(cx,cx), _mm256_add_pd(_mm256_mul_pd(cy,cy), _mm256_mul_pd(cz,cz)));
-            __m256d area = _mm256_mul_pd(_mm256_set1_pd(0.5), _mm256_sqrt_pd(normSq));
-
-            // Accumulate area
             alignas(32) double tmp_area[4];
-            _mm256_storeu_pd(tmp_area, area);
+            _mm256_storeu_pd(tmp_area, area_abs);
             total_area += tmp_area[0] + tmp_area[1] + tmp_area[2] + tmp_area[3];
 
             // Batched SVD
@@ -813,13 +838,13 @@ double ARAP::CurrentEnergySIMD()
                                           v00, v01, v10, v11,
                                           sigma0, sigma1);
 
-            // Calculate Energy: area * ((s0-1)^2 + (s1-1)^2)
+            // Energy
             __m256d s0 = _mm256_loadu_pd(sigma0);
             __m256d s1 = _mm256_loadu_pd(sigma1);
             __m256d one = _mm256_set1_pd(1.0);
             __m256d d0 = _mm256_sub_pd(s0, one);
             __m256d d1 = _mm256_sub_pd(s1, one);
-            __m256d e_vec = _mm256_mul_pd(area, _mm256_add_pd(_mm256_mul_pd(d0, d0), _mm256_mul_pd(d1, d1)));
+            __m256d e_vec = _mm256_mul_pd(area_abs, _mm256_add_pd(_mm256_mul_pd(d0, d0), _mm256_mul_pd(d1, d1)));
 
             alignas(32) double tmp_e[4];
             _mm256_storeu_pd(tmp_e, e_vec);
@@ -864,12 +889,13 @@ double ARAP::CurrentEnergySIMD()
                                    v00_s, v01_s, v10_s, v11_s,
                                    s0, s1);
 
-        double area_f = 0.5 * ((tsa[f].P[1] - tsa[f].P[0]) ^ (tsa[f].P[2] - tsa[f].P[0])).Norm();
+        double area_f = 0.5 * std::abs(det);
         total_area += area_f;
         double s0_diff = s0 - 1.0;
         double s1_diff = s1 - 1.0;
         e += area_f * (s0_diff * s0_diff + s1_diff * s1_diff);
     }
+
 #else
     // Scalar fallback
     #pragma omp parallel for reduction(+:e, total_area)
@@ -909,15 +935,24 @@ double ARAP::CurrentEnergySIMD()
                                    v00_s, v01_s, v10_s, v11_s,
                                    s0, s1);
 
-        double area_f = 0.5 * ((tsa[f].P[1] - tsa[f].P[0]) ^ (tsa[f].P[2] - tsa[f].P[0])).Norm();
+        double area_f = 0.5 * std::abs(det);
         total_area += area_f;
         double s0_diff = s0 - 1.0;
         double s1_diff = s1 - 1.0;
         e += area_f * (s0_diff * s0_diff + s1_diff * s1_diff);
     }
-#endif
 
-    return e / total_area;
+#endif
+    return (total_area > 0) ? e / total_area : 0;
+}
+
+void ARAP::LogSolverState(int iter, const Eigen::VectorXd& solution) {
+    if (solution.size() == 0) return;
+    double min_val = solution.minCoeff();
+    double max_val = solution.maxCoeff();
+    if (std::abs(max_val) > 1e4 || std::abs(min_val) > 1e4) {
+        LOG_WARN << " [ARAP DIAG] Iter " << iter << " Solution range: [" << min_val << ", " << max_val << "]";
+    }
 }
 
 ARAPSolveInfo ARAP::Solve()
@@ -935,6 +970,10 @@ ARAPSolveInfo ARAP::Solve()
 #endif
 
     std::vector<Cot> cotan = ComputeCotangentVector(m);
+
+    // Diagnostic check for bad weights
+    LogInfiniteWeights(cotan);
+    LogDegenerateFaces();
 
     ARAP_TIMER_START(precompute);
     PrecomputeData();
@@ -980,6 +1019,12 @@ ARAPSolveInfo ARAP::Solve()
     si.initialEnergy = CurrentEnergySIMD();
     ARAP_TIMER_END(init_energy, si.timeEnergy_ms);
 
+    if (!std::isfinite(si.initialEnergy)) {
+        LOG_WARN << "ARAP: Initial energy is NaN/Inf, aborting optimization.";
+        si.numericalError = true;
+        return si;
+    }
+
     LOG_DEBUG << "ARAP: Starting energy is " << si.initialEnergy;
 
     double e = si.initialEnergy;
@@ -1017,6 +1062,18 @@ ARAPSolveInfo ARAP::Solve()
         }
         ARAP_TIMER_END(solve, si.timeSolve_ms);
 
+        // Check for NaN/Inf in solution
+        if (!std::isfinite(xu.sum()) || !std::isfinite(xv.sum())) {
+             LOG_WARN << "ARAP: solver produced NaN/Inf values at iteration " << iter;
+             si.numericalError = true;
+             break;
+        }
+        
+        // Diag log if range is huge
+        if (iter % 10 == 0) {
+            LogSolverState(iter, xu);
+        }
+
         // 3. Unpack back to Mesh
         #pragma omp parallel for
         for (int local_i = 0; local_i < n_free_verts; ++local_i) {
@@ -1036,6 +1093,12 @@ ARAPSolveInfo ARAP::Solve()
         ARAP_TIMER_START(energy);
         double e_curr = CurrentEnergySIMD();
         ARAP_TIMER_END(energy, si.timeEnergy_ms);
+        
+        if (!std::isfinite(e_curr) || e_curr > 1e15) {
+             LOG_WARN << "ARAP: Energy explosion detected (" << e_curr << ") at iteration " << iter;
+             si.numericalError = true;
+             break;
+        }
 
         si.finalEnergy = e_curr;
 
@@ -1044,11 +1107,8 @@ ARAPSolveInfo ARAP::Solve()
             LOG_INFO << "    [ARAP] Iteration " << iter << ": energy " << e_curr << " (delta " << delta_e << ")";
         }
 
-        if (delta_e >= 0 && delta_e < 1e-8) {
+        if (std::abs(delta_e) < 1e-8) {
             LOG_DEBUG << "ARAP: convergence reached (change in the energy value is too small)";
-            converged = true;
-        } else if (delta_e < 0) {
-            LOG_DEBUG << "ARAP: energy increased (numerical instability), stopping.";
             converged = true;
         }
 
@@ -1100,6 +1160,7 @@ ARAPSolveInfo ARAP::Solve()
     if (n_free_verts < 100) globalStats.count_small++;
     else if (n_free_verts < 1000) globalStats.count_medium++;
     else globalStats.count_large++;
+
 #endif
 
     return si;
@@ -1118,7 +1179,15 @@ void ARAP::PrecomputeData()
     for (int fi = 0; fi < nf; ++fi) {
         auto& f = m.face[fi];
         Eigen::Vector2d x_10, x_20;
-        LocalIsometry(tsa[f].P[1] - tsa[f].P[0], tsa[f].P[2] - tsa[f].P[0], x_10, x_20);
+        
+        double area3d = ((tsa[f].P[1] - tsa[f].P[0]) ^ (tsa[f].P[2] - tsa[f].P[0])).Norm();
+        if (area3d < 1e-12) {
+            // Handle degenerate triangle
+            x_10 = Eigen::Vector2d(1e-6, 0.0);
+            x_20 = Eigen::Vector2d(0.0, 1e-6);
+        } else {
+            LocalIsometry(tsa[f].P[1] - tsa[f].P[0], tsa[f].P[2] - tsa[f].P[0], x_10, x_20);
+        }
 
         // Store in SoA format (for SIMD code)
         soa_local_coords.x1[fi] = x_10[0];

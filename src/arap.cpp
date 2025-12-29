@@ -180,11 +180,18 @@ static std::vector<ARAP::Cot> ComputeCotangentVector(Mesh& m)
     for (int fi = 0; fi < m.FN(); ++fi) {
         auto& f = m.face[fi];
         ARAP::Cot c;
-        for (int i = 0; i < 3; ++i) {
-            int j = (i+1)%3;
-            int k = (i+2)%3;
-            double alpha_i = std::max(VecAngle(tsa[f].P[j] - tsa[f].P[i], tsa[f].P[k] - tsa[f].P[i]), eps);
-            c.v[i] = 0.5 * std::tan(M_PI_2 - alpha_i);
+        
+        // If the 3D triangle is degenerate, it should not contribute to the system.
+        double area3d = ((tsa[f].P[1] - tsa[f].P[0]) ^ (tsa[f].P[2] - tsa[f].P[0])).Norm();
+        if (area3d < 1e-12) {
+            c.v[0] = 0.0; c.v[1] = 0.0; c.v[2] = 0.0;
+        } else {
+            for (int i = 0; i < 3; ++i) {
+                int j = (i+1)%3;
+                int k = (i+2)%3;
+                double alpha_i = std::max(VecAngle(tsa[f].P[j] - tsa[f].P[i], tsa[f].P[k] - tsa[f].P[i]), eps);
+                c.v[i] = 0.5 * std::tan(M_PI_2 - alpha_i);
+            }
         }
         cotan[fi] = c;
     }
@@ -294,11 +301,12 @@ void ARAP::ComputeRotationsSIMD(Mesh& m)
         // Compute Jacobian J = U * F^-1 (Vectorized)
         __m256d det = _mm256_sub_pd(_mm256_mul_pd(x10_x, x20_y), _mm256_mul_pd(x20_x, x10_y));
 
-        // Protect small det
-        __m256d eps = _mm256_set1_pd(1e-300);
-        __m256d abs_det = _mm256_andnot_pd(_mm256_set1_pd(-0.0), det);
-        __m256d is_tiny = _mm256_cmp_pd(abs_det, eps, _CMP_LT_OQ);
-        det = _mm256_blendv_pd(det, eps, is_tiny); 
+        // 1. Create Mask: Only process faces with valid area
+        __m256d abs_det_real = _mm256_andnot_pd(_mm256_set1_pd(-0.0), det);
+        __m256d valid_mask = _mm256_cmp_pd(abs_det_real, _mm256_set1_pd(1e-20), _CMP_GT_OQ);
+
+        // 2. Prevent NaN: If invalid, set det=1.0 (result is discarded later)
+        det = _mm256_blendv_pd(_mm256_set1_pd(1.0), det, valid_mask);
 
         __m256d inv_det = _mm256_div_pd(_mm256_set1_pd(1.0), det);
 
@@ -328,6 +336,22 @@ void ARAP::ComputeRotationsSIMD(Mesh& m)
         arap_simd::batch_rotation_from_svd_avx2(u00, u01, u10, u11,
                                                  v00, v01, v10, v11,
                                                  r00, r01, r10, r11);
+
+        // 3. Mask Output: Invalid faces have Identity rotation
+        __m256d vr00 = _mm256_loadu_pd(r00);
+        __m256d vr01 = _mm256_loadu_pd(r01);
+        __m256d vr10 = _mm256_loadu_pd(r10);
+        __m256d vr11 = _mm256_loadu_pd(r11);
+
+        vr00 = _mm256_blendv_pd(_mm256_set1_pd(1.0), vr00, valid_mask);
+        vr01 = _mm256_blendv_pd(_mm256_setzero_pd(), vr01, valid_mask);
+        vr10 = _mm256_blendv_pd(_mm256_setzero_pd(), vr10, valid_mask);
+        vr11 = _mm256_blendv_pd(_mm256_set1_pd(1.0), vr11, valid_mask);
+
+        _mm256_storeu_pd(r00, vr00);
+        _mm256_storeu_pd(r01, vr01);
+        _mm256_storeu_pd(r10, vr10);
+        _mm256_storeu_pd(r11, vr11);
 
         // Store rotations
         for (int k = 0; k < batch_size; ++k) {
@@ -360,7 +384,11 @@ void ARAP::ComputeRotationsSIMD(Mesh& m)
         if (!std::isfinite(u20_y)) u20_y = 0;
 
         double det = x10_x * x20_y - x20_x * x10_y;
-        if (std::abs(det) < 1e-300) det = (det >= 0) ? 1e-300 : -1e-300;
+        if (std::abs(det) < 1e-20) {
+            soa_rotations.r00[fi] = 1.0; soa_rotations.r01[fi] = 0.0;
+            soa_rotations.r10[fi] = 0.0; soa_rotations.r11[fi] = 1.0;
+            continue;
+        }
         double inv_det = 1.0 / det;
 
         double f_inv00 = x20_y * inv_det;
@@ -410,7 +438,11 @@ void ARAP::ComputeRotationsSIMD(Mesh& m)
         if (!std::isfinite(u20_y)) u20_y = 0;
 
         double det = x10_x * x20_y - x20_x * x10_y;
-        if (std::abs(det) < 1e-300) det = (det >= 0) ? 1e-300 : -1e-300;
+        if (std::abs(det) < 1e-20) {
+            soa_rotations.r00[fi] = 1.0; soa_rotations.r01[fi] = 0.0;
+            soa_rotations.r10[fi] = 0.0; soa_rotations.r11[fi] = 1.0;
+            continue;
+        }
         double inv_det = 1.0 / det;
 
         double f_inv00 = x20_y * inv_det;
@@ -799,10 +831,14 @@ double ARAP::CurrentEnergySIMD()
 
             // Compute Jacobian J = U * F^-1
             __m256d det = _mm256_sub_pd(_mm256_mul_pd(x10_x, x20_y), _mm256_mul_pd(x20_x, x10_y));
-            // Protect small det
-            __m256d eps = _mm256_set1_pd(1e-300);
-            __m256d mask = _mm256_cmp_pd(_mm256_andnot_pd(_mm256_set1_pd(-0.0), det), eps, _CMP_LT_OQ);
-            det = _mm256_blendv_pd(det, eps, mask); 
+
+            // 1. Create Mask: Only process faces with valid area
+            __m256d abs_det_real = _mm256_andnot_pd(_mm256_set1_pd(-0.0), det);
+            __m256d valid_mask = _mm256_cmp_pd(abs_det_real, _mm256_set1_pd(1e-20), _CMP_GT_OQ);
+
+            // 2. Prevent NaN: If invalid, set det=1.0 (result is discarded later)
+            det = _mm256_blendv_pd(_mm256_set1_pd(1.0), det, valid_mask);
+
             __m256d inv_det = _mm256_div_pd(_mm256_set1_pd(1.0), det);
 
             __m256d finv00 = _mm256_mul_pd(x20_y, inv_det);
@@ -827,6 +863,7 @@ double ARAP::CurrentEnergySIMD()
 
             // Compute Area
             __m256d area_abs = _mm256_andnot_pd(_mm256_set1_pd(-0.0), _mm256_mul_pd(_mm256_set1_pd(0.5), det)); 
+            area_abs = _mm256_and_pd(area_abs, valid_mask);
 
             alignas(32) double tmp_area[4];
             _mm256_storeu_pd(tmp_area, area_abs);
@@ -845,6 +882,7 @@ double ARAP::CurrentEnergySIMD()
             __m256d d0 = _mm256_sub_pd(s0, one);
             __m256d d1 = _mm256_sub_pd(s1, one);
             __m256d e_vec = _mm256_mul_pd(area_abs, _mm256_add_pd(_mm256_mul_pd(d0, d0), _mm256_mul_pd(d1, d1)));
+            e_vec = _mm256_and_pd(e_vec, valid_mask);
 
             alignas(32) double tmp_e[4];
             _mm256_storeu_pd(tmp_e, e_vec);
@@ -867,7 +905,7 @@ double ARAP::CurrentEnergySIMD()
         double u20_y = f.WT(2).P().Y() - f.WT(0).P().Y();
 
         double det = x10_x * x20_y - x20_x * x10_y;
-        if (std::abs(det) < 1e-300) det = 1e-300;
+        if (std::abs(det) < 1e-20) continue;
         double inv_det = 1.0 / det;
 
         double f_inv00 = x20_y * inv_det;
@@ -913,7 +951,7 @@ double ARAP::CurrentEnergySIMD()
         double u20_y = f.WT(2).P().Y() - f.WT(0).P().Y();
 
         double det = x10_x * x20_y - x20_x * x10_y;
-        if (std::abs(det) < 1e-300) det = 1e-300;
+        if (std::abs(det) < 1e-20) continue;
         double inv_det = 1.0 / det;
 
         double f_inv00 = x20_y * inv_det;
@@ -950,8 +988,16 @@ void ARAP::LogSolverState(int iter, const Eigen::VectorXd& solution) {
     if (solution.size() == 0) return;
     double min_val = solution.minCoeff();
     double max_val = solution.maxCoeff();
-    if (std::abs(max_val) > 1e4 || std::abs(min_val) > 1e4) {
-        LOG_WARN << " [ARAP DIAG] Iter " << iter << " Solution range: [" << min_val << ", " << max_val << "]";
+    double span = max_val - min_val;
+
+    // A span > 1e8 (100 million pixels) is a clear sign of numerical explosion,
+    // even for 8k or 16k textures
+    if (span > 1e8 || !std::isfinite(span)) {
+        LOG_WARN << " [ARAP DIAG] Iter " << iter << " Solution EXPLOSION: span=" << span 
+                 << " range=[" << min_val << ", " << max_val << "]";
+    } else if (iter % 50 == 0) {
+        LOG_DEBUG << " [ARAP DIAG] Iter " << iter << " Solution: span=" << span 
+                  << " range=[" << min_val << ", " << max_val << "]";
     }
 }
 
@@ -1170,7 +1216,6 @@ void ARAP::PrecomputeData()
 {
     const int nf = m.FN();
 
-    // Allocate SoA structures
     soa_local_coords.resize(nf);
     soa_rotations.resize(nf);
 
@@ -1182,14 +1227,13 @@ void ARAP::PrecomputeData()
         
         double area3d = ((tsa[f].P[1] - tsa[f].P[0]) ^ (tsa[f].P[2] - tsa[f].P[0])).Norm();
         if (area3d < 1e-12) {
-            // Handle degenerate triangle
-            x_10 = Eigen::Vector2d(1e-6, 0.0);
-            x_20 = Eigen::Vector2d(0.0, 1e-6);
+            // Do not inflate. Zero area reference means zero energy contribution
+            x_10.setZero();
+            x_20.setZero();
         } else {
             LocalIsometry(tsa[f].P[1] - tsa[f].P[0], tsa[f].P[2] - tsa[f].P[0], x_10, x_20);
         }
 
-        // Store in SoA format (for SIMD code)
         soa_local_coords.x1[fi] = x_10[0];
         soa_local_coords.y1[fi] = x_10[1];
         soa_local_coords.x2[fi] = x_20[0];

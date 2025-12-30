@@ -24,7 +24,7 @@ SOURCES += \
     $$VCGPATH/wrap/openfbx/src/miniz.c \
     $$VCGPATH/wrap/ply/plylib.cpp \
     $$VCGPATH/wrap/qt/outline2_rasterizer.cpp \
-    $$VCGPATH/wrap/triangle/triangle.cpp
+    $$VCGPATH/wrap/triangle/triangle.c
 
 DEFINES += TRILIBRARY
 

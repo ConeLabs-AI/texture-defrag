@@ -66,6 +66,7 @@ struct FaceGroup {
     std::unordered_set<ChartHandle, Hasher> adj;
 
     int numMerges;
+    bool isSeamStraightened = false;
 
     float minMappedFaceValue;
     float maxMappedFaceValue;

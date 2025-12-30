@@ -106,6 +106,7 @@ void FaceGroup::Clear()
     fpVec.clear();
     adj.clear();
     numMerges = 0;
+    isSeamStraightened = false;
     minMappedFaceValue = -1;
     maxMappedFaceValue = -1;
     error = 0;

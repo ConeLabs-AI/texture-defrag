@@ -30,6 +30,7 @@
 #include "mesh_attribute.h"
 #include "seam_remover.h"
 #include "texture_rendering.h"
+#include "seam_straightening.h"
 
 #include <wrap/io_trimesh/io_mask.h>
 #include <wrap/system/qgetopt.h>
@@ -61,19 +62,20 @@
 #include <cmath>
 
 struct Args {
-    double m = 2.0;
-    double b = 0.2;
-    double d = 0.5;
-    double g = 0.025;
-    double u = 0.0;
-    double a = 5.0;
-    double t = 0.0;
+    double matchingThreshold = 2.0;
+    double boundaryTolerance = 0.2;
+    double localDistortionTolerance = 0.5;
+    double globalDistortionThreshold = 0.025;
+    double borderReductionTarget = 0.0;
+    double alpha = 5.0;
+    double timelimit = 0.0;
+    double straightenTolerancePixels = 2.0;
     std::string infile = "";
     std::string outfile = "";
-    int r = 4;
-    int l = 0;
-    double c = 8.0; // texture GPU cache budget in GB
-    double p = 8.0; // packing rasterization cache budget in GB
+    int rotationNum = 4;
+    int loggingLevel = 0;
+    double gpuCacheGB = 8.0; // texture GPU cache budget in GB
+    double packingCacheGB = 8.0; // packing rasterization cache budget in GB
 };
 
 void PrintArgsUsage(const char *binary);
@@ -95,16 +97,16 @@ int main(int argc, char *argv[])
 
     Args args = ParseArgs(argc, argv);
 
-    ap.matchingThreshold = args.m;
-    ap.boundaryTolerance = args.b;
-    ap.distortionTolerance = args.d;
-    ap.globalDistortionThreshold = args.g;
-    ap.UVBorderLengthReduction = args.u;
-    ap.offsetFactor = args.a;
-    ap.timelimit = args.t;
-    ap.rotationNum = args.r;
+    ap.matchingThreshold = args.matchingThreshold;
+    ap.boundaryTolerance = args.boundaryTolerance;
+    ap.distortionTolerance = args.localDistortionTolerance;
+    ap.globalDistortionThreshold = args.globalDistortionThreshold;
+    ap.UVBorderLengthReduction = args.borderReductionTarget;
+    ap.offsetFactor = args.alpha;
+    ap.timelimit = args.timelimit;
+    ap.rotationNum = args.rotationNum;
 
-    LOG_INIT(args.l);
+    LOG_INIT(args.loggingLevel);
 
     LOG_INFO << "Verifying OpenGL context availability...";
     EnsureOpenGLContextOrExit(mainContext, mainSurface);
@@ -132,17 +134,17 @@ int main(int argc, char *argv[])
 
     // Configure GPU texture cache budget
     if (textureObject) {
-        textureObject->SetCacheBudgetGB(args.c);
-        LOG_INFO << "Texture GPU cache budget configured to " << args.c << " GB";
+        textureObject->SetCacheBudgetGB(args.gpuCacheGB);
+        LOG_INFO << "Texture GPU cache budget configured to " << args.gpuCacheGB << " GB";
     }
 
     // Configure packing rasterization cache budget
     {
-        std::size_t rasterCacheBytes = (args.p <= 0.0)
+        std::size_t rasterCacheBytes = (args.packingCacheGB <= 0.0)
             ? 0
-            : static_cast<std::size_t>(args.p * 1024.0 * 1024.0 * 1024.0);
+            : static_cast<std::size_t>(args.packingCacheGB * 1024.0 * 1024.0 * 1024.0);
         SetRasterizerCacheMaxBytes(rasterCacheBytes);
-        LOG_INFO << "Packing rasterization cache budget configured to " << args.p << " GB";
+        LOG_INFO << "Packing rasterization cache budget configured to " << args.packingCacheGB << " GB";
     }
 
     LOG_INFO << "[DIAG] Input mesh loaded: " << m.FN() << " faces, " << m.VN() << " vertices.";
@@ -249,6 +251,17 @@ int main(int argc, char *argv[])
 
     GreedyOptimization(graph, state, ap);
     timings["Greedy optimization"] = t.TimeSinceLastCheck();
+
+    LOG_INFO << "Straightening seams...";
+    {
+        UVDefrag::SeamStraighteningParameters ssp;
+        double maxRes = (textureObject) ? (double)textureObject->MaxSize() : 1024.0;
+        ssp.initialTolerance = args.straightenTolerancePixels / maxRes;
+        LOG_INFO << "[DIAG] Seam straightening texel tolerance: " << args.straightenTolerancePixels << " pixels -> epsilon=" << ssp.initialTolerance << " (resolution=" << maxRes << ")";
+        UVDefrag::IntegrateSeamStraightening(graph, ssp);
+    }
+    timings["Seam straightening"] = t.TimeSinceLastCheck();
+
     int vndupOut;
 
     std::string savename = args.outfile;
@@ -560,58 +573,54 @@ int main(int argc, char *argv[])
 
 void PrintArgsUsage(const char *binary) {
     Args def;
-    std::cout << "Usage: " << binary << " MESHFILE [-mbdgutao]" << std::endl;
+    std::cout << "Usage: " << binary << " MESHFILE [OPTIONS]" << std::endl;
     std::cout << std::endl;
     std::cout << "MESHFILE specifies the input mesh file (supported formats are obj, ply and fbx)" << std::endl;
     std::cout << std::endl;
-    std::cout << "-m  <val>      " << "Matching error tolerance when attempting merge operations." << " (default: " << def.m << ")" << std::endl;
-    std::cout << "-b  <val>      " << "Maximum tolerance on the seam-length to chart-perimeter ratio when attempting merge operations. Range is [0,1]." << " (default: " << def.b << ")" << std::endl;
-    std::cout << "-d  <val>      " << "Local ARAP distortion tolerance when performing the local UV optimization." << " (default: " << def.d << ")" << std::endl;
-    std::cout << "-g  <val>      " << "Global ARAP distortion tolerance when performing the local UV optimization." << " (default: " << def.g << ")" << std::endl;
-    std::cout << "-u  <val>      " << "UV border reduction target in percentage relative to the input. Range is [0,1]." << " (default: " << def.u << ")" << std::endl;
-    std::cout << "-a  <val>      " << "Alpha parameter to control the UV optimization area size." << " (default: " << def.a << ")" << std::endl;
-    std::cout << "-t  <val>      " << "Time-limit for the atlas clustering (in seconds)." << " (default: " << def.t << ")" << std::endl;
-    std::cout << "-o  <val>      " << "Output mesh file. Supported formats are obj and ply." << " (default: out_MESHFILE" << ")" << std::endl;
-    std::cout << "-r  <val>      " << "Number of rotations to try (e.g., 4 for 0/90/180/270, 1 for no rotation). If > 1, must be multiple of 4." << " (default: " << def.r << ")" << std::endl;
-    std::cout << "-l  <val>      " << "Logging level. 0 for minimal verbosity, 1 for verbose output, 2 for debug output." << " (default: " << def.l << ")" << std::endl;
-    std::cout << "-c  <val>      " << "Texture GPU cache budget in GB. Set 0 for unlimited." << " (default: " << def.c << ")" << std::endl;
-    std::cout << "-p  <val>      " << "Packing rasterization cache budget in GB. Set 0 for unlimited." << " (default: " << def.p << ")" << std::endl;
+    std::cout << "Options:" << std::endl;
+    std::cout << "  -m, --matching-threshold <val>  " << "Matching error tolerance for merge operations." << " (default: " << def.matchingThreshold << ")" << std::endl;
+    std::cout << "  -b, --boundary-tolerance <val>  " << "Max tolerance on seam-length to perimeter ratio [0,1]." << " (default: " << def.boundaryTolerance << ")" << std::endl;
+    std::cout << "  -d, --local-distortion <val>    " << "Local ARAP distortion tolerance for UV optimization." << " (default: " << def.localDistortionTolerance << ")" << std::endl;
+    std::cout << "  -g, --global-distortion <val>   " << "Global ARAP distortion threshold." << " (default: " << def.globalDistortionThreshold << ")" << std::endl;
+    std::cout << "  -u, --reduction-target <val>    " << "UV border reduction target percentage [0,1]." << " (default: " << def.borderReductionTarget << ")" << std::endl;
+    std::cout << "  -a, --alpha <val>               " << "Alpha parameter for UV optimization area size." << " (default: " << def.alpha << ")" << std::endl;
+    std::cout << "  -t, --time-limit <val>          " << "Time-limit for atlas clustering (seconds)." << " (default: " << def.timelimit << ")" << std::endl;
+    std::cout << "  -k, --straighten-pixels <val>   " << "Allowable deviation in pixels for seam straightening." << " (default: " << def.straightenTolerancePixels << ")" << std::endl;
+    std::cout << "  -o, --output <val>              " << "Output mesh file (obj or ply)." << " (default: out_MESHFILE" << ")" << std::endl;
+    std::cout << "  -r, --rotations <val>           " << "Number of rotations to try (must be multiple of 4)." << " (default: " << def.rotationNum << ")" << std::endl;
+    std::cout << "  -l, --loglevel <val>            " << "Logging level (0: minimal, 1: verbose, 2: debug)." << " (default: " << def.loggingLevel << ")" << std::endl;
+    std::cout << "  -c, --gpu-cache <val>           " << "Texture GPU cache budget in GB (0: unlimited)." << " (default: " << def.gpuCacheGB << ")" << std::endl;
+    std::cout << "  -p, --packing-cache <val>       " << "Packing rasterization cache budget in GB (0: unlimited)." << " (default: " << def.packingCacheGB << ")" << std::endl;
 }
 
 bool ParseOption(const std::string& option, const std::string& argument, Args *args)
 {
-    ensure(option.size() == 2);
-    if (option[1] == 'o') {
-        args->outfile = argument;
-        return true;
-    }
-    if (option[1] == 'l') {
-        args->l = std::stoi(argument);
-        if (args->l >= 0)
-            return true;
+    try {
+        if (option == "-m" || option == "--matching-threshold") args->matchingThreshold = std::stod(argument);
+        else if (option == "-b" || option == "--boundary-tolerance") args->boundaryTolerance = std::stod(argument);
+        else if (option == "-d" || option == "--local-distortion") args->localDistortionTolerance = std::stod(argument);
+        else if (option == "-g" || option == "--global-distortion") args->globalDistortionThreshold = std::stod(argument);
+        else if (option == "-u" || option == "--reduction-target") args->borderReductionTarget = std::stod(argument);
+        else if (option == "-a" || option == "--alpha") args->alpha = std::stod(argument);
+        else if (option == "-t" || option == "--time-limit") args->timelimit = std::stod(argument);
+        else if (option == "-k" || option == "--straighten-pixels") args->straightenTolerancePixels = std::stod(argument);
+        else if (option == "-o" || option == "--output") args->outfile = argument;
+        else if (option == "-r" || option == "--rotations") args->rotationNum = std::stoi(argument);
+        else if (option == "-l" || option == "--loglevel") {
+            args->loggingLevel = std::stoi(argument);
+            if (args->loggingLevel < 0) {
+                std::cerr << "Logging level must be positive" << std::endl << std::endl;
+                return false;
+            }
+        }
+        else if (option == "-c" || option == "--gpu-cache") args->gpuCacheGB = std::stod(argument);
+        else if (option == "-p" || option == "--packing-cache") args->packingCacheGB = std::stod(argument);
         else {
-            std::cerr << "Logging level must be positive" << std::endl << std::endl;
+            std::cerr << "Unrecognized option " << option << std::endl << std::endl;
             return false;
         }
-    }
-    try {
-        switch (option[1]) {
-            case 'm': args->m = std::stod(argument); break;
-            case 'b': args->b = std::stod(argument); break;
-            case 'd': args->d = std::stod(argument); break;
-            case 'g': args->g = std::stod(argument); break;
-            case 'u': args->u = std::stod(argument); break;
-            case 'a': args->a = std::stod(argument); break;
-            case 't': args->t = std::stod(argument); break;
-            case 'r': args->r = std::stoi(argument); break;
-            case 'c': args->c = std::stod(argument); break;
-            case 'p': args->p = std::stod(argument); break;
-            default:
-                std::cerr << "Unrecognized option " << option << std::endl << std::endl;
-                return false;
-        }
     } catch (const std::exception& e) {
-        std::cerr << "Error while parsing option `" << option << " " << argument << "`"; std::cerr << ": " << e.what() << std::endl << std::endl;;
+        std::cerr << "Error while parsing option `" << option << " " << argument << "`: " << e.what() << std::endl << std::endl;
         return false;
     }
     return true;
@@ -626,19 +635,19 @@ Args ParseArgs(int argc, char *argv[])
 
     Args args;
 
-    for (int i = 0; i < argc; ++i) {
+    for (int i = 1; i < argc; ++i) {
         std::string argi(argv[i]);
-        if (argi[0] == '-' && argi.size() == 2) {
+        if (argi[0] == '-') {
+            std::string option = argi;
             i++;
             if (i >= argc) {
-                std::cerr << "Missing argument for option " << argi << std::endl << std::endl;
+                std::cerr << "Missing argument for option " << option << std::endl << std::endl;
                 PrintArgsUsage(argv[0]);
                 std::exit(-1);
-            } else {
-                if (!ParseOption(argi, std::string(argv[i]), &args)) {
-                    PrintArgsUsage(argv[0]);
-                    std::exit(-1);
-                }
+            }
+            if (!ParseOption(option, std::string(argv[i]), &args)) {
+                PrintArgsUsage(argv[0]);
+                std::exit(-1);
             }
         } else {
             args.infile = argi;

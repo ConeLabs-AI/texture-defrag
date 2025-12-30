@@ -16,13 +16,17 @@ SOURCES += \
     ../src/arap.cpp \
     ../src/shell.cpp \
     ../src/texture_object.cpp \
+    ../src/seam_straightening.cpp \
     main.cpp
 
 SOURCES += \
     $$VCGPATH/wrap/openfbx/src/ofbx.cpp \
     $$VCGPATH/wrap/openfbx/src/miniz.c \
     $$VCGPATH/wrap/ply/plylib.cpp \
-    $$VCGPATH/wrap/qt/outline2_rasterizer.cpp
+    $$VCGPATH/wrap/qt/outline2_rasterizer.cpp \
+    $$VCGPATH/wrap/triangle/triangle.cpp
+
+DEFINES += TRILIBRARY
 
 HEADERS += \
     ../src/intersection.h \
@@ -44,4 +48,7 @@ HEADERS += \
     ../src/matching.h \
     ../src/arap.h \
     ../src/shell.h \
-    ../src/texture_object.h
+    ../src/texture_object.h \
+    ../src/rdp.h \
+    ../src/harmonic_map_utils.h \
+    ../src/seam_straightening.h

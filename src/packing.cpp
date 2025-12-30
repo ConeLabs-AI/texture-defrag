@@ -816,6 +816,7 @@ void IntegerShift(Mesh& m, const std::vector<ChartHandle>& chartsToPack, const s
     auto Rotate = [] (vcg::Point2d p, double theta) -> vcg::Point2d { return p.Rotate(theta); };
 
     for (auto c : chartsToPack) {
+        if (c->isSeamStraightened) continue;
         auto it = anchorMap.find(c);
         if (it != anchorMap.end()) {
             Mesh::FacePointer fptr = &(m.face[it->second]);
@@ -847,7 +848,7 @@ void IntegerShift(Mesh& m, const std::vector<ChartHandle>& chartsToPack, const s
             }
 
             int ti = fptr->cWT(0).N();
-            if (ti >= (int) texszVec.size()) {
+            if (ti < 0 || ti >= (int)texszVec.size()) {
                 LOG_ERR << "[VALIDATION] IntegerShift: texture index " << ti
                         << " out of bounds for texszVec.size()=" << texszVec.size() << ". Aborting.";
                 std::exit(-1);

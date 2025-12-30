@@ -24,9 +24,12 @@ SOURCES += \
     $$VCGPATH/wrap/openfbx/src/miniz.c \
     $$VCGPATH/wrap/ply/plylib.cpp \
     $$VCGPATH/wrap/qt/outline2_rasterizer.cpp \
-    $$VCGPATH/wrap/triangle/triangle.c
+    $$VCGPATH/wrap/triangle/triangle.cpp
 
 DEFINES += TRILIBRARY
+
+# triangle.cpp uses old K&R C function syntax
+QMAKE_CXXFLAGS += -fpermissive
 
 HEADERS += \
     ../src/intersection.h \

@@ -252,6 +252,10 @@
 #define REAL double
 #endif
 
+#ifndef TRI_REAL
+#define TRI_REAL REAL
+#endif
+
 #ifndef VOID
 #define VOID int
 #endif

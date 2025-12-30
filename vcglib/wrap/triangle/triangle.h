@@ -257,7 +257,7 @@
 #endif
 
 #ifndef VOID
-#define VOID int
+#define VOID void
 #endif
 
 #ifdef __cplusplus

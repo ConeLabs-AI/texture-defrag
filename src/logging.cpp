@@ -30,10 +30,6 @@
 #include <iomanip>
 #include <iostream>
 
-#ifdef __APPLE__
-#include <mach/mach.h>
-#endif
-
 namespace logging {
 
 Buffer::Buffer(int level)
@@ -126,12 +122,6 @@ void LogMemoryUsage()
         if (line.rfind("VmSize:", 0) == 0 || line.rfind("VmRSS:", 0) == 0 || line.rfind("VmHWM:", 0) == 0) {
             LOG_INFO << "[MEM] " << line;
         }
-    }
-#elif defined(__APPLE__)
-    struct mach_task_basic_info info;
-    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
-    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) == KERN_SUCCESS) {
-        LOG_INFO << "[MEM] RSS: " << (info.resident_size / (1024 * 1024)) << " MB";
     }
 #else
     LOG_WARN << "LogMemoryUsage() not implemented for this platform.";

@@ -105,6 +105,16 @@ bool LoadMesh(const char *fileName, Mesh& m, TextureObjectHandle& textureObject,
 
 bool SaveMesh(const char *fileName, Mesh& m, const std::vector<std::shared_ptr<QImage>>& textureImages, bool color)
 {
+    // Ensure output directory exists
+    QFileInfo fi(fileName);
+    QDir outDir = fi.absoluteDir();
+    if (!outDir.exists()) {
+        if (!outDir.mkpath(".")) {
+            LOG_ERR << "Failed to create output directory: " << outDir.absolutePath().toStdString();
+            return false;
+        }
+    }
+
     int mask = tri::io::Mask::IOM_WEDGTEXCOORD;
 
     if (textureImages.size() > 0 && m.textures.empty()) {

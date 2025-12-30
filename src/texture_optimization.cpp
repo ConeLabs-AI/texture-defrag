@@ -40,7 +40,6 @@
 
 #include <Eigen/SVD>
 
-#include "arap_simd.h"
 
 static void MirrorU(ChartHandle chart);
 
@@ -96,21 +95,19 @@ int RotateChartForResampling(ChartHandle chart, const std::set<Mesh::FacePointer
         if (areaUV_original <= 1e-12) continue;
 
         Eigen::Matrix2d Jf = ComputeTransformationMatrix(x10, x20, u10, u20);
-        
-        // Optimize: Use closed-form SVD instead of iterative Eigen::JacobiSVD
-        double a = Jf(0,0), b = Jf(0,1), c = Jf(1,0), d = Jf(1,1);
-        double u00_s, u01_s, u10_s, u11_s, v00_s, v01_s, v10_s, v11_s, s0, s1;
-        arap_simd::scalar::svd2x2(a, b, c, d, u00_s, u01_s, u10_s, u11_s, v00_s, v01_s, v10_s, v11_s, s0, s1);
+        Eigen::JacobiSVD<Eigen::Matrix2d> svd(Jf, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        Eigen::Vector2d sigma = svd.singularValues();
 
         // Check if nearly rigid (isometry)
-        if (std::abs(s0 - 1.0) < RIGID_TOLERANCE && std::abs(s1 - 1.0) < RIGID_TOLERANCE) {
+        if (std::abs(sigma[0] - 1.0) < RIGID_TOLERANCE && std::abs(sigma[1] - 1.0) < RIGID_TOLERANCE) {
+            Eigen::Matrix2d R = svd.matrixU() * svd.matrixV().transpose();
+            if (R.determinant() < 0) {
+                Eigen::Matrix2d U = svd.matrixU();
+                U.col(1) *= -1;
+                R = U * svd.matrixV().transpose();
+            }
             
-            double r00, r01, r10, r11;
-            arap_simd::scalar::rotation_from_svd(u00_s, u01_s, u10_s, u11_s, v00_s, v01_s, v10_s, v11_s, r00, r01, r10, r11);
-            
-            // R = [[r00, r01], [r10, r11]]
-            // angle = atan2(R[1,0], R[0,0])
-            double angle = std::atan2(r10, r00);
+            double angle = std::atan2(R(1, 0), R(0, 0));
             
             bool found = false;
             for (int ci = 0; ci < (int)clusters.size(); ++ci) {

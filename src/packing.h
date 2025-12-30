@@ -41,8 +41,8 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
  * of the chart texture coordinates.
  * NOTE: It assumes the face-face topology is computed according to the wedge
  * texture coordinates of the chart/mesh */
-Outline2f ExtractOutline2f(FaceGroup& chart, int* warningCounter = nullptr);
-Outline2d ExtractOutline2d(FaceGroup& chart, int* warningCounter = nullptr);
+Outline2f ExtractOutline2f(FaceGroup& chart);
+Outline2d ExtractOutline2d(FaceGroup& chart);
 
 
 void IntegerShift(Mesh& m,

@@ -16,7 +16,6 @@ INCLUDEPATH += $$PWD/src $$VCGPATH $$VCGPATH/eigenlib
 
 DEFINES += EIGEN_DONT_ALIGN_STATICALLY
 DEFINES += EIGEN_MAX_STATIC_ALIGN_BYTES=0
-DEFINES += ARAP_ENABLE_TIMING
 
 #### PLATFORM SPECIFIC #########################################################
 

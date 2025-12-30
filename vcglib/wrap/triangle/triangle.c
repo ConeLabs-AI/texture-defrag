@@ -340,17 +340,10 @@
 
 #define ONETHIRD 0.333333333333333333333333333333333333333333333333333333333333
 
-
-/* Define the size large enough to store and operate on a pointer.           */
-#define INT_PTR unsigned long long
-
-
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <cmath>
-#include <string>
-#include <stdexcept>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
 #ifndef NO_TIMER
 #include <sys/time.h>
 #endif /* not NO_TIMER */
@@ -367,8 +360,8 @@
 /* A few forward declarations.                                               */
 
 #ifndef TRILIBRARY
-char *readline(char *string, FILE *infile, char *infilename);
-char *findfield(char *string);
+char *readline();
+char *findfield();
 #endif /* not TRILIBRARY */
 
 /* Labels that signify the result of point location.  The result of a        */
@@ -648,12 +641,12 @@ struct memorypool {
 
 /* Global constants.                                                         */
 
-static REAL splitter;       /* Used to split REAL factors for exact multiplication. */
-static REAL epsilon;                             /* Floating-point machine epsilon. */
-static REAL resulterrbound;
-static REAL ccwerrboundA, ccwerrboundB, ccwerrboundC;
-static REAL iccerrboundA, iccerrboundB, iccerrboundC;
-static REAL o3derrboundA, o3derrboundB, o3derrboundC;
+REAL splitter;       /* Used to split REAL factors for exact multiplication. */
+REAL epsilon;                             /* Floating-point machine epsilon. */
+REAL resulterrbound;
+REAL ccwerrboundA, ccwerrboundB, ccwerrboundC;
+REAL iccerrboundA, iccerrboundB, iccerrboundC;
+REAL o3derrboundA, o3derrboundB, o3derrboundC;
 
 /* Random number seed is not constant, but I've made it global anyway.       */
 
@@ -945,16 +938,16 @@ int minus1mod3[3] = {2, 0, 1};
 /*   extracted from the two least significant bits of the pointer.           */
 
 #define decode(ptr, otri)                                                     \
-  (otri).orient = (int) ((INT_PTR) (ptr) & (INT_PTR) 3l);                     \
+  (otri).orient = (int) ((unsigned long) (ptr) & (unsigned long) 3l);         \
   (otri).tri = (triangle *)                                                   \
-                  ((INT_PTR) (ptr) ^ (INT_PTR) (otri).orient)
+                  ((unsigned long) (ptr) ^ (unsigned long) (otri).orient)
 
 /* encode() compresses an oriented triangle into a single pointer.  It       */
 /*   relies on the assumption that all triangles are aligned to four-byte    */
 /*   boundaries, so the two least significant bits of (otri).tri are zero.   */
 
 #define encode(otri)                                                          \
-  (triangle) ((INT_PTR) (otri).tri | (INT_PTR) (otri).orient)
+  (triangle) ((unsigned long) (otri).tri | (unsigned long) (otri).orient)
 
 /* The following handle manipulation primitives are all described by Guibas  */
 /*   and Stolfi.  However, Guibas and Stolfi use an edge-based data          */
@@ -1118,16 +1111,16 @@ int minus1mod3[3] = {2, 0, 1};
 
 #define infect(otri)                                                          \
   (otri).tri[6] = (triangle)                                                  \
-                    ((INT_PTR) (otri).tri[6] | (INT_PTR) 2l)
+                    ((unsigned long) (otri).tri[6] | (unsigned long) 2l)
 
 #define uninfect(otri)                                                        \
   (otri).tri[6] = (triangle)                                                  \
-                    ((INT_PTR) (otri).tri[6] & ~ (INT_PTR) 2l)
+                    ((unsigned long) (otri).tri[6] & ~ (unsigned long) 2l)
 
 /* Test a triangle for viral infection.                                      */
 
 #define infected(otri)                                                        \
-  (((INT_PTR) (otri).tri[6] & (INT_PTR) 2l) != 0l)
+  (((unsigned long) (otri).tri[6] & (unsigned long) 2l) != 0l)
 
 /* Check or set a triangle's attributes.                                     */
 
@@ -1165,16 +1158,16 @@ int minus1mod3[3] = {2, 0, 1};
 /*   are masked out to produce the real pointer.                             */
 
 #define sdecode(sptr, osub)                                                   \
-  (osub).ssorient = (int) ((INT_PTR) (sptr) & (INT_PTR) 1l);                  \
+  (osub).ssorient = (int) ((unsigned long) (sptr) & (unsigned long) 1l);      \
   (osub).ss = (subseg *)                                                      \
-              ((INT_PTR) (sptr) & ~ (INT_PTR) 3l)
+              ((unsigned long) (sptr) & ~ (unsigned long) 3l)
 
 /* sencode() compresses an oriented subsegment into a single pointer.  It    */
 /*   relies on the assumption that all subsegments are aligned to two-byte   */
 /*   boundaries, so the least significant bit of (osub).ss is zero.          */
 
 #define sencode(osub)                                                         \
-  (subseg) ((INT_PTR) (osub).ss | (INT_PTR) (osub).ssorient)
+  (subseg) ((unsigned long) (osub).ss | (unsigned long) (osub).ssorient)
 
 /* ssym() toggles the orientation of a subsegment.                           */
 
@@ -1422,7 +1415,7 @@ int status;
 #endif /* not ANSI_DECLARATORS */
 
 {
-  throw std::runtime_error("triexit("+std::to_string(status)+")");
+  exit(status);
 }
 
 #ifdef ANSI_DECLARATORS
@@ -3898,7 +3891,7 @@ struct memorypool *pool;
 #endif /* not ANSI_DECLARATORS */
 
 {
-  INT_PTR alignptr = 0;
+  unsigned long alignptr;
 
   pool->items = 0;
   pool->maxitems = 0;
@@ -3906,11 +3899,11 @@ struct memorypool *pool;
   /* Set the currently active block. */
   pool->nowblock = pool->firstblock;
   /* Find the first item in the pool.  Increment by the size of (VOID *). */
-  alignptr = (INT_PTR) (pool->nowblock + 1);
+  alignptr = (unsigned long) (pool->nowblock + 1);
   /* Align the item on an `alignbytes'-byte boundary. */
   pool->nextitem = (VOID *)
-    (alignptr + (INT_PTR) pool->alignbytes -
-     (alignptr % (INT_PTR) pool->alignbytes));
+    (alignptr + (unsigned long) pool->alignbytes -
+     (alignptr % (unsigned long) pool->alignbytes));
   /* There are lots of unallocated items left in this block. */
   pool->unallocateditems = pool->itemsfirstblock;
   /* The stack of deallocated items is empty. */
@@ -4015,7 +4008,7 @@ struct memorypool *pool;
 {
   VOID *newitem;
   VOID **newblock;
-  INT_PTR alignptr = 0;
+  unsigned long alignptr;
 
   /* First check the linked list of dead items.  If the list is not   */
   /*   empty, allocate an item from the list rather than a fresh one. */
@@ -4040,11 +4033,11 @@ struct memorypool *pool;
       pool->nowblock = (VOID **) *(pool->nowblock);
       /* Find the first item in the block.    */
       /*   Increment by the size of (VOID *). */
-      alignptr = (INT_PTR) (pool->nowblock + 1);
+      alignptr = (unsigned long) (pool->nowblock + 1);
       /* Align the item on an `alignbytes'-byte boundary. */
       pool->nextitem = (VOID *)
-        (alignptr + (INT_PTR) pool->alignbytes -
-         (alignptr % (INT_PTR) pool->alignbytes));
+        (alignptr + (unsigned long) pool->alignbytes -
+         (alignptr % (unsigned long) pool->alignbytes));
       /* There are lots of unallocated items left in this block. */
       pool->unallocateditems = pool->itemsperblock;
     }
@@ -4099,16 +4092,16 @@ struct memorypool *pool;
 #endif /* not ANSI_DECLARATORS */
 
 {
-  INT_PTR alignptr = 0;
+  unsigned long alignptr;
 
   /* Begin the traversal in the first block. */
   pool->pathblock = pool->firstblock;
   /* Find the first item in the block.  Increment by the size of (VOID *). */
-  alignptr = (INT_PTR) (pool->pathblock + 1);
+  alignptr = (unsigned long) (pool->pathblock + 1);
   /* Align with item on an `alignbytes'-byte boundary. */
   pool->pathitem = (VOID *)
-    (alignptr + (INT_PTR) pool->alignbytes -
-     (alignptr % (INT_PTR) pool->alignbytes));
+    (alignptr + (unsigned long) pool->alignbytes -
+     (alignptr % (unsigned long) pool->alignbytes));
   /* Set the number of items left in the current block. */
   pool->pathitemsleft = pool->itemsfirstblock;
 }
@@ -4136,7 +4129,7 @@ struct memorypool *pool;
 
 {
   VOID *newitem;
-  INT_PTR alignptr = 0;
+  unsigned long alignptr;
 
   /* Stop upon exhausting the list of items. */
   if (pool->pathitem == pool->nextitem) {
@@ -4148,11 +4141,11 @@ struct memorypool *pool;
     /* Find the next block. */
     pool->pathblock = (VOID **) *(pool->pathblock);
     /* Find the first item in the block.  Increment by the size of (VOID *). */
-    alignptr = (INT_PTR) (pool->pathblock + 1);
+    alignptr = (unsigned long) (pool->pathblock + 1);
     /* Align with item on an `alignbytes'-byte boundary. */
     pool->pathitem = (VOID *)
-      (alignptr + (INT_PTR) pool->alignbytes -
-       (alignptr % (INT_PTR) pool->alignbytes));
+      (alignptr + (unsigned long) pool->alignbytes -
+       (alignptr % (unsigned long) pool->alignbytes));
     /* Set the number of items left in the current block. */
     pool->pathitemsleft = pool->itemsperblock;
   }
@@ -4204,16 +4197,16 @@ int subsegbytes;
 #endif /* not ANSI_DECLARATORS */
 
 {
-  INT_PTR alignptr = 0;
+  unsigned long alignptr;
 
   /* Set up `dummytri', the `triangle' that occupies "outer space." */
   m->dummytribase = (triangle *) trimalloc(trianglebytes +
                                            m->triangles.alignbytes);
   /* Align `dummytri' on a `triangles.alignbytes'-byte boundary. */
-  alignptr = (INT_PTR) m->dummytribase;
+  alignptr = (unsigned long) m->dummytribase;
   m->dummytri = (triangle *)
-    (alignptr + (INT_PTR) m->triangles.alignbytes -
-     (alignptr % (INT_PTR) m->triangles.alignbytes));
+    (alignptr + (unsigned long) m->triangles.alignbytes -
+     (alignptr % (unsigned long) m->triangles.alignbytes));
   /* Initialize the three adjoining triangles to be "outer space."  These  */
   /*   will eventually be changed by various bonding operations, but their */
   /*   values don't really matter, as long as they can legally be          */
@@ -4233,10 +4226,10 @@ int subsegbytes;
     m->dummysubbase = (subseg *) trimalloc(subsegbytes +
                                            m->subsegs.alignbytes);
     /* Align `dummysub' on a `subsegs.alignbytes'-byte boundary. */
-    alignptr = (INT_PTR) m->dummysubbase;
+    alignptr = (unsigned long) m->dummysubbase;
     m->dummysub = (subseg *)
-      (alignptr + (INT_PTR) m->subsegs.alignbytes -
-       (alignptr % (INT_PTR) m->subsegs.alignbytes));
+      (alignptr + (unsigned long) m->subsegs.alignbytes -
+       (alignptr % (unsigned long) m->subsegs.alignbytes));
     /* Initialize the two adjoining subsegments to be the omnipresent      */
     /*   subsegment.  These will eventually be changed by various bonding  */
     /*   operations, but their values don't really matter, as long as they */
@@ -4593,7 +4586,7 @@ int number;
 {
   VOID **getblock;
   char *foundvertex;
-  INT_PTR alignptr = 0;
+  unsigned long alignptr;
   int current;
 
   getblock = m->vertices.firstblock;
@@ -4610,9 +4603,9 @@ int number;
   }
 
   /* Now find the right vertex. */
-  alignptr = (INT_PTR) (getblock + 1);
-  foundvertex = (char *) (alignptr + (INT_PTR) m->vertices.alignbytes -
-                          (alignptr % (INT_PTR) m->vertices.alignbytes));
+  alignptr = (unsigned long) (getblock + 1);
+  foundvertex = (char *) (alignptr + (unsigned long) m->vertices.alignbytes -
+                          (alignptr % (unsigned long) m->vertices.alignbytes));
   return (vertex) (foundvertex + m->vertices.itembytes * (number - current));
 }
 
@@ -4890,7 +4883,6 @@ struct osub *newsubseg;
 /*                                                                           */
 /*****************************************************************************/
 
-static
 void exactinit()
 {
   REAL half;
@@ -4964,7 +4956,6 @@ void exactinit()
 /*                                                                           */
 /*****************************************************************************/
 
-static
 #ifdef ANSI_DECLARATORS
 int fast_expansion_sum_zeroelim(int elen, REAL *e, int flen, REAL *f, REAL *h)
 #else /* not ANSI_DECLARATORS */
@@ -5059,7 +5050,6 @@ REAL *h;
 /*                                                                           */
 /*****************************************************************************/
 
-static
 #ifdef ANSI_DECLARATORS
 int scale_expansion_zeroelim(int elen, REAL *e, REAL b, REAL *h)
 #else /* not ANSI_DECLARATORS */
@@ -5116,7 +5106,6 @@ REAL *h;
 /*                                                                           */
 /*****************************************************************************/
 
-static
 #ifdef ANSI_DECLARATORS
 REAL estimate(int elen, REAL *e)
 #else /* not ANSI_DECLARATORS */
@@ -5314,7 +5303,6 @@ vertex pc;
 /*                                                                           */
 /*****************************************************************************/
 
-static
 #ifdef ANSI_DECLARATORS
 REAL incircleadapt(vertex pa, vertex pb, vertex pc, vertex pd, REAL permanent)
 #else /* not ANSI_DECLARATORS */
@@ -5894,7 +5882,6 @@ REAL permanent;
   return finnow[finlength - 1];
 }
 
-static
 #ifdef ANSI_DECLARATORS
 REAL incircle(struct mesh *m, struct behavior *b,
               vertex pa, vertex pb, vertex pc, vertex pd)
@@ -5977,7 +5964,6 @@ vertex pd;
 /*                                                                           */
 /*****************************************************************************/
 
-static
 #ifdef ANSI_DECLARATORS
 REAL orient3dadapt(vertex pa, vertex pb, vertex pc, vertex pd,
                    REAL aheight, REAL bheight, REAL cheight, REAL dheight,
@@ -6403,7 +6389,6 @@ REAL permanent;
   return finnow[finlength - 1];
 }
 
-static
 #ifdef ANSI_DECLARATORS
 REAL orient3d(struct mesh *m, struct behavior *b,
               vertex pa, vertex pb, vertex pc, vertex pd,
@@ -6449,7 +6434,7 @@ REAL dheight;
   adxbdy = adx * bdy;
   bdxady = bdx * ady;
 
-  det = adheight * (bdxcdy - cdxbdy)
+  det = adheight * (bdxcdy - cdxbdy) 
       + bdheight * (cdxady - adxcdy)
       + cdheight * (adxbdy - bdxady);
 
@@ -7664,7 +7649,7 @@ struct otri *searchtri;
   char *firsttri;
   struct otri sampletri;
   vertex torg, tdest;
-  INT_PTR alignptr = 0;
+  unsigned long alignptr;
   REAL searchdist, dist;
   REAL ahead;
   long samplesperblock, totalsamplesleft, samplesleft;
@@ -7736,11 +7721,11 @@ struct otri *searchtri;
       population = totalpopulation;
     }
     /* Find a pointer to the first triangle in the block. */
-    alignptr = (INT_PTR) (sampleblock + 1);
+    alignptr = (unsigned long) (sampleblock + 1);
     firsttri = (char *) (alignptr +
-                         (INT_PTR) m->triangles.alignbytes -
+                         (unsigned long) m->triangles.alignbytes -
                          (alignptr %
-                          (INT_PTR) m->triangles.alignbytes));
+                          (unsigned long) m->triangles.alignbytes));
 
     /* Choose `samplesleft' randomly sampled triangles in this block. */
     do {
@@ -11490,7 +11475,7 @@ FILE *polyfile;
       for (j = 0; j < 2; j++) {
         if ((end[j] < b->firstnumber) ||
             (end[j] >= b->firstnumber + m->invertices)) {
-          printf("Error:  Segment %ld has an invalid vertex index.\n",
+          printf("Error:  Segment %ld has an invalid vertex index.\n", 
                  segmentnumber);
           triexit(1);
         }
@@ -11623,12 +11608,6 @@ vertex searchpoint;
   REAL leftccw, rightccw;
   int leftflag, rightflag;
   triangle ptr;           /* Temporary variable used by onext() and oprev(). */
-  int iter;
-  // Number of iterations allowed before throwing an exception and declaring
-  // this to be hitting a bug that causes an infinite loop.
-  //
-  // Valid worst case: vertex is incident on every face. 
-  int max_iter = 2*m->triangles.items+100;
 
   org(*searchtri, startvertex);
   dest(*searchtri, rightvertex);
@@ -11649,7 +11628,6 @@ vertex searchpoint;
       rightflag = 0;
     }
   }
-  iter = 0;
   while (leftflag) {
     /* Turn left until satisfied. */
     onextself(*searchtri);
@@ -11664,14 +11642,7 @@ vertex searchpoint;
     rightccw = leftccw;
     leftccw = counterclockwise(m, b, searchpoint, startvertex, leftvertex);
     leftflag = leftccw > 0.0;
-    iter++;
-    if(iter>max_iter)
-    {
-      printf("Bailing out after %d iterations in finddirection().\n",iter);
-      internalerror();
-    }
   }
-  iter = 0;
   while (rightflag) {
     /* Turn right until satisfied. */
     oprevself(*searchtri);
@@ -11686,12 +11657,6 @@ vertex searchpoint;
     leftccw = rightccw;
     rightccw = counterclockwise(m, b, startvertex, searchpoint, rightvertex);
     rightflag = rightccw > 0.0;
-    iter++;
-    if(iter>max_iter)
-    {
-      printf("Bailing out after %d iterations in finddirection().\n",iter);
-      internalerror();
-    }
   }
   if (leftccw == 0.0) {
     return LEFTCOLLINEAR;
@@ -11739,7 +11704,6 @@ vertex endpoint2;
   vertex leftvertex, rightvertex;
   vertex newvertex;
   enum insertvertexresult success;
-  enum finddirectionresult collinear;
   REAL ex, ey;
   REAL tx, ty;
   REAL etx, ety;
@@ -11808,7 +11772,9 @@ vertex endpoint2;
 
   /* Inserting the vertex may have caused edge flips.  We wish to rediscover */
   /*   the edge connecting endpoint1 to the new intersection vertex.         */
+/*
   collinear = finddirection(m, b, splittri, endpoint1);
+*/
   dest(*splittri, rightvertex);
   apex(*splittri, leftvertex);
   if ((leftvertex[0] == endpoint1[0]) && (leftvertex[1] == endpoint1[1])) {
@@ -13145,7 +13111,7 @@ int regions;
         } else {
           printf("Spreading regional attributes.\n");
         }
-      } else {
+      } else { 
         printf("Spreading regional area constraints.\n");
       }
     }
@@ -13216,14 +13182,13 @@ struct behavior *b;
 
 {
   struct osub subsegloop;
-  int dummy;
 
   traversalinit(&m->subsegs);
   subsegloop.ssorient = 0;
   subsegloop.ss = subsegtraverse(m);
   while (subsegloop.ss != (subseg *) NULL) {
     /* If the segment is encroached, add it to the list. */
-    dummy = checkseg4encroach(m, b, &subsegloop);
+    checkseg4encroach(m, b, &subsegloop);
     subsegloop.ss = subsegtraverse(m);
   }
 }
@@ -13289,7 +13254,6 @@ int triflaws;
   REAL split;
   REAL multiplier, divisor;
   int acuteorg, acuteorg2, acutedest, acutedest2;
-  int dummy;
   int i;
   triangle ptr;                     /* Temporary variable used by stpivot(). */
   subseg sptr;                        /* Temporary variable used by snext(). */
@@ -13458,9 +13422,9 @@ int triflaws;
           m->steinerleft--;
         }
         /* Check the two new subsegments to see if they're encroached. */
-        dummy = checkseg4encroach(m, b, &currentenc);
+        checkseg4encroach(m, b, &currentenc);
         snextself(currentenc);
-        dummy = checkseg4encroach(m, b, &currentenc);
+        checkseg4encroach(m, b, &currentenc);
       }
 
       badsubsegdealloc(m, encloop);

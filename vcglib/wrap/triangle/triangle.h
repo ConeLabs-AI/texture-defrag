@@ -247,24 +247,17 @@
 /*  not used, `numberofsegments' will indicate the number of boundary edges. */
 /*                                                                           */
 /*****************************************************************************/
-#pragma once
-
-#ifdef SINGLE
-#define TRI_REAL float
-#else /* not SINGLE */
-#define TRI_REAL double
-#endif /* not SINGLE */
 
 struct triangulateio {
-  TRI_REAL *pointlist;                                               /* In / out */
-  TRI_REAL *pointattributelist;                                      /* In / out */
+  REAL *pointlist;                                               /* In / out */
+  REAL *pointattributelist;                                      /* In / out */
   int *pointmarkerlist;                                          /* In / out */
   int numberofpoints;                                            /* In / out */
   int numberofpointattributes;                                   /* In / out */
 
   int *trianglelist;                                             /* In / out */
-  TRI_REAL *triangleattributelist;                                   /* In / out */
-  TRI_REAL *trianglearealist;                                         /* In only */
+  REAL *triangleattributelist;                                   /* In / out */
+  REAL *trianglearealist;                                         /* In only */
   int *neighborlist;                                             /* Out only */
   int numberoftriangles;                                         /* In / out */
   int numberofcorners;                                           /* In / out */
@@ -274,19 +267,23 @@ struct triangulateio {
   int *segmentmarkerlist;                                        /* In / out */
   int numberofsegments;                                          /* In / out */
 
-  TRI_REAL *holelist;                        /* In / pointer to array copied out */
+  REAL *holelist;                        /* In / pointer to array copied out */
   int numberofholes;                                      /* In / copied out */
 
-  TRI_REAL *regionlist;                      /* In / pointer to array copied out */
+  REAL *regionlist;                      /* In / pointer to array copied out */
   int numberofregions;                                    /* In / copied out */
 
   int *edgelist;                                                 /* Out only */
   int *edgemarkerlist;            /* Not used with Voronoi diagram; out only */
-  TRI_REAL *normlist;                /* Used only with Voronoi diagram; out only */
+  REAL *normlist;                /* Used only with Voronoi diagram; out only */
   int numberofedges;                                             /* Out only */
 };
 
+#ifdef ANSI_DECLARATORS
 void triangulate(char *, struct triangulateio *, struct triangulateio *,
                  struct triangulateio *);
-void trifree(int *memptr);
-
+void trifree(VOID *memptr);
+#else /* not ANSI_DECLARATORS */
+void triangulate();
+void trifree();
+#endif /* not ANSI_DECLARATORS */

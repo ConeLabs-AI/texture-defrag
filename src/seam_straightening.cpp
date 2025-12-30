@@ -13,7 +13,7 @@
 #include <algorithm>
 
 extern "C" {
-#include <wrap/triangle/triangle.h>
+#include "../vcglib/wrap/triangle/triangle.h"
 }
 
 namespace UVDefrag {
@@ -290,7 +290,7 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
             }
 
             vcg::Box2d bbox = chart->UVBox();
-            bbox.Offset(bbox.DimX() * 0.1, bbox.DimY() * 0.1);
+            bbox.Offset(vcg::Point2d(bbox.DimX() * 0.1, bbox.DimY() * 0.1));
 
             struct triangulateio in, out;
             memset(&in, 0, sizeof(in));
@@ -391,7 +391,7 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
             }
 
             free(in.pointlist); free(in.segmentlist);
-            trifree(out.pointlist); trifree(out.trianglelist); trifree(out.segmentlist);
+            trifree((int*)out.pointlist); trifree(out.trianglelist); trifree(out.segmentlist);
             
             if (success) break;
             chartTol *= 0.5;

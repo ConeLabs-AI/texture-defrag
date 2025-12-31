@@ -290,40 +290,56 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
             }
 
             vcg::Box2d bbox = chart->UVBox();
-            bbox.Offset(vcg::Point2d(bbox.DimX() * 0.1, bbox.DimY() * 0.1));
+            double expansion = std::max({bbox.DimX() * 0.1, bbox.DimY() * 0.1, 1e-6});
+            bbox.Offset(vcg::Point2d(expansion, expansion));
 
             struct triangulateio in, out;
             memset(&in, 0, sizeof(in));
             memset(&out, 0, sizeof(out));
 
-            in.numberofpoints = (int)boundaryStarts.size() + 4;
-            in.pointlist = (TRI_REAL *) malloc(in.numberofpoints * 2 * sizeof(TRI_REAL));
-            
+            std::map<std::pair<double, double>, int> posToIdx;
             std::map<Mesh::VertexPointer, int> vToTriIdx;
+            std::vector<double> pts;
             int nextIdx = 0;
             for (auto& [v, pos] : boundaryStarts) {
-                in.pointlist[nextIdx * 2] = pos.x();
-                in.pointlist[nextIdx * 2 + 1] = pos.y();
-                vToTriIdx[v] = nextIdx++;
+                std::pair<double, double> p = {pos.x(), pos.y()};
+                if (posToIdx.find(p) == posToIdx.end()) {
+                    posToIdx[p] = nextIdx++;
+                    pts.push_back(pos.x());
+                    pts.push_back(pos.y());
+                }
+                vToTriIdx[v] = posToIdx[p];
             }
-            in.pointlist[nextIdx * 2] = bbox.min.X(); in.pointlist[nextIdx * 2 + 1] = bbox.min.Y(); int bb0 = nextIdx++;
-            in.pointlist[nextIdx * 2] = bbox.max.X(); in.pointlist[nextIdx * 2 + 1] = bbox.min.Y(); int bb1 = nextIdx++;
-            in.pointlist[nextIdx * 2] = bbox.max.X(); in.pointlist[nextIdx * 2 + 1] = bbox.max.Y(); int bb2 = nextIdx++;
-            in.pointlist[nextIdx * 2] = bbox.min.X(); in.pointlist[nextIdx * 2 + 1] = bbox.max.Y(); int bb3 = nextIdx++;
 
-            in.numberofsegments = (int)constraints.size() + 4;
-            in.segmentlist = (int *) malloc(in.numberofsegments * 2 * sizeof(int));
+            int bb0 = nextIdx++; pts.push_back(bbox.min.X()); pts.push_back(bbox.min.Y());
+            int bb1 = nextIdx++; pts.push_back(bbox.max.X()); pts.push_back(bbox.min.Y());
+            int bb2 = nextIdx++; pts.push_back(bbox.max.X()); pts.push_back(bbox.max.Y());
+            int bb3 = nextIdx++; pts.push_back(bbox.min.X()); pts.push_back(bbox.max.Y());
+
+            in.numberofpoints = nextIdx;
+            in.pointlist = (TRI_REAL *) malloc(in.numberofpoints * 2 * sizeof(TRI_REAL));
+            for (int k = 0; k < (int)pts.size(); ++k) in.pointlist[k] = pts[k];
+
+            std::vector<std::pair<int, int>> filteredConstraints;
             for (int k = 0; k < (int)constraints.size(); ++k) {
-                in.segmentlist[k * 2] = vToTriIdx[constraints[k].first];
-                in.segmentlist[k * 2 + 1] = vToTriIdx[constraints[k].second];
+                int i0 = vToTriIdx[constraints[k].first];
+                int i1 = vToTriIdx[constraints[k].second];
+                if (i0 != i1) filteredConstraints.push_back({i0, i1});
             }
-            int segOff = (int)constraints.size();
+
+            in.numberofsegments = (int)filteredConstraints.size() + 4;
+            in.segmentlist = (int *) malloc(in.numberofsegments * 2 * sizeof(int));
+            for (int k = 0; k < (int)filteredConstraints.size(); ++k) {
+                in.segmentlist[k * 2] = filteredConstraints[k].first;
+                in.segmentlist[k * 2 + 1] = filteredConstraints[k].second;
+            }
+            int segOff = (int)filteredConstraints.size();
             in.segmentlist[segOff*2] = bb0; in.segmentlist[segOff*2+1] = bb1;
             in.segmentlist[(segOff+1)*2] = bb1; in.segmentlist[(segOff+1)*2+1] = bb2;
             in.segmentlist[(segOff+2)*2] = bb2; in.segmentlist[(segOff+2)*2+1] = bb3;
             in.segmentlist[(segOff+3)*2] = bb3; in.segmentlist[(segOff+3)*2+1] = bb0;
 
-            triangulate((char*)"zpaQ", &in, &out, nullptr);
+            triangulate((char*)"zpQ", &in, &out, nullptr);
 
             std::vector<Eigen::Vector2d> ambientVerts(out.numberofpoints);
             for (int k = 0; k < out.numberofpoints; ++k) ambientVerts[k] = Eigen::Vector2d(out.pointlist[k * 2], out.pointlist[k * 2 + 1]);

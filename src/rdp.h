@@ -33,9 +33,9 @@ namespace GeometryUtils {
     /**
      * RDP Recursive step. Standard implementation marking keep_flags.
      */
-    template <typename T>
+    template <typename T, typename Alloc>
     void rdpRecursive(
-        const std::vector<T>& points,
+        const std::vector<T, Alloc>& points,
         size_t start,
         size_t end,
         double epsilon_sq,
@@ -65,17 +65,17 @@ namespace GeometryUtils {
      * Ramer-Douglas-Peucker polyline simplification.
      * Works with Eigen types (Vector2d, Vector3d, Vector4d).
      */
-    template <typename T>
-    std::vector<T> simplifyRDP(const std::vector<T>& points, double epsilon) {
+    template <typename T, typename Alloc = std::allocator<T>>
+    std::vector<T, Alloc> simplifyRDP(const std::vector<T, Alloc>& points, double epsilon) {
         if (points.size() < 3) return points;
 
         std::vector<bool> keep_flags(points.size(), false);
         keep_flags[0] = true;
         keep_flags[points.size() - 1] = true;
 
-        rdpRecursive(points, 0, points.size() - 1, epsilon * epsilon, keep_flags);
+        rdpRecursive<T, Alloc>(points, 0, points.size() - 1, epsilon * epsilon, keep_flags);
 
-        std::vector<T> result;
+        std::vector<T, Alloc> result;
         result.reserve(points.size());
         for (size_t i = 0; i < points.size(); ++i) {
             if (keep_flags[i]) result.push_back(points[i]);

@@ -8,6 +8,7 @@
 #include <Eigen/Core>
 #include <Eigen/Sparse>
 #include <Eigen/SparseCholesky>
+#include <Eigen/StdVector>
 
 namespace UVDefrag {
 
@@ -17,10 +18,11 @@ class HarmonicMapSolver {
 public:
     using Scalar = double;
     using Vector2 = Eigen::Vector2d;
+    using AlignedVector2 = std::vector<Vector2, Eigen::aligned_allocator<Vector2>>;
     using SparseMat = Eigen::SparseMatrix<Scalar>;
     using Triplet = Eigen::Triplet<Scalar>;
 
-    HarmonicMapSolver(const std::vector<Vector2>& vertices, 
+    HarmonicMapSolver(const AlignedVector2& vertices, 
                       const std::vector<Triangle>& faces,
                       const std::vector<int>& fixedIndices) 
     {
@@ -119,7 +121,7 @@ public:
      * @brief Updates the full mesh positions based on the current positions of the fixed nodes.
      * The input 'positions' vector MUST contain the valid target positions at the fixed indices.
      */
-    void Solve(std::vector<Vector2>& positions) {
+    void Solve(AlignedVector2& positions) {
         if (!IsValid()) return;
 
         // Extract boundary conditions (RHS)
@@ -142,7 +144,7 @@ public:
      * @brief Utility: Checks if any triangle in the mesh has flipped (negative signed area).
      * Used for the "Adaptive Back-off" check.
      */
-    static bool HasInvertedTriangles(const std::vector<Vector2>& verts, const std::vector<Triangle>& faces) {
+    static bool HasInvertedTriangles(const AlignedVector2& verts, const std::vector<Triangle>& faces) {
         for (const auto& tri : faces) {
             const Vector2& a = verts[tri.v[0]];
             const Vector2& b = verts[tri.v[1]];
@@ -192,17 +194,17 @@ private:
  * @param targetPositions The pre-calculated straightened positions for the boundary.
  * @return true If successful and valid (no inversions), false if it failed.
  */
-inline bool ApplyCompositeWarp(std::vector<Eigen::Vector2d>& meshVerts,
+inline bool ApplyCompositeWarp(std::vector<Eigen::Vector2d, Eigen::aligned_allocator<Eigen::Vector2d>>& meshVerts,
                         const std::vector<Triangle>& meshFaces,
                         const std::vector<int>& boundaryIndices,
-                        const std::vector<Eigen::Vector2d>& targetPositions)
+                        const std::vector<Eigen::Vector2d, Eigen::aligned_allocator<Eigen::Vector2d>>& targetPositions)
 {
     // 1. Init Solver (Factorization happens here)
     HarmonicMapSolver solver(meshVerts, meshFaces, boundaryIndices);
     if (!solver.IsValid()) return false;
 
     // 2. Cache Start Positions
-    std::vector<Eigen::Vector2d> startPositions;
+    std::vector<Eigen::Vector2d, Eigen::aligned_allocator<Eigen::Vector2d>> startPositions;
     startPositions.reserve(boundaryIndices.size());
     for(int idx : boundaryIndices) startPositions.push_back(meshVerts[idx]);
 

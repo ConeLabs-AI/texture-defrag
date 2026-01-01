@@ -6,12 +6,15 @@
 #include <vcg/complex/algorithms/update/topology.h>
 #include <vcg/complex/algorithms/clean.h>
 #include <vcg/complex/algorithms/outline_support.h>
+#include <vcg/math/disjoint_set.h>
 #include <map>
 #include <set>
 #include <unordered_map>
 #include <queue>
 #include <algorithm>
 #include <omp.h>
+#include <cmath>
+#include <array>
 
 extern "C" {
 #include "../vcglib/wrap/triangle/triangle.h"
@@ -26,32 +29,28 @@ struct SeamChain {
     bool isSeam = false;
     bool isTrueBoundary = false;
     int twinChainIdx = -1;
+    bool twinIsReversed = false;
 };
 
 struct BoundaryVertexInfo {
     bool isImmutable = false;
     bool isTJunction = false;
-    bool isTrueBoundary = false;
+    bool isTrueBoundary = false; // Truly a mesh hole
     bool isEar = false;
     std::vector<std::pair<Mesh::FacePointer, int>> incidentBoundaryEdges;
-    Mesh::VertexPointer twinV = nullptr;
+    std::vector<Mesh::VertexPointer> geometricTwins; // Vertices at same 3D position
 };
 
-// Global Snapshot Container to ensure deterministic Parallel RDP calculation
+// Global Snapshot for Thread-Safe RDP
 using GlobalUVSnapshot = std::unordered_map<Mesh::FacePointer, std::array<Point2d, 3>>;
 
 Point2d GetSnapshotUV(const GlobalUVSnapshot& snapshot, const SeamChain& chain, int vertexIdx) {
-    // If vertexIdx is within edge count, use the start of that edge
     if (vertexIdx < (int)chain.edges.size()) {
         auto& edge = chain.edges[vertexIdx];
-        const auto& faceUVs = snapshot.at(edge.first);
-        return faceUVs[edge.second];
-    } 
-    // If vertexIdx is the last vertex, use the end of the last edge
-    else {
+        return snapshot.at(edge.first)[edge.second];
+    } else {
         auto& edge = chain.edges.back();
-        const auto& faceUVs = snapshot.at(edge.first);
-        return faceUVs[(edge.second + 1) % 3];
+        return snapshot.at(edge.first)[(edge.second + 1) % 3];
     }
 }
 
@@ -60,24 +59,24 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
     tri::UpdateTopology<Mesh>::FaceFace(m);
     tri::UpdateTopology<Mesh>::VertexFace(m);
 
-    LOG_INFO << "Phase 1: Boundary Classification and Protection...";
+    LOG_INFO << "Phase 1: Boundary Classification and Geometric Twin Finding...";
 
     int numChartsAttempted = 0;
     int numChartsSucceeded = 0;
     int totalSegmentsBefore = 0;
     int totalSegmentsAfter = 0;
-    int numTwinPairs = 0;
 
     std::map<Mesh::VertexPointer, BoundaryVertexInfo> vertexInfo;
     
     auto isBoundary = [&](Mesh::FacePointer f, int e) {
         Mesh::FacePointer ff = f->FFp(e);
-        if (ff == f) return true; 
-        if (ff->id != f->id) return true; 
+        if (ff == f) return true; // Hole or Cut
+        if (ff->id != f->id) return true; // Seam
         return false;
     };
 
-    // 1. Classification (Serial)
+    // 1. Initial Pass: Collect Boundary Vertices
+    std::vector<Mesh::VertexPointer> boundaryVertices;
     for (auto& entry : graph->charts) {
         ChartHandle chart = entry.second;
         for (auto f : chart->fpVec) {
@@ -87,18 +86,12 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                     boundaryEdgesInFace++;
                     Mesh::VertexPointer v0 = f->V(i);
                     Mesh::VertexPointer v1 = f->V((i + 1) % 3);
+                    
+                    if (vertexInfo.find(v0) == vertexInfo.end()) boundaryVertices.push_back(v0);
+                    if (vertexInfo.find(v1) == vertexInfo.end()) boundaryVertices.push_back(v1);
+
                     vertexInfo[v0].incidentBoundaryEdges.push_back({f, i});
                     vertexInfo[v1].incidentBoundaryEdges.push_back({f, i});
-                    
-                    Mesh::FacePointer ff = f->FFp(i);
-                    if (ff != f) {
-                        int pi = f->FFi(i);
-                        vertexInfo[v0].twinV = ff->V((pi + 1) % 3);
-                        vertexInfo[v1].twinV = ff->V(pi);
-                    } else {
-                        vertexInfo[v0].isTrueBoundary = true;
-                        vertexInfo[v1].isTrueBoundary = true;
-                    }
                 }
             }
             if (boundaryEdgesInFace >= 2) {
@@ -107,28 +100,88 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
         }
     }
 
-    for (auto& [v, info] : vertexInfo) {
-        if (info.incidentBoundaryEdges.size() != 2) info.isImmutable = true;
-        if (info.incidentBoundaryEdges.size() > 2) info.isTJunction = true;
-        if (info.isEar) info.isImmutable = true;
-        if (info.isTrueBoundary) info.isImmutable = true;
+    // 2. Geometric Twin Finding (Sort-and-Sweep with Transitive Welding)
+    std::vector<Mesh::VertexPointer> sortedVertices = boundaryVertices;
+    std::sort(sortedVertices.begin(), sortedVertices.end(), [](Mesh::VertexPointer a, Mesh::VertexPointer b) {
+        if (a->P().X() != b->P().X()) return a->P().X() < b->P().X();
+        if (a->P().Y() != b->P().Y()) return a->P().Y() < b->P().Y();
+        return a->P().Z() < b->P().Z();
+    });
+
+    // Use Disjoint Set for transitive welding (A~B and B~C => A~C)
+    vcg::DisjointSet<int> ds((int)sortedVertices.size());
+    for (size_t i = 0; i < sortedVertices.size(); ++i) {
+        for (size_t j = i + 1; j < sortedVertices.size(); ++j) {
+            // Early out based on X-axis distance
+            if (sortedVertices[j]->P().X() - sortedVertices[i]->P().X() > params.geometricTolerance) break;
+            
+            if (Distance(sortedVertices[i]->P(), sortedVertices[j]->P()) < params.geometricTolerance) {
+                ds.Union((int)i, (int)j);
+            }
+        }
     }
 
+    // Map each vertex to a unique ID based on its representative in the Disjoint Set
+    std::map<Mesh::VertexPointer, int> vertexToUniqueId;
+    std::map<int, int> dsToUniqueId;
+    int nextUniqueId = 0;
+
+    for (size_t i = 0; i < sortedVertices.size(); ++i) {
+        int root = ds.Find((int)i);
+        if (dsToUniqueId.find(root) == dsToUniqueId.end()) {
+            dsToUniqueId[root] = nextUniqueId++;
+        }
+        vertexToUniqueId[sortedVertices[i]] = dsToUniqueId[root];
+    }
+
+    // Fill geometricTwins based on shared IDs
+    std::map<int, std::vector<Mesh::VertexPointer>> idToVertices;
+    for (auto const& [v, id] : vertexToUniqueId) idToVertices[id].push_back(v);
+
+    for (auto const& [id, group] : idToVertices) {
+        if (group.size() > 1) {
+            // Seam or cut (multiple vertices at same 3D location)
+            for (auto v : group) {
+                for (auto other : group) {
+                    if (v != other) vertexInfo[v].geometricTwins.push_back(other);
+                }
+            }
+        } else {
+            // True mesh border (hole)
+            vertexInfo[group[0]].isTrueBoundary = true;
+        }
+    }
+
+    // 3. Mark Immutable Vertices
+    for (auto& [v, info] : vertexInfo) {
+        if (info.incidentBoundaryEdges.size() != 2) info.isImmutable = true;
+        if (info.isEar) info.isImmutable = true;
+        
+        // Pin mesh holes to preserve silhouette
+        if (info.isTrueBoundary) info.isImmutable = true; 
+        
+        // Multi-chart Hubs (more than 1 twin implies >2 charts meeting)
+        if (info.geometricTwins.size() > 1) info.isImmutable = true;
+    }
+
+    // 4. Propagate Protection
     bool changes = true;
     while (changes) {
         changes = false;
         for (auto& [v, info] : vertexInfo) {
-            if (info.isImmutable && info.twinV) {
-                auto& twinInfo = vertexInfo[info.twinV];
-                if (!twinInfo.isImmutable) {
-                    twinInfo.isImmutable = true;
-                    changes = true;
+            if (info.isImmutable) {
+                for (auto twin : info.geometricTwins) {
+                    auto& twinInfo = vertexInfo[twin];
+                    if (!twinInfo.isImmutable) {
+                        twinInfo.isImmutable = true;
+                        changes = true;
+                    }
                 }
             }
         }
     }
 
-    // 4. Extract Chains (Serial)
+    // 5. Extract Chains
     std::vector<SeamChain> chains;
     std::set<std::pair<Mesh::FacePointer, int>> visitedEdges;
 
@@ -169,9 +222,8 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                         chain.edges.push_back(e);
                     }
                     chain.vertices.push_back(path.back().first->V((path.back().second + 1) % 3));
-                    chain.isTrueBoundary = false;
-                    for (auto& e : path) if (e.first->FFp(e.second) == e.first) chain.isTrueBoundary = true;
-                    chain.isSeam = !chain.isTrueBoundary;
+                    
+                    chain.isSeam = true; // Mark potential seam (matched via geometric twins later)
                     chains.push_back(chain);
                 }
             }
@@ -180,41 +232,58 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
 
     LOG_INFO << "Extracted " << chains.size() << " chains.";
 
-    std::map<std::vector<vcg::Point3d>, int> coordToChain;
+    // 6. Chain Matching
+    struct ChainKey {
+        std::vector<int> pointIds;
+        bool operator<(const ChainKey& o) const {
+            if (pointIds.size() != o.pointIds.size()) return pointIds.size() < o.pointIds.size();
+            return pointIds < o.pointIds;
+        }
+    };
+    
+    std::map<ChainKey, int> idToChain;
+    int numTwinPairs = 0;
+
     for (int i = 0; i < (int)chains.size(); ++i) {
         if (!chains[i].isSeam) continue;
-        std::vector<vcg::Point3d> coords;
-        for (auto v : chains[i].vertices) coords.push_back(v->P());
+        if (chains[i].twinChainIdx != -1) continue;
+
+        ChainKey key;
+        for (auto v : chains[i].vertices) key.pointIds.push_back(vertexToUniqueId[v]);
         
-        if (coordToChain.count(coords)) {
-            int j = coordToChain[coords];
+        if (idToChain.count(key)) {
+            int j = idToChain[key];
             chains[i].twinChainIdx = j;
             chains[j].twinChainIdx = i;
+            chains[i].twinIsReversed = false;
+            chains[j].twinIsReversed = false;
             numTwinPairs++;
         } else {
-            std::reverse(coords.begin(), coords.end());
-            if (coordToChain.count(coords)) {
-                int j = coordToChain[coords];
+            std::reverse(key.pointIds.begin(), key.pointIds.end());
+            if (idToChain.count(key)) {
+                int j = idToChain[key];
                 chains[i].twinChainIdx = j;
                 chains[j].twinChainIdx = i;
+                chains[i].twinIsReversed = true;
+                chains[j].twinIsReversed = true;
+                numTwinPairs++;
             } else {
-                std::reverse(coords.begin(), coords.end());
-                coordToChain[coords] = i;
+                std::reverse(key.pointIds.begin(), key.pointIds.end());
+                idToChain[key] = i;
             }
         }
     }
+    LOG_INFO << "Matched " << numTwinPairs << " twin pairs of seam chains.";
 
-    // Pre-map charts to chains
+    // 7. Processing Loop (Parallel)
     std::map<ChartHandle, std::vector<int>> chartToChains;
-    for(int i = 0; i < (int)chains.size(); ++i) {
-        chartToChains[chains[i].chart].push_back(i);
-    }
+    for(int i = 0; i < (int)chains.size(); ++i) chartToChains[chains[i].chart].push_back(i);
 
     std::vector<ChartHandle> chartVec;
     chartVec.reserve(graph->charts.size());
     for(auto& entry : graph->charts) chartVec.push_back(entry.second);
 
-    // Create Global UV Snapshot for Thread-Safe, Deterministic RDP Calculation
+    // Create Immutable Snapshot
     GlobalUVSnapshot globalSnapshot;
     for (auto& entry : graph->charts) {
         for (auto f : entry.second->fpVec) {
@@ -232,32 +301,31 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
         
         #pragma omp atomic
         numChartsAttempted++;
-        
+
         double chartTol = params.initialTolerance;
         bool success = false;
-        
         const std::vector<int>& myChains = chartToChains[chart];
 
         for (int attempt = 0; attempt < params.maxWarpAttempts; ++attempt) {
             std::map<Mesh::VertexPointer, Eigen::Vector2d> boundaryTargets;
-            
-            // --- 1. RDP Target Calculation ---
+
+            // RDP Calculation
             for (int ci : myChains) {
                 const auto& chain = chains[ci];
                 int twinIdx = chain.twinChainIdx;
 
                 if (twinIdx != -1) {
+                    // 4D Seam Straightening
                     const auto& chainB = chains[twinIdx];
-                    bool reversed = (chain.vertices.front()->P() != chainB.vertices.front()->P());
+                    
+                    // Use matched orientation
+                    bool reversed = chain.twinIsReversed;
                     
                     std::vector<Eigen::Vector4d> poly4D;
                     for (int k = 0; k < (int)chain.vertices.size(); ++k) {
                         int kB = reversed ? (chainB.vertices.size() - 1 - k) : k;
-                        
-                        // Read from Immutable Global Snapshot
                         Point2d pA = GetSnapshotUV(globalSnapshot, chain, k);
                         Point2d pB = GetSnapshotUV(globalSnapshot, chainB, kB); 
-                        
                         poly4D.push_back(Eigen::Vector4d(pA.X(), pA.Y(), pB.X(), pB.Y()));
                     }
                     std::vector<Eigen::Vector4d> simplified = GeometryUtils::simplifyRDP(poly4D, chartTol);
@@ -297,6 +365,7 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                         boundaryTargets[chain.vertices[k]] = Eigen::Vector2d(p4.x(), p4.y());
                     }
                 } else {
+                    // 2D Fallback: Pin to original to prevent drift of unpaired boundaries
                     for (int k = 0; k < (int)chain.vertices.size(); ++k) {
                         Point2d pA = GetSnapshotUV(globalSnapshot, chain, k);
                         boundaryTargets[chain.vertices[k]] = Eigen::Vector2d(pA.X(), pA.Y());
@@ -310,7 +379,7 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                 }
             }
 
-            // --- 2. Ambient Mesh Construction (Robust) ---
+            // Ambient Mesh Setup
             vcg::Box2d bbox = chart->UVBox();
             double dimX = std::max(bbox.DimX(), 1e-6);
             double dimY = std::max(bbox.DimY(), 1e-6);
@@ -321,37 +390,33 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
             memset(&in, 0, sizeof(in));
             memset(&out, 0, sizeof(out));
 
-            std::vector<std::pair<Mesh::VertexPointer, Eigen::Vector2d>> rawPoints;
-            
-            // Re-write RawPoints collection to avoid scanning
-            rawPoints.clear();
+            struct RawPt { Mesh::VertexPointer v; Eigen::Vector2d p; };
+            std::vector<RawPt> rawPoints;
             rawPoints.reserve(chart->fpVec.size() * 3);
-            for(auto f : chart->fpVec) {
-                const auto& uvs = globalSnapshot.at(f); // Fast lookup
-                for(int k=0; k<3; ++k) {
-                    rawPoints.push_back({f->V(k), Eigen::Vector2d(uvs[k].X(), uvs[k].Y())});
-                }
+
+            for (auto f : chart->fpVec) {
+                const auto& uvs = globalSnapshot.at(f);
+                for(int k=0; k<3; ++k) rawPoints.push_back({f->V(k), Eigen::Vector2d(uvs[k].X(), uvs[k].Y())});
             }
-            
-            // Deduplication logic (Weak ordering fix)
-            std::sort(rawPoints.begin(), rawPoints.end(), [](const auto& a, const auto& b) {
-                if (a.second.x() != b.second.x()) return a.second.x() < b.second.x();
-                return a.second.y() < b.second.y();
+
+            std::sort(rawPoints.begin(), rawPoints.end(), [](const RawPt& a, const RawPt& b) {
+                if (a.p.x() != b.p.x()) return a.p.x() < b.p.x();
+                return a.p.y() < b.p.y();
             });
 
             std::map<Mesh::VertexPointer, int> vToTriIdx;
             std::vector<Eigen::Vector2d> uniquePoints;
             
             if (!rawPoints.empty()) {
-                uniquePoints.push_back(rawPoints[0].second);
-                vToTriIdx[rawPoints[0].first] = 0;
+                uniquePoints.push_back(rawPoints[0].p);
+                vToTriIdx[rawPoints[0].v] = 0;
                 for (size_t k = 1; k < rawPoints.size(); ++k) {
                     const auto& prev = uniquePoints.back();
-                    const auto& curr = rawPoints[k].second;
+                    const auto& curr = rawPoints[k].p;
                     if ((curr - prev).squaredNorm() < 1e-20) {
-                        vToTriIdx[rawPoints[k].first] = (int)uniquePoints.size() - 1;
+                        vToTriIdx[rawPoints[k].v] = (int)uniquePoints.size() - 1;
                     } else {
-                        vToTriIdx[rawPoints[k].first] = (int)uniquePoints.size();
+                        vToTriIdx[rawPoints[k].v] = (int)uniquePoints.size();
                         uniquePoints.push_back(curr);
                     }
                 }
@@ -377,7 +442,6 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
             in.segmentlist[4] = bb2; in.segmentlist[5] = bb3;
             in.segmentlist[6] = bb3; in.segmentlist[7] = bb0;
 
-            // Critical Section for Triangle + "zpQ" + No internal segments
             #pragma omp critical(triangulate_lib)
             {
                 triangulate((char*)"zpQ", &in, &out, nullptr);
@@ -411,7 +475,7 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
             }
 
             if (ApplyCompositeWarp(ambientVerts, ambientFaces, fixedIndices, targetPositions)) {
-                // Result Validation Buffer
+                // Buffer computed UVs to verify inversion before committing
                 std::map<Mesh::VertexPointer, Point2d> computedUVs;
                 for (auto f : chart->fpVec) {
                     for(int k=0; k<3; ++k) {
@@ -431,27 +495,24 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                 
                 if (!inverted) {
                     success = true;
-                    
                     #pragma omp atomic
                     numChartsSucceeded++;
                     #pragma omp atomic
                     retryStats[attempt]++;
-                    
+
                     chart->isSeamStraightened = true;
                     if (params.colorize) {
                         for (auto f : chart->fpVec) f->C() = vcg::Color4b(255, 165, 0, 255);
                     }
-                    // Thread-Safe Write
+                    // Commit to thread-safe Wedge attributes
                     for (auto f : chart->fpVec) {
-                        for (int k = 0; k < 3; ++k) {
-                            f->WT(k).P() = computedUVs[f->V(k)];
-                        }
+                        for (int k = 0; k < 3; ++k) f->WT(k).P() = computedUVs[f->V(k)];
                     }
                 }
             }
 
             free(in.pointlist); free(in.segmentlist);
-            trifree((VOID *)out.pointlist); trifree(out.trianglelist); trifree(out.segmentlist);
+            trifree(out.pointlist); trifree(out.trianglelist); trifree(out.segmentlist);
             
             if (success) break;
             chartTol *= 0.5;

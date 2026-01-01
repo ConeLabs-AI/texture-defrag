@@ -19,6 +19,7 @@ namespace UVDefrag {
 
 struct SeamStraighteningParameters {
     double initialTolerance = 0.01; // Recommended in "Seamless" paper - likely too high for large atlases
+    double geometricTolerance = 1e-6; // Tolerance for welding 3D vertices at seams
     int maxWarpAttempts = 2;
     bool colorize = true;
 };

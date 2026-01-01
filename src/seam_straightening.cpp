@@ -109,25 +109,27 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
     });
 
     // Use Disjoint Set for transitive welding (A~B and B~C => A~C)
-    vcg::DisjointSet<int> ds((int)sortedVertices.size());
+    vcg::DisjointSet<MeshVertex> ds;
+    for (auto v : sortedVertices) ds.MakeSet(v);
+
     for (size_t i = 0; i < sortedVertices.size(); ++i) {
         for (size_t j = i + 1; j < sortedVertices.size(); ++j) {
             // Early out based on X-axis distance
             if (sortedVertices[j]->P().X() - sortedVertices[i]->P().X() > params.geometricTolerance) break;
             
             if (Distance(sortedVertices[i]->P(), sortedVertices[j]->P()) < params.geometricTolerance) {
-                ds.Union((int)i, (int)j);
+                ds.Union(sortedVertices[i], sortedVertices[j]);
             }
         }
     }
 
     // Map each vertex to a unique ID based on its representative in the Disjoint Set
     std::map<Mesh::VertexPointer, int> vertexToUniqueId;
-    std::map<int, int> dsToUniqueId;
+    std::map<Mesh::VertexPointer, int> dsToUniqueId;
     int nextUniqueId = 0;
 
     for (size_t i = 0; i < sortedVertices.size(); ++i) {
-        int root = ds.Find((int)i);
+        Mesh::VertexPointer root = ds.FindSet(sortedVertices[i]);
         if (dsToUniqueId.find(root) == dsToUniqueId.end()) {
             dsToUniqueId[root] = nextUniqueId++;
         }
@@ -136,9 +138,10 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
 
     // Fill geometricTwins based on shared IDs
     std::map<int, std::vector<Mesh::VertexPointer>> idToVertices;
-    for (auto const& [v, id] : vertexToUniqueId) idToVertices[id].push_back(v);
+    for (auto const& pair : vertexToUniqueId) idToVertices[pair.second].push_back(pair.first);
 
-    for (auto const& [id, group] : idToVertices) {
+    for (auto const& pair : idToVertices) {
+        const std::vector<Mesh::VertexPointer>& group = pair.second;
         if (group.size() > 1) {
             // Seam or cut (multiple vertices at same 3D location)
             for (auto v : group) {
@@ -153,7 +156,9 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
     }
 
     // 3. Mark Immutable Vertices
-    for (auto& [v, info] : vertexInfo) {
+    for (auto& pair : vertexInfo) {
+        Mesh::VertexPointer v = pair.first;
+        BoundaryVertexInfo& info = pair.second;
         if (info.incidentBoundaryEdges.size() != 2) info.isImmutable = true;
         if (info.isEar) info.isImmutable = true;
         
@@ -168,7 +173,8 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
     bool changes = true;
     while (changes) {
         changes = false;
-        for (auto& [v, info] : vertexInfo) {
+        for (auto& pair : vertexInfo) {
+            BoundaryVertexInfo& info = pair.second;
             if (info.isImmutable) {
                 for (auto twin : info.geometricTwins) {
                     auto& twinInfo = vertexInfo[twin];
@@ -465,7 +471,9 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
             fixedIndices.push_back(bb2); targetPositions.push_back(ambientVerts[bb2]); isFixed[bb2] = true;
             fixedIndices.push_back(bb3); targetPositions.push_back(ambientVerts[bb3]); isFixed[bb3] = true;
 
-            for (auto const& [v, pos] : boundaryTargets) {
+            for (auto const& pair : boundaryTargets) {
+                Mesh::VertexPointer v = pair.first;
+                const Eigen::Vector2d& pos = pair.second;
                 int idx = vToTriIdx[v];
                 if (!isFixed[idx]) {
                     fixedIndices.push_back(idx);

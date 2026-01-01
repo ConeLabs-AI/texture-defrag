@@ -315,7 +315,9 @@ int main(int argc, char *argv[])
 
     LOG_INFO << "[VALIDATION] Checking graph and mesh integrity post-optimization...";
     int emptyCharts = 0;
-    for (auto const& [id, chart] : graph->charts) {
+    for (auto const& pair : graph->charts) {
+        RegionID id = pair.first;
+        ChartHandle chart = pair.second;
         if (chart == nullptr) {
             LOG_ERR << "[VALIDATION] CRITICAL: Found null chart handle in graph!";
         } else if (chart->fpVec.empty()) {

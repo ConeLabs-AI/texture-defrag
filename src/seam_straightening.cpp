@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <queue>
 #include <algorithm>
+#include <omp.h>
 
 extern "C" {
 #include "../vcglib/wrap/triangle/triangle.h"
@@ -20,7 +21,7 @@ namespace UVDefrag {
 
 struct SeamChain {
     std::vector<Mesh::VertexPointer> vertices;
-    std::vector<std::pair<Mesh::FacePointer, int>> edges; // Face and edge index
+    std::vector<std::pair<Mesh::FacePointer, int>> edges; 
     ChartHandle chart;
     bool isSeam = false;
     bool isTrueBoundary = false;
@@ -33,16 +34,25 @@ struct BoundaryVertexInfo {
     bool isTrueBoundary = false;
     bool isEar = false;
     std::vector<std::pair<Mesh::FacePointer, int>> incidentBoundaryEdges;
+    Mesh::VertexPointer twinV = nullptr;
 };
 
-static Eigen::Vector3d ComputeBarycentric(const Eigen::Vector2d& p, const Eigen::Vector2d& a, const Eigen::Vector2d& b, const Eigen::Vector2d& c) {
-    Eigen::Vector2d v0 = b - a, v1 = c - a, v2 = p - a;
-    double den = v0.x() * v1.y() - v1.x() * v0.y();
-    if (std::abs(den) < 1e-12) return Eigen::Vector3d(1, 0, 0);
-    double v = (v2.x() * v1.y() - v1.x() * v2.y()) / den;
-    double w = (v0.x() * v2.y() - v2.x() * v0.y()) / den;
-    double u = 1.0 - v - w;
-    return Eigen::Vector3d(u, v, w);
+// Global Snapshot Container to ensure deterministic Parallel RDP calculation
+using GlobalUVSnapshot = std::unordered_map<Mesh::FacePointer, std::array<Point2d, 3>>;
+
+Point2d GetSnapshotUV(const GlobalUVSnapshot& snapshot, const SeamChain& chain, int vertexIdx) {
+    // If vertexIdx is within edge count, use the start of that edge
+    if (vertexIdx < (int)chain.edges.size()) {
+        auto& edge = chain.edges[vertexIdx];
+        const auto& faceUVs = snapshot.at(edge.first);
+        return faceUVs[edge.second];
+    } 
+    // If vertexIdx is the last vertex, use the end of the last edge
+    else {
+        auto& edge = chain.edges.back();
+        const auto& faceUVs = snapshot.at(edge.first);
+        return faceUVs[(edge.second + 1) % 3];
+    }
 }
 
 void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParameters& params) {
@@ -50,7 +60,7 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
     tri::UpdateTopology<Mesh>::FaceFace(m);
     tri::UpdateTopology<Mesh>::VertexFace(m);
 
-    LOG_INFO << "Phase 1: Boundary Classification and Pairing...";
+    LOG_INFO << "Phase 1: Boundary Classification and Protection...";
 
     int numChartsAttempted = 0;
     int numChartsSucceeded = 0;
@@ -60,15 +70,14 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
 
     std::map<Mesh::VertexPointer, BoundaryVertexInfo> vertexInfo;
     
-    // Helper to identify if an edge is a boundary (mesh hole or seam)
     auto isBoundary = [&](Mesh::FacePointer f, int e) {
         Mesh::FacePointer ff = f->FFp(e);
-        if (ff == f) return true; // Mesh hole
-        if (ff->id != f->id) return true; // Seam
+        if (ff == f) return true; 
+        if (ff->id != f->id) return true; 
         return false;
     };
 
-    // 1. Collect boundary edges and count incident boundary edges per vertex
+    // 1. Classification (Serial)
     for (auto& entry : graph->charts) {
         ChartHandle chart = entry.second;
         for (auto f : chart->fpVec) {
@@ -81,31 +90,45 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                     vertexInfo[v0].incidentBoundaryEdges.push_back({f, i});
                     vertexInfo[v1].incidentBoundaryEdges.push_back({f, i});
                     
-                    if (f->FFp(i) == f) {
+                    Mesh::FacePointer ff = f->FFp(i);
+                    if (ff != f) {
+                        int pi = f->FFi(i);
+                        vertexInfo[v0].twinV = ff->V((pi + 1) % 3);
+                        vertexInfo[v1].twinV = ff->V(pi);
+                    } else {
                         vertexInfo[v0].isTrueBoundary = true;
                         vertexInfo[v1].isTrueBoundary = true;
                     }
                 }
             }
             if (boundaryEdgesInFace >= 2) {
-                for (int i = 0; i < 3; ++i) {
-                    vertexInfo[f->V(i)].isEar = true;
+                for (int i = 0; i < 3; ++i) vertexInfo[f->V(i)].isEar = true;
+            }
+        }
+    }
+
+    for (auto& [v, info] : vertexInfo) {
+        if (info.incidentBoundaryEdges.size() != 2) info.isImmutable = true;
+        if (info.incidentBoundaryEdges.size() > 2) info.isTJunction = true;
+        if (info.isEar) info.isImmutable = true;
+        if (info.isTrueBoundary) info.isImmutable = true;
+    }
+
+    bool changes = true;
+    while (changes) {
+        changes = false;
+        for (auto& [v, info] : vertexInfo) {
+            if (info.isImmutable && info.twinV) {
+                auto& twinInfo = vertexInfo[info.twinV];
+                if (!twinInfo.isImmutable) {
+                    twinInfo.isImmutable = true;
+                    changes = true;
                 }
             }
         }
     }
 
-    // 2. Mark Immutable vertices
-    for (auto& [v, info] : vertexInfo) {
-        if (info.incidentBoundaryEdges.size() > 2) {
-            info.isTJunction = true;
-            info.isImmutable = true;
-        }
-        if (info.isTrueBoundary) info.isImmutable = true;
-        if (info.isEar) info.isImmutable = true;
-    }
-
-    // 3. Extract Seam Chains
+    // 4. Extract Chains (Serial)
     std::vector<SeamChain> chains;
     std::set<std::pair<Mesh::FacePointer, int>> visitedEdges;
 
@@ -121,46 +144,24 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                     path.push_back({f, i});
                     visitedEdges.insert({f, i});
 
-                    auto nextEdge = [&](std::pair<Mesh::FacePointer, int> curr) -> std::pair<Mesh::FacePointer, int> {
-                        Mesh::VertexPointer vEnd = curr.first->V((curr.second + 1) % 3);
-                        if (vertexInfo[vEnd].isImmutable) return {nullptr, -1};
-                        
-                        for (auto& edge : vertexInfo[vEnd].incidentBoundaryEdges) {
-                            if (edge.first->id == chart->id && visitedEdges.find(edge) == visitedEdges.end()) {
-                                if (edge.first->V(edge.second) == vEnd) return edge;
-                            }
-                        }
-                        return {nullptr, -1};
-                    };
-
-                    auto prevEdge = [&](std::pair<Mesh::FacePointer, int> curr) -> std::pair<Mesh::FacePointer, int> {
-                        Mesh::VertexPointer vStart = curr.first->V(curr.second);
-                        if (vertexInfo[vStart].isImmutable) return {nullptr, -1};
-
-                        for (auto& edge : vertexInfo[vStart].incidentBoundaryEdges) {
-                            if (edge.first->id == chart->id && visitedEdges.find(edge) == visitedEdges.end()) {
-                                if (edge.first->V((edge.second + 1) % 3) == vStart) return edge;
-                            }
-                        }
-                        return {nullptr, -1};
-                    };
-
                     auto curr = path.back();
                     while (true) {
-                        auto next = nextEdge(curr);
+                        Mesh::VertexPointer vEnd = curr.first->V((curr.second + 1) % 3);
+                        if (vertexInfo[vEnd].isImmutable) break;
+                        
+                        std::pair<Mesh::FacePointer, int> next = {nullptr, -1};
+                        for (auto& edge : vertexInfo[vEnd].incidentBoundaryEdges) {
+                            if (edge.first->id == chart->id && visitedEdges.find(edge) == visitedEdges.end()) {
+                                if (edge.first->V(edge.second) == vEnd) {
+                                    next = edge;
+                                    break;
+                                }
+                            }
+                        }
                         if (next.first == nullptr) break;
                         path.push_back(next);
                         visitedEdges.insert(next);
                         curr = next;
-                    }
-
-                    curr = path.front();
-                    while (true) {
-                        auto prev = prevEdge(curr);
-                        if (prev.first == nullptr) break;
-                        path.insert(path.begin(), prev);
-                        visitedEdges.insert(prev);
-                        curr = prev;
                     }
 
                     for (auto& e : path) {
@@ -168,21 +169,17 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                         chain.edges.push_back(e);
                     }
                     chain.vertices.push_back(path.back().first->V((path.back().second + 1) % 3));
-                    
                     chain.isTrueBoundary = false;
                     for (auto& e : path) if (e.first->FFp(e.second) == e.first) chain.isTrueBoundary = true;
                     chain.isSeam = !chain.isTrueBoundary;
-
                     chains.push_back(chain);
                 }
             }
         }
     }
 
-    LOG_INFO << "Extracted " << chains.size() << " boundary chains.";
+    LOG_INFO << "Extracted " << chains.size() << " chains.";
 
-    // Link twins (Sides A and B of a cut)
-    // Note: This relies on shared vertices or exact float equality for duplicated vertices.
     std::map<std::vector<vcg::Point3d>, int> coordToChain;
     for (int i = 0; i < (int)chains.size(); ++i) {
         if (!chains[i].isSeam) continue;
@@ -200,7 +197,6 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                 int j = coordToChain[coords];
                 chains[i].twinChainIdx = j;
                 chains[j].twinChainIdx = i;
-                numTwinPairs++;
             } else {
                 std::reverse(coords.begin(), coords.end());
                 coordToChain[coords] = i;
@@ -208,48 +204,71 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
         }
     }
 
-    LOG_INFO << "Phase 2, 3 & 4: Processing each chart...";
+    // Pre-map charts to chains
+    std::map<ChartHandle, std::vector<int>> chartToChains;
+    for(int i = 0; i < (int)chains.size(); ++i) {
+        chartToChains[chains[i].chart].push_back(i);
+    }
+
+    std::vector<ChartHandle> chartVec;
+    chartVec.reserve(graph->charts.size());
+    for(auto& entry : graph->charts) chartVec.push_back(entry.second);
+
+    // Create Global UV Snapshot for Thread-Safe, Deterministic RDP Calculation
+    GlobalUVSnapshot globalSnapshot;
+    for (auto& entry : graph->charts) {
+        for (auto f : entry.second->fpVec) {
+            globalSnapshot[f] = { f->WT(0).P(), f->WT(1).P(), f->WT(2).P() };
+        }
+    }
+
+    LOG_INFO << "Phase 2 & 3: Straightening & Warping (Parallel " << omp_get_max_threads() << " threads)...";
+
     std::vector<int> retryStats(params.maxWarpAttempts, 0);
 
-    for (auto& entry : graph->charts) {
-        ChartHandle chart = entry.second;
+    #pragma omp parallel for schedule(dynamic)
+    for (int i = 0; i < (int)chartVec.size(); ++i) {
+        ChartHandle chart = chartVec[i];
+        
+        #pragma omp atomic
         numChartsAttempted++;
         
         double chartTol = params.initialTolerance;
         bool success = false;
-
-        // Backup original positions for this chart
-        std::map<Mesh::VertexPointer, Point2d> originalPositions;
-        for (auto f : chart->fpVec) for (int k = 0; k < 3; ++k) originalPositions[f->V(k)] = f->V(k)->T().P();
+        
+        const std::vector<int>& myChains = chartToChains[chart];
 
         for (int attempt = 0; attempt < params.maxWarpAttempts; ++attempt) {
             std::map<Mesh::VertexPointer, Eigen::Vector2d> boundaryTargets;
-            std::map<Mesh::VertexPointer, Eigen::Vector2d> boundaryStarts;
-            std::vector<std::pair<Mesh::VertexPointer, Mesh::VertexPointer>> constraints;
-
-            for (int ci = 0; ci < (int)chains.size(); ++ci) {
-                if (chains[ci].chart != chart) continue;
-                auto& chain = chains[ci];
+            
+            // --- 1. RDP Target Calculation ---
+            for (int ci : myChains) {
+                const auto& chain = chains[ci];
                 int twinIdx = chain.twinChainIdx;
 
-                if (twinIdx != -1 && chains[twinIdx].vertices.size() == chain.vertices.size()) {
-                    auto& chainB = chains[twinIdx];
+                if (twinIdx != -1) {
+                    const auto& chainB = chains[twinIdx];
                     bool reversed = (chain.vertices.front()->P() != chainB.vertices.front()->P());
+                    
                     std::vector<Eigen::Vector4d> poly4D;
                     for (int k = 0; k < (int)chain.vertices.size(); ++k) {
                         int kB = reversed ? (chainB.vertices.size() - 1 - k) : k;
-                        poly4D.push_back(Eigen::Vector4d(
-                            originalPositions[chain.vertices[k]].X(), originalPositions[chain.vertices[k]].Y(),
-                            originalPositions[chainB.vertices[kB]].X(), originalPositions[chainB.vertices[kB]].Y()
-                        ));
+                        
+                        // Read from Immutable Global Snapshot
+                        Point2d pA = GetSnapshotUV(globalSnapshot, chain, k);
+                        Point2d pB = GetSnapshotUV(globalSnapshot, chainB, kB); 
+                        
+                        poly4D.push_back(Eigen::Vector4d(pA.X(), pA.Y(), pB.X(), pB.Y()));
                     }
                     std::vector<Eigen::Vector4d> simplified = GeometryUtils::simplifyRDP(poly4D, chartTol);
                     
                     if (attempt == 0) {
+                        #pragma omp atomic
                         totalSegmentsBefore += (int)poly4D.size() - 1;
+                        #pragma omp atomic
                         totalSegmentsAfter += (int)simplified.size() - 1;
                     }
-
+                    
                     auto computeArcLengths = [](const std::vector<Eigen::Vector4d>& poly) {
                         std::vector<double> lengths(poly.size(), 0.0);
                         for (size_t k = 1; k < poly.size(); ++k) lengths[k] = lengths[k - 1] + (poly[k] - poly[k - 1]).norm();
@@ -276,70 +295,93 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                             }
                         }
                         boundaryTargets[chain.vertices[k]] = Eigen::Vector2d(p4.x(), p4.y());
-                        boundaryStarts[chain.vertices[k]] = Eigen::Vector2d(originalPositions[chain.vertices[k]].X(), originalPositions[chain.vertices[k]].Y());
                     }
                 } else {
-                    for (auto v : chain.vertices) {
-                        boundaryTargets[v] = Eigen::Vector2d(originalPositions[v].X(), originalPositions[v].Y());
-                        boundaryStarts[v] = Eigen::Vector2d(originalPositions[v].X(), originalPositions[v].Y());
+                    for (int k = 0; k < (int)chain.vertices.size(); ++k) {
+                        Point2d pA = GetSnapshotUV(globalSnapshot, chain, k);
+                        boundaryTargets[chain.vertices[k]] = Eigen::Vector2d(pA.X(), pA.Y());
                     }
-                }
-                for (size_t k = 0; k < chain.vertices.size() - 1; ++k) {
-                    constraints.push_back({chain.vertices[k], chain.vertices[k+1]});
+                    if (attempt == 0) {
+                        #pragma omp atomic
+                        totalSegmentsBefore += (int)chain.vertices.size() - 1;
+                        #pragma omp atomic
+                        totalSegmentsAfter += (int)chain.vertices.size() - 1;
+                    }
                 }
             }
 
+            // --- 2. Ambient Mesh Construction (Robust) ---
             vcg::Box2d bbox = chart->UVBox();
-            double expansion = std::max({bbox.DimX() * 0.1, bbox.DimY() * 0.1, 1e-6});
-            bbox.Offset(vcg::Point2d(expansion, expansion));
+            double dimX = std::max(bbox.DimX(), 1e-6);
+            double dimY = std::max(bbox.DimY(), 1e-6);
+            bbox.min -= vcg::Point2d(dimX * 0.2, dimY * 0.2);
+            bbox.max += vcg::Point2d(dimX * 0.2, dimY * 0.2);
 
             struct triangulateio in, out;
             memset(&in, 0, sizeof(in));
             memset(&out, 0, sizeof(out));
 
-            std::map<std::pair<double, double>, int> posToIdx;
-            std::map<Mesh::VertexPointer, int> vToTriIdx;
-            std::vector<double> pts;
-            int nextIdx = 0;
-            for (auto& [v, pos] : boundaryStarts) {
-                std::pair<double, double> p = {pos.x(), pos.y()};
-                if (posToIdx.find(p) == posToIdx.end()) {
-                    posToIdx[p] = nextIdx++;
-                    pts.push_back(pos.x());
-                    pts.push_back(pos.y());
+            std::vector<std::pair<Mesh::VertexPointer, Eigen::Vector2d>> rawPoints;
+            
+            // Re-write RawPoints collection to avoid scanning
+            rawPoints.clear();
+            rawPoints.reserve(chart->fpVec.size() * 3);
+            for(auto f : chart->fpVec) {
+                const auto& uvs = globalSnapshot.at(f); // Fast lookup
+                for(int k=0; k<3; ++k) {
+                    rawPoints.push_back({f->V(k), Eigen::Vector2d(uvs[k].X(), uvs[k].Y())});
                 }
-                vToTriIdx[v] = posToIdx[p];
+            }
+            
+            // Deduplication logic (Weak ordering fix)
+            std::sort(rawPoints.begin(), rawPoints.end(), [](const auto& a, const auto& b) {
+                if (a.second.x() != b.second.x()) return a.second.x() < b.second.x();
+                return a.second.y() < b.second.y();
+            });
+
+            std::map<Mesh::VertexPointer, int> vToTriIdx;
+            std::vector<Eigen::Vector2d> uniquePoints;
+            
+            if (!rawPoints.empty()) {
+                uniquePoints.push_back(rawPoints[0].second);
+                vToTriIdx[rawPoints[0].first] = 0;
+                for (size_t k = 1; k < rawPoints.size(); ++k) {
+                    const auto& prev = uniquePoints.back();
+                    const auto& curr = rawPoints[k].second;
+                    if ((curr - prev).squaredNorm() < 1e-20) {
+                        vToTriIdx[rawPoints[k].first] = (int)uniquePoints.size() - 1;
+                    } else {
+                        vToTriIdx[rawPoints[k].first] = (int)uniquePoints.size();
+                        uniquePoints.push_back(curr);
+                    }
+                }
             }
 
-            int bb0 = nextIdx++; pts.push_back(bbox.min.X()); pts.push_back(bbox.min.Y());
-            int bb1 = nextIdx++; pts.push_back(bbox.max.X()); pts.push_back(bbox.min.Y());
-            int bb2 = nextIdx++; pts.push_back(bbox.max.X()); pts.push_back(bbox.max.Y());
-            int bb3 = nextIdx++; pts.push_back(bbox.min.X()); pts.push_back(bbox.max.Y());
-
-            in.numberofpoints = nextIdx;
+            in.numberofpoints = (int)uniquePoints.size() + 4;
             in.pointlist = (TRI_REAL *) malloc(in.numberofpoints * 2 * sizeof(TRI_REAL));
-            for (int k = 0; k < (int)pts.size(); ++k) in.pointlist[k] = pts[k];
-
-            std::vector<std::pair<int, int>> filteredConstraints;
-            for (int k = 0; k < (int)constraints.size(); ++k) {
-                int i0 = vToTriIdx[constraints[k].first];
-                int i1 = vToTriIdx[constraints[k].second];
-                if (i0 != i1) filteredConstraints.push_back({i0, i1});
+            for (int k = 0; k < (int)uniquePoints.size(); ++k) {
+                in.pointlist[k * 2] = uniquePoints[k].x();
+                in.pointlist[k * 2 + 1] = uniquePoints[k].y();
             }
 
-            in.numberofsegments = (int)filteredConstraints.size() + 4;
+            int nextIdx = (int)uniquePoints.size();
+            in.pointlist[nextIdx * 2] = bbox.min.X(); in.pointlist[nextIdx * 2 + 1] = bbox.min.Y(); int bb0 = nextIdx++;
+            in.pointlist[nextIdx * 2] = bbox.max.X(); in.pointlist[nextIdx * 2 + 1] = bbox.min.Y(); int bb1 = nextIdx++;
+            in.pointlist[nextIdx * 2] = bbox.max.X(); in.pointlist[nextIdx * 2 + 1] = bbox.max.Y(); int bb2 = nextIdx++;
+            in.pointlist[nextIdx * 2] = bbox.min.X(); in.pointlist[nextIdx * 2 + 1] = bbox.max.Y(); int bb3 = nextIdx++;
+
+            in.numberofsegments = 4;
             in.segmentlist = (int *) malloc(in.numberofsegments * 2 * sizeof(int));
-            for (int k = 0; k < (int)filteredConstraints.size(); ++k) {
-                in.segmentlist[k * 2] = filteredConstraints[k].first;
-                in.segmentlist[k * 2 + 1] = filteredConstraints[k].second;
-            }
-            int segOff = (int)filteredConstraints.size();
-            in.segmentlist[segOff*2] = bb0; in.segmentlist[segOff*2+1] = bb1;
-            in.segmentlist[(segOff+1)*2] = bb1; in.segmentlist[(segOff+1)*2+1] = bb2;
-            in.segmentlist[(segOff+2)*2] = bb2; in.segmentlist[(segOff+2)*2+1] = bb3;
-            in.segmentlist[(segOff+3)*2] = bb3; in.segmentlist[(segOff+3)*2+1] = bb0;
+            in.segmentlist[0] = bb0; in.segmentlist[1] = bb1;
+            in.segmentlist[2] = bb1; in.segmentlist[3] = bb2;
+            in.segmentlist[4] = bb2; in.segmentlist[5] = bb3;
+            in.segmentlist[6] = bb3; in.segmentlist[7] = bb0;
 
-            triangulate((char*)"zpQ", &in, &out, nullptr);
+            // Critical Section for Triangle + "zpQ" + No internal segments
+            #pragma omp critical(triangulate_lib)
+            {
+                triangulate((char*)"zpQ", &in, &out, nullptr);
+            }
 
             std::vector<Eigen::Vector2d> ambientVerts(out.numberofpoints);
             for (int k = 0; k < out.numberofpoints; ++k) ambientVerts[k] = Eigen::Vector2d(out.pointlist[k * 2], out.pointlist[k * 2 + 1]);
@@ -350,69 +392,72 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                 ambientFaces[k].v[2] = out.trianglelist[k * 3 + 2];
             }
 
-            struct Binding { int triIdx; Eigen::Vector3d bary; };
-            std::map<Mesh::VertexPointer, Binding> bindings;
-            std::set<Mesh::VertexPointer> allChartVerts;
-            for (auto f : chart->fpVec) for (int k = 0; k < 3; ++k) allChartVerts.insert(f->V(k));
+            std::vector<int> fixedIndices;
+            std::vector<Eigen::Vector2d> targetPositions;
+            std::vector<bool> isFixed(ambientVerts.size(), false);
 
-            for (auto v : allChartVerts) {
-                Eigen::Vector2d p(originalPositions[v].X(), originalPositions[v].Y());
-                bool found = false;
-                for (int k = 0; k < (int)ambientFaces.size(); ++k) {
-                    auto& tri = ambientFaces[k];
-                    Eigen::Vector3d bary = ComputeBarycentric(p, ambientVerts[tri.v[0]], ambientVerts[tri.v[1]], ambientVerts[tri.v[2]]);
-                    if (bary.x() >= -1e-6 && bary.y() >= -1e-6 && bary.z() >= -1e-6) {
-                        bindings[v] = {k, bary};
-                        found = true;
-                        break;
+            fixedIndices.push_back(bb0); targetPositions.push_back(ambientVerts[bb0]); isFixed[bb0] = true;
+            fixedIndices.push_back(bb1); targetPositions.push_back(ambientVerts[bb1]); isFixed[bb1] = true;
+            fixedIndices.push_back(bb2); targetPositions.push_back(ambientVerts[bb2]); isFixed[bb2] = true;
+            fixedIndices.push_back(bb3); targetPositions.push_back(ambientVerts[bb3]); isFixed[bb3] = true;
+
+            for (auto const& [v, pos] : boundaryTargets) {
+                int idx = vToTriIdx[v];
+                if (!isFixed[idx]) {
+                    fixedIndices.push_back(idx);
+                    targetPositions.push_back(pos);
+                    isFixed[idx] = true;
+                }
+            }
+
+            if (ApplyCompositeWarp(ambientVerts, ambientFaces, fixedIndices, targetPositions)) {
+                // Result Validation Buffer
+                std::map<Mesh::VertexPointer, Point2d> computedUVs;
+                for (auto f : chart->fpVec) {
+                    for(int k=0; k<3; ++k) {
+                        int idx = vToTriIdx[f->V(k)];
+                        computedUVs[f->V(k)] = Point2d(ambientVerts[idx].x(), ambientVerts[idx].y());
                     }
                 }
-                if (!found) { /* Use closest or something? Margin should be enough. */ }
-            }
 
-            std::vector<int> fixedAmbientIndices;
-            std::vector<Eigen::Vector2d> ambientTargets;
-            for (auto& [v, idx] : vToTriIdx) {
-                fixedAmbientIndices.push_back(idx);
-                ambientTargets.push_back(boundaryTargets[v]);
-            }
-            fixedAmbientIndices.push_back(bb0); ambientTargets.push_back(ambientVerts[bb0]);
-            fixedAmbientIndices.push_back(bb1); ambientTargets.push_back(ambientVerts[bb1]);
-            fixedAmbientIndices.push_back(bb2); ambientTargets.push_back(ambientVerts[bb2]);
-            fixedAmbientIndices.push_back(bb3); ambientTargets.push_back(ambientVerts[bb3]);
-
-            if (ApplyCompositeWarp(ambientVerts, ambientFaces, fixedAmbientIndices, ambientTargets)) {
-                for (auto v : allChartVerts) {
-                    auto it = bindings.find(v);
-                    if (it == bindings.end()) continue;
-                    auto& b = it->second;
-                    auto& tri = ambientFaces[b.triIdx];
-                    Eigen::Vector2d p = b.bary.x() * ambientVerts[tri.v[0]] + b.bary.y() * ambientVerts[tri.v[1]] + b.bary.z() * ambientVerts[tri.v[2]];
-                    v->T().P() = Point2d(p.x(), p.y());
-                }
                 bool inverted = false;
-                for (auto f : chart->fpVec) if (AreaUV(*f) <= 1e-12) { inverted = true; break; }
+                for (auto f : chart->fpVec) {
+                    Point2d p0 = computedUVs[f->V(0)];
+                    Point2d p1 = computedUVs[f->V(1)];
+                    Point2d p2 = computedUVs[f->V(2)];
+                    double area = ((p1.X()-p0.X())*(p2.Y()-p0.Y()) - (p1.Y()-p0.Y())*(p2.X()-p0.X())) / 2.0;
+                    if (area <= 1e-12) { inverted = true; break; }
+                }
+                
                 if (!inverted) {
                     success = true;
+                    
+                    #pragma omp atomic
                     numChartsSucceeded++;
+                    #pragma omp atomic
                     retryStats[attempt]++;
+                    
                     chart->isSeamStraightened = true;
                     if (params.colorize) {
                         for (auto f : chart->fpVec) f->C() = vcg::Color4b(255, 165, 0, 255);
                     }
-                    for (auto f : chart->fpVec) for (int k = 0; k < 3; ++k) f->WT(k).P() = f->V(k)->T().P();
-                } else {
-                    for (auto v : allChartVerts) v->T().P() = originalPositions[v];
+                    // Thread-Safe Write
+                    for (auto f : chart->fpVec) {
+                        for (int k = 0; k < 3; ++k) {
+                            f->WT(k).P() = computedUVs[f->V(k)];
+                        }
+                    }
                 }
             }
 
             free(in.pointlist); free(in.segmentlist);
-            trifree((int*)out.pointlist); trifree(out.trianglelist); trifree(out.segmentlist);
+            trifree((VOID *)out.pointlist); trifree(out.trianglelist); trifree(out.segmentlist);
             
             if (success) break;
             chartTol *= 0.5;
         }
     }
+
     LOG_INFO << "Seam Straightening completed:";
     LOG_INFO << "  - Charts: " << numChartsSucceeded << " / " << numChartsAttempted << " straightened successfully";
     for (int i = 0; i < params.maxWarpAttempts; ++i) {

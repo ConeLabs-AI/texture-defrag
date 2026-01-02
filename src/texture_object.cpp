@@ -36,6 +36,7 @@
 
 #include <QImageReader>
 #include <QImage>
+#include <QFileInfo>
 #include <QOpenGLContext>
 
 
@@ -113,7 +114,7 @@ void TextureObject::Bind(int i)
         // Track memory usage and LRU
         texBytesVec_[i] = bytesNeeded;
         currentCacheBytes_ += bytesNeeded;
-        currentROIs_[i].Set(vcg::Point2d(0, 0), vcg::Point2d(1, 1));
+        currentROIs_[i].Set(0, 0, 1, 1);
         TouchLRU(i);
     }
     else {

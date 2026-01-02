@@ -77,4 +77,3 @@ std::string GetRawTilePath(const std::string& imagePath) {
 }
 
 } // namespace TextureConversion
-

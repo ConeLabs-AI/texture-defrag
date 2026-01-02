@@ -49,9 +49,12 @@
 #include <QOpenGLContext>
 #include <QSurfaceFormat>
 #include <QOffscreenSurface>
+#include <QFile>
 
 #include <chrono>
 #include <limits>
+
+#include "texture_conversion.h"
 
 
 static const char *vs_text[] = {
@@ -402,6 +405,20 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
     if (!textureObject || textureObject->ArraySize() == 0) {
         LOG_ERR << "No textures available for rendering. Ensure input OBJ references an MTL with map_Kd textures.";
         std::exit(-1);
+    }
+
+    // Automatic On-Demand Conversion:
+    // Generate .rawtile files only if they don't exist, right before rendering begins.
+    LOG_INFO << "Ensuring optimized .rawtile caches exist...";
+    for (size_t i = 0; i < textureObject->ArraySize(); ++i) {
+        std::string inputPath = textureObject->texInfoVec[i].path;
+        std::string rawPath = TextureConversion::GetRawTilePath(inputPath);
+        if (!QFile::exists(QString::fromStdString(rawPath))) {
+            LOG_INFO << "  [Preparing Cache] " << inputPath;
+            if (!TextureConversion::ConvertToRawTile(inputPath, rawPath)) {
+                LOG_ERR << "  - Conversion failed. Tiled I/O disabled for this file.";
+            }
+        }
     }
 
     // Reset GPU texture cache stats for this rendering pass

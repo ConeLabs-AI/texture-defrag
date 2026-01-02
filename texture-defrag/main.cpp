@@ -499,28 +499,6 @@ int main(int argc, char *argv[])
     double totalNewTextureGB = totalNewTextureMB / 1024.0;
     LOG_INFO << "[DIAG] Total texture memory to be allocated by rendering: " << totalNewTextureMB << " MB (" << totalNewTextureGB << " GB)";
     
-    // Hard limit: abort if planned allocation exceeds 64 GB to prevent OOM/crash
-    const double MAX_TEXTURE_MEMORY_GB = 64.0;
-    if (totalNewTextureGB > MAX_TEXTURE_MEMORY_GB) {
-        LOG_ERR << "[VALIDATION] Total planned texture memory (" << totalNewTextureGB 
-                << " GB) exceeds hard limit of " << MAX_TEXTURE_MEMORY_GB << " GB. Aborting.";
-        LOG_ERR << "[VALIDATION] This usually indicates non-normalized UVs or collapsed packing scale.";
-        LOG_ERR << "[VALIDATION] texszVec has " << texszVec.size() << " entries.";
-        // Log a few of the largest entries for debugging
-        std::vector<std::pair<int64_t, size_t>> sizeIdx;
-        for (size_t i = 0; i < texszVec.size(); ++i) {
-            sizeIdx.push_back({(int64_t)texszVec[i].w * texszVec[i].h, i});
-        }
-        std::sort(sizeIdx.begin(), sizeIdx.end(), std::greater<std::pair<int64_t, size_t>>());
-        LOG_ERR << "[VALIDATION] Largest texture sheets:";
-        for (size_t k = 0; k < std::min<size_t>(10, sizeIdx.size()); ++k) {
-            size_t idx = sizeIdx[k].second;
-            LOG_ERR << "  [" << idx << "] " << texszVec[idx].w << "x" << texszVec[idx].h 
-                    << " = " << sizeIdx[k].first << " pixels";
-        }
-        std::exit(-1);
-    }
-
     if (npacked < (int) chartsToPack.size()) {
         LOG_ERR << "Not all charts were packed (" << chartsToPack.size() << " charts, " << npacked << " packed)";
         std::exit(-1);

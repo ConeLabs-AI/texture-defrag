@@ -64,10 +64,12 @@ static const char *vs_text[] = {
     "out vec4 fcolor;                                            \n"
     "uniform vec2 tile_min;                                      \n"
     "uniform vec2 tile_scale;                                    \n"
+    "uniform vec2 roi_min;                                       \n"
+    "uniform vec2 roi_scale;                                     \n"
     "                                                            \n"
     "void main(void)                                             \n"
     "{                                                           \n"
-    "    uv = texcoord;                                          \n"
+    "    uv = (texcoord - roi_min) / roi_scale;                  \n"
     "    fcolor = color;                                         \n"
     "    vec2 local = (position - tile_min) / tile_scale;        \n"
     "    vec2 p = vec2(2.0 * local.x - 1.0, 1.0 - 2.0 * local.y);\n"
@@ -153,6 +155,8 @@ struct RenderingContext {
     GLint loc_render_mode = -1;
     GLint loc_tile_min = -1;
     GLint loc_tile_scale = -1;
+    GLint loc_roi_min = -1;
+    GLint loc_roi_scale = -1;
 
     RenderingContext() {
         if (QOpenGLContext::currentContext() == nullptr) {
@@ -196,6 +200,8 @@ struct RenderingContext {
         loc_render_mode = glFuncs->glGetUniformLocation(program, "render_mode");
         loc_tile_min = glFuncs->glGetUniformLocation(program, "tile_min");
         loc_tile_scale = glFuncs->glGetUniformLocation(program, "tile_scale");
+        loc_roi_min = glFuncs->glGetUniformLocation(program, "roi_min");
+        loc_roi_scale = glFuncs->glGetUniformLocation(program, "roi_scale");
 
         glFuncs->glGenFramebuffers(1, &fbo);
         glFuncs->glGenTextures(1, &renderTarget);
@@ -438,8 +444,14 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
     ImageSaveQueue saveQueue(2);
     saveQueue.resetStats();
 
+    int lastProgressLog = -1;
     for (int i = 0; i < nTex; ++i) {
-        LOG_INFO << "Processing sheet " << (i + 1) << " of " << nTex << "...";
+        int progressPercent = (i * 100) / nTex;
+        if (progressPercent / 10 != lastProgressLog) {
+            LOG_INFO << "Rendering Progress: " << progressPercent << "% (" << (i + 1) << " / " << nTex << " sheets)";
+            lastProgressLog = progressPercent / 10;
+        }
+
         auto t_render_start = std::chrono::high_resolution_clock::now();
         std::shared_ptr<QImage> teximg = RenderTexture(renderingContext, facesByTexture[i], m, textureObject, filter, imode, texSizes[i].w, texSizes[i].h);
         auto t_render_end = std::chrono::high_resolution_clock::now();
@@ -457,7 +469,7 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
         const QString absPath = texFI.absoluteFilePath();
         // Enqueue save to overlap compression with next sheet rendering
         auto t_enqueue_start = std::chrono::high_resolution_clock::now();
-        saveQueue.enqueue(*teximg, absPath, 50);
+        saveQueue.enqueue(*teximg, absPath, 75);
         auto t_enqueue_end = std::chrono::high_resolution_clock::now();
         t_total_savequeue_enqueue_s += std::chrono::duration<double>(t_enqueue_end - t_enqueue_start).count();
     }
@@ -477,22 +489,38 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
     double t_total_s = std::chrono::duration<double>(t_total_end - t_total_start).count();
 
     // Log performance summary
-    LOG_VERBOSE << "[RENDER-STATS] sheets=" << nTex
+    LOG_INFO << "[RENDER-STATS] total_s=" << t_total_s
+             << " sheets=" << nTex
              << " pixels=" << total_pixels_rendered
-             << " total_s=" << t_total_s
              << " render_s=" << t_total_render_s
-             << " enqueue_s=" << t_total_savequeue_enqueue_s
+             << " png_save_s=" << t_total_png_save_s;
+
+    LOG_VERBOSE << "[RENDER-STATS-VERBOSE] enqueue_s=" << t_total_savequeue_enqueue_s
              << " save_wait_s=" << t_save_wait_s
-             << " png_save_s=" << t_total_png_save_s
              << " png_min_s=" << saveStats.minSaveS
              << " png_max_s=" << saveStats.maxSaveS
              << " png_saved=" << saveStats.saved;
 
-    // Log GPU texture cache stats
+    // Log GPU texture cache and Tiled I/O stats
     if (textureObject) {
         auto cs = textureObject->GetCacheStats();
         uint64_t lookups = cs.hits + cs.misses;
         double hitRate = lookups ? double(cs.hits) / double(lookups) : 0.0;
+        double mbRead = double(cs.bytesRead) / (1024.0 * 1024.0);
+        double mbEvicted = double(cs.bytesEvicted) / (1024.0 * 1024.0);
+        double diskSpeed = (cs.diskReadTimeS > 0) ? (mbRead / cs.diskReadTimeS) : 0.0;
+
+        LOG_INFO << "--- Texture Rendering Observability Summary ---";
+        LOG_INFO << "  [I/O Efficiency] Tiles Loaded: " << cs.tilesLoaded << " (" << mbRead << " MB total)";
+        LOG_INFO << "  [Disk Performance] Raw I/O Time: " << cs.diskReadTimeS << "s (" << diskSpeed << " MB/s)";
+        LOG_INFO << "  [GPU Cache] Hit Rate: " << (hitRate * 100.0) << "% (" << lookups << " lookups)";
+        LOG_INFO << "  [GPU Pressure] Evictions: " << cs.evictions << " (" << mbEvicted << " MB evicted)";
+        if (cs.fallbacks > 0) {
+            LOG_WARN << "  [Optimization] Tiled I/O Fallbacks: " << cs.fallbacks << " (missing .rawtile files)";
+        }
+        LOG_INFO << "  [Final State] Bytes in Use: " << (double(textureObject->GetCurrentCacheBytes()) / (1024.0 * 1024.0)) << " MB";
+        LOG_INFO << "-----------------------------------------------";
+
         LOG_VERBOSE << "[TEX-CACHE] lookups=" << lookups
                  << " hits=" << cs.hits
                  << " misses=" << cs.misses
@@ -500,8 +528,10 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
                  << " evictions=" << cs.evictions
                  << " bytesEvicted=" << cs.bytesEvicted
                  << " bytesInUse=" << textureObject->GetCurrentCacheBytes()
-                 << "/budget=" << textureObject->GetCacheBudgetBytes();
-        LOG_INFO << "[TEX-CACHE] lookups=" << lookups << " hitRate=" << hitRate;
+                 << "/budget=" << textureObject->GetCacheBudgetBytes()
+                 << " tiles=" << cs.tilesLoaded
+                 << " readMB=" << mbRead
+                 << " diskS=" << cs.diskReadTimeS;
     }
 
     if (textureObject) textureObject->ReleaseAll();
@@ -630,8 +660,28 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
             while (fbase != fvec.end()) {
                 auto fcurr = fbase;
                 int currTexIndex = WTCSh[*fcurr].tc[0].N();
-                while (fcurr != fvec.end() && WTCSh[*fcurr].tc[0].N() == currTexIndex)
+                
+                // Calculate UV bounding box of this face batch to determine ROI
+                vcg::Box2d roiPixels;
+                while (fcurr != fvec.end() && WTCSh[*fcurr].tc[0].N() == currTexIndex) {
+                    for (int k = 0; k < 3; ++k) {
+                        roiPixels.Add(WTCSh[*fcurr].tc[k].P());
+                    }
                     fcurr++;
+                }
+
+                // IMPORTANT: Add 2-pixel margin to avoid interpolation/clamping artifacts 
+                // at the edges of the dynamically loaded patches.
+                roiPixels.min -= vcg::Point2d(2, 2);
+                roiPixels.max += vcg::Point2d(2, 2);
+
+                vcg::Box2d roiNormalized;
+                if (currTexIndex >= 0 && currTexIndex < (int)inTexSizes.size() && inTexSizes[currTexIndex].w > 0 && inTexSizes[currTexIndex].h > 0) {
+                    roiNormalized.min.X() = std::max(0.0, std::min(1.0, roiPixels.min.X() / inTexSizes[currTexIndex].w));
+                    roiNormalized.min.Y() = std::max(0.0, std::min(1.0, roiPixels.min.Y() / inTexSizes[currTexIndex].h));
+                    roiNormalized.max.X() = std::max(0.0, std::min(1.0, roiPixels.max.X() / inTexSizes[currTexIndex].w));
+                    roiNormalized.max.Y() = std::max(0.0, std::min(1.0, roiPixels.max.Y() / inTexSizes[currTexIndex].h));
+                }
                 int baseIndex = std::distance(f0, fbase) * 3;
                 int count = std::distance(fbase, fcurr) * 3;
 
@@ -644,7 +694,12 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
                     fbase = fcurr;
                     continue;
                 }
-                textureObject->Bind(currTexIndex);
+                textureObject->BindRegion(currTexIndex, roiNormalized);
+
+                // Set ROI uniforms for UV remapping
+                vcg::Box2d actualROI = textureObject->GetCurrentROI(currTexIndex);
+                glFuncs->glUniform2f(ctx.loc_roi_min, (float)actualROI.min.X(), (float)actualROI.min.Y());
+                glFuncs->glUniform2f(ctx.loc_roi_scale, (float)actualROI.DimX(), (float)actualROI.DimY());
 
                 glFuncs->glUniform1i(ctx.loc_img0, 0);
                 glFuncs->glUniform2f(ctx.loc_texture_size, float(textureObject->TextureWidth(currTexIndex)), float(textureObject->TextureHeight(currTexIndex)));

@@ -17,6 +17,7 @@ SOURCES += \
     ../src/shell.cpp \
     ../src/texture_object.cpp \
     ../src/seam_straightening.cpp \
+    ../src/texture_conversion.cpp \
     main.cpp
 
 SOURCES += \
@@ -51,4 +52,5 @@ HEADERS += \
     ../src/texture_object.h \
     ../src/rdp.h \
     ../src/harmonic_map_utils.h \
-    ../src/seam_straightening.h
+    ../src/seam_straightening.h \
+    ../src/texture_conversion.h

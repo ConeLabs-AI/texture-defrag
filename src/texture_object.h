@@ -28,6 +28,7 @@
 #include <string>
 #include <list>
 #include <unordered_map>
+#include <vcg/space/box2.h>
 
 class QImage;
 class TextureObject;
@@ -62,6 +63,20 @@ struct TextureObject {
     /* Binds the texture at index i */
     void Bind(int i);
 
+    /**
+     * Binds a specific region of interest (ROI) for texture i.
+     * The ROI is specified in normalized [0,1] coordinates.
+     * This will load only the necessary tiles from a .rawtile file if available.
+     * If .rawtile is not found, it falls back to Bind(i) (full texture load).
+     */
+    void BindRegion(int i, vcg::Box2d roi);
+
+    /**
+     * Returns the current ROI loaded on the GPU for texture i.
+     * This is used by the renderer to remap UV coordinates.
+     */
+    vcg::Box2d GetCurrentROI(int i) const;
+
     /* Releases the texture i, without unbinding it if it is bound */
     void Release(int i);
     /* Releases all textures */
@@ -86,6 +101,12 @@ struct TextureObject {
         uint64_t misses = 0;
         uint64_t evictions = 0;
         uint64_t bytesEvicted = 0;
+
+        // Tiled I/O stats
+        uint64_t tilesLoaded = 0;
+        uint64_t bytesRead = 0;
+        double diskReadTimeS = 0.0;
+        uint64_t fallbacks = 0;
     };
     void ResetCacheStats();
     CacheStats GetCacheStats() const;
@@ -114,6 +135,14 @@ private:
     uint64_t cacheMisses_ = 0;
     uint64_t cacheEvictions_ = 0;
     uint64_t bytesEvicted_ = 0;
+
+    // Tiled I/O stats
+    uint64_t tilesLoaded_ = 0;
+    uint64_t bytesRead_ = 0;
+    double diskReadTimeS_ = 0.0;
+    uint64_t fallbacks_ = 0;
+
+    std::vector<vcg::Box2d> currentROIs_; // Track current ROI loaded for each texture index
 };
 
 /* Vertically mirrors a QImage in-place, useful to match the OpenGL convention

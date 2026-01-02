@@ -31,6 +31,7 @@
 #include "seam_remover.h"
 #include "texture_rendering.h"
 #include "seam_straightening.h"
+#include "texture_conversion.h"
 
 #include <wrap/io_trimesh/io_mask.h>
 #include <wrap/system/qgetopt.h>
@@ -54,6 +55,7 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QString>
+#include <QFile>
 #include <QOpenGLContext>
 #include <QSurfaceFormat>
 #include <QOffscreenSurface>
@@ -130,6 +132,7 @@ int main(int argc, char *argv[])
         LOG_ERR << "Failed to open mesh";
         std::exit(-1);
     }
+
     timings["Load mesh"] = t.TimeSinceLastCheck();
 
     // Configure GPU texture cache budget
@@ -545,6 +548,16 @@ int main(int argc, char *argv[])
     if (SaveMesh(savename.c_str(), m, {}, true) == false)
         LOG_ERR << "Model not saved correctly";
     timings["Saving mesh"] = t.TimeSinceLastCheck();
+
+    if (textureObject) {
+        LOG_INFO << "Cleaning up intermediate .rawtile files...";
+        for (size_t i = 0; i < textureObject->ArraySize(); ++i) {
+            std::string rawPath = TextureConversion::GetRawTilePath(textureObject->texInfoVec[i].path);
+            if (QFile::exists(QString::fromStdString(rawPath))) {
+                QFile::remove(QString::fromStdString(rawPath));
+            }
+        }
+    }
 
     std::stringstream timingsSS;
     timingsSS << "--- Timings ---";

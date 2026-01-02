@@ -252,15 +252,21 @@ int main(int argc, char *argv[])
     GreedyOptimization(graph, state, ap);
     timings["Greedy optimization"] = t.TimeSinceLastCheck();
 
-    LOG_INFO << "Straightening seams...";
-    {
-        UVDefrag::SeamStraighteningParameters ssp;
-        double maxRes = (textureObject) ? (double)textureObject->MaxSize() : 1024.0;
-        ssp.initialTolerance = args.straightenTolerancePixels / maxRes;
-        LOG_INFO << "[DIAG] Seam straightening texel tolerance: " << args.straightenTolerancePixels << " pixels -> epsilon=" << ssp.initialTolerance << " (resolution=" << maxRes << ")";
-        UVDefrag::IntegrateSeamStraightening(graph, ssp);
+    double maxRes = (textureObject) ? (double)textureObject->MaxSize() : 1024.0;
+    double straightenToleranceEpsilon = args.straightenTolerancePixels / maxRes;
+
+    if (args.straightenTolerancePixels > 0) {
+        LOG_INFO << "Straightening seams...";
+        {
+            UVDefrag::SeamStraighteningParameters ssp;
+            ssp.initialTolerance = straightenToleranceEpsilon;
+            LOG_INFO << "[DIAG] Seam straightening texel tolerance: " << args.straightenTolerancePixels << " pixels -> epsilon=" << ssp.initialTolerance << " (resolution=" << maxRes << ")";
+            UVDefrag::IntegrateSeamStraightening(graph, ssp);
+        }
+        timings["Seam straightening"] = t.TimeSinceLastCheck();
+    } else {
+        LOG_INFO << "Skipping seam straightening (tolerance is zero).";
     }
-    timings["Seam straightening"] = t.TimeSinceLastCheck();
 
     int vndupOut;
 

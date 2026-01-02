@@ -58,6 +58,11 @@ Point2d GetSnapshotUV(const GlobalUVSnapshot& snapshot, const SeamChain& chain, 
 }
 
 void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParameters& params) {
+    if (params.initialTolerance <= 0.0) {
+        LOG_INFO << "Seam straightening skipped (tolerance is zero or negative)";
+        return;
+    }
+
     Mesh& m = graph->mesh;
     tri::UpdateTopology<Mesh>::FaceFace(m);
     tri::UpdateTopology<Mesh>::VertexFace(m);

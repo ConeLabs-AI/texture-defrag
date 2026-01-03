@@ -40,7 +40,7 @@ win32-msvc* {
 }
 
 
-unix {
+unix:!macx {
   LIBS += -lGLU
 }
 

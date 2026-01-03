@@ -12,7 +12,9 @@
 #include <unordered_map>
 #include <queue>
 #include <algorithm>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 #include <cmath>
 #include <array>
 #include <Eigen/StdVector>
@@ -150,16 +152,19 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
 
     for (auto const& pair : idToVertices) {
         const std::vector<Mesh::VertexPointer>& group = pair.second;
-        if (group.size() > 1) {
-            // Seam or cut (multiple vertices at same 3D location)
-            for (auto v : group) {
-                for (auto other : group) {
-                    if (v != other) vertexInfo[v].geometricTwins.push_back(other);
+        for (auto v : group) {
+            for (auto other : group) {
+                if (v != other) vertexInfo[v].geometricTwins.push_back(other);
+            }
+            
+            // A vertex is on a true mesh boundary (hole) if any of its incident boundary edges 
+            // has no neighbor across it in the 3D surface mesh (FFp points to itself).
+            for (auto& be : vertexInfo[v].incidentBoundaryEdges) {
+                if (be.first->FFp(be.second) == be.first) {
+                    vertexInfo[v].isTrueBoundary = true;
+                    break;
                 }
             }
-        } else {
-            // True mesh border (hole)
-            vertexInfo[group[0]].isTrueBoundary = true;
         }
     }
 
@@ -167,13 +172,26 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
     for (auto& pair : vertexInfo) {
         Mesh::VertexPointer v = pair.first;
         BoundaryVertexInfo& info = pair.second;
-        if (info.incidentBoundaryEdges.size() != 2) info.isImmutable = true;
+
+        // Count distinct 3D boundary edges incident to this vertex.
+        // In a welded mesh, a seam edge is shared by 2 face-edges. We count it once 
+        // by only considering the edge where the face pointer is <= its neighbor.
+        int num3DBoundaryEdges = 0;
+        for (auto& be : info.incidentBoundaryEdges) {
+            if (be.first <= be.first->FFp(be.second)) {
+                num3DBoundaryEdges++;
+            }
+        }
+
+        // Only "middle" vertices of a boundary (exactly 2 incident 3D edges) are mutable.
+        if (num3DBoundaryEdges != 2) info.isImmutable = true;
+        
         if (info.isEar) info.isImmutable = true;
         
         // Pin mesh holes to preserve silhouette
         if (info.isTrueBoundary) info.isImmutable = true; 
         
-        // Multi-chart Hubs (more than 1 twin implies >2 charts meeting)
+        // Multi-chart Hubs (where 3 or more charts meet at a single 3D position)
         if (info.geometricTwins.size() > 1) info.isImmutable = true;
     }
 
@@ -305,15 +323,23 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
         }
     }
 
-    LOG_INFO << "Phase 2 & 3: Straightening & Warping (Parallel " << omp_get_max_threads() << " threads)...";
+    int num_threads = 1;
+#ifdef _OPENMP
+    num_threads = omp_get_max_threads();
+#endif
+    LOG_INFO << "Phase 2 & 3: Straightening & Warping (Parallel " << num_threads << " threads)...";
 
     std::vector<int> retryStats(params.maxWarpAttempts, 0);
 
+#ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic)
+#endif
     for (int i = 0; i < (int)chartVec.size(); ++i) {
         ChartHandle chart = chartVec[i];
         
+#ifdef _OPENMP
         #pragma omp atomic
+#endif
         numChartsAttempted++;
 
         double chartTol = params.initialTolerance;
@@ -348,9 +374,13 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                     std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>> simplified = GeometryUtils::simplifyRDP(poly4D, chartTol);
                     
                     if (attempt == 0) {
+#ifdef _OPENMP
                         #pragma omp atomic
+#endif
                         totalSegmentsBefore += (int)poly4D.size() - 1;
+#ifdef _OPENMP
                         #pragma omp atomic
+#endif
                         totalSegmentsAfter += (int)simplified.size() - 1;
                     }
                     
@@ -387,12 +417,16 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                         Point2d pA = GetSnapshotUV(globalSnapshot, chain, k);
                         boundaryTargets[chain.vertices[k]] = { pA.X(), pA.Y() };
                     }
-                    if (attempt == 0) {
-                        #pragma omp atomic
-                        totalSegmentsBefore += (int)chain.vertices.size() - 1;
-                        #pragma omp atomic
-                        totalSegmentsAfter += (int)chain.vertices.size() - 1;
-                    }
+                if (attempt == 0) {
+#ifdef _OPENMP
+                    #pragma omp atomic
+#endif
+                    totalSegmentsBefore += (int)chain.vertices.size() - 1;
+#ifdef _OPENMP
+                    #pragma omp atomic
+#endif
+                    totalSegmentsAfter += (int)chain.vertices.size() - 1;
+                }
                 }
             }
 
@@ -460,7 +494,9 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
             in.segmentlist[4] = bb2; in.segmentlist[5] = bb3;
             in.segmentlist[6] = bb3; in.segmentlist[7] = bb0;
 
+#ifdef _OPENMP
             #pragma omp critical(triangulate_lib)
+#endif
             {
                 triangulate((char*)"zpQ", &in, &out, nullptr);
             }
@@ -515,9 +551,13 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                 
                 if (!inverted) {
                     success = true;
+#ifdef _OPENMP
                     #pragma omp atomic
+#endif
                     numChartsSucceeded++;
+#ifdef _OPENMP
                     #pragma omp atomic
+#endif
                     retryStats[attempt]++;
 
                     chart->isSeamStraightened = true;

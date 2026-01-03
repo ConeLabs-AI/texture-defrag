@@ -27,7 +27,9 @@
 
 #include <iomanip>
 #include <unordered_set>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 
 
 ARAP::ARAP(Mesh& mesh)
@@ -467,6 +469,12 @@ ARAPSolveInfo ARAP::Solve()
         Eigen::VectorXd xv = solver.solve(bv);
         if (solver.info() != Eigen::Success) {
             LOG_WARN << "ARAP: solve(v) failed";
+            si.numericalError = true;
+            break;
+        }
+
+        if (!xu.allFinite() || !xv.allFinite()) {
+            LOG_WARN << "ARAP: numerical explosion detected (NaN or Inf in solution)";
             si.numericalError = true;
             break;
         }

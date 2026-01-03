@@ -177,6 +177,11 @@ struct RenderingContext {
     int renderedTexHeight = -1;
     GLint initialDrawBuffer = 0;
 
+    // Aggregated profile stats
+    double total_vbo_s = 0.0;
+    double total_draw_s = 0.0;
+    double total_read_s = 0.0;
+
     // Cached uniform locations
     GLint loc_tile_cache = -1;
     GLint loc_page_table = -1;
@@ -549,6 +554,10 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
              << " png_max_s=" << saveStats.maxSaveS
              << " png_saved=" << saveStats.saved;
 
+    LOG_INFO << "[RENDER-PROFILE-SUMMARY] total_vbo_s=" << renderingContext.total_vbo_s
+             << " total_draw_s=" << renderingContext.total_draw_s
+             << " total_read_s=" << renderingContext.total_read_s;
+
     // Log GPU texture cache and Tiled I/O stats
     if (textureObject) {
         auto cs = textureObject->GetCacheStats();
@@ -647,10 +656,6 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
         std::exit(-1);
     }
     textureImage->fill(qRgba(0, 0, 0, 255));
-
-    double t_vbo_s = 0.0;
-    double t_draw_s = 0.0;
-    double t_read_s = 0.0;
 
     const int tileSize = textureObject->TileSize();
     const int border = textureObject->TileBorder();
@@ -829,7 +834,7 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
                 }
                 glFuncs->glUnmapBuffer(GL_ARRAY_BUFFER);
                 auto t_vbo_end = std::chrono::high_resolution_clock::now();
-                t_vbo_s += std::chrono::duration<double>(t_vbo_end - t_vbo_start).count();
+                ctx.total_vbo_s += std::chrono::duration<double>(t_vbo_end - t_vbo_start).count();
 
                 glFuncs->glDrawArrays(GL_TRIANGLES, 0, (GLsizei)ready.size() * 3);
                 CHECK_GL_ERROR();
@@ -839,7 +844,7 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
                 }
             }
             auto t_draw_end = std::chrono::high_resolution_clock::now();
-            t_draw_s += std::chrono::duration<double>(t_draw_end - t_draw_start).count();
+            ctx.total_draw_s += std::chrono::duration<double>(t_draw_end - t_draw_start).count();
         }
 
         // Read back this output tile into the final image
@@ -852,7 +857,7 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
         auto t_read_start = std::chrono::high_resolution_clock::now();
         glFuncs->glReadPixels(0, 0, otile.w, otile.h, GL_BGRA, GL_UNSIGNED_BYTE, textureImage->bits());
         auto t_read_end = std::chrono::high_resolution_clock::now();
-        t_read_s += std::chrono::duration<double>(t_read_end - t_read_start).count();
+        ctx.total_read_s += std::chrono::duration<double>(t_read_end - t_read_start).count();
     }
 
     // Reset pixel store state
@@ -863,9 +868,5 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
 
     if (filter) vcg::PullPush(*textureImage, qRgba(0, 0, 0, 255));
 
-    LOG_INFO << "[RENDER-PROFILE] vbo_s=" << t_vbo_s
-             << " draw_s=" << t_draw_s
-             << " read_s=" << t_read_s
-             << " image=" << textureWidth << "x" << textureHeight;
     return textureImage;
 }

@@ -97,6 +97,45 @@ static CostInfo ReduceSeam(ClusteredSeamHandle csh, AlgoStateHandle state, Graph
 
 Perf perf = {};
 
+static void LogArapExplosionDiagnostics(Mesh& shell) {
+    int numComponents = tri::Clean<Mesh>::CountConnectedComponents(shell);
+    LOG_WARN << "  Diagnostic: Shell has " << numComponents << " components";
+
+    // Simple BFS to count fixed vertices per component
+    tri::UpdateFlags<Mesh>::VertexClearV(shell);
+    int compIdx = 0;
+    for (auto& startV : shell.vert) {
+        if (startV.IsD() || startV.IsV()) continue;
+        
+        int vCount = 0;
+        int fixedCount = 0;
+        std::vector<Mesh::VertexPointer> q;
+        q.push_back(&startV);
+        startV.SetV();
+        
+        while(!q.empty()) {
+            Mesh::VertexPointer v = q.back(); q.pop_back();
+            vCount++;
+            if (v->IsS()) fixedCount++;
+            
+            if (v->VFp() != nullptr) {
+                face::VFIterator<MeshFace> vfi(v);
+                for (; !vfi.End(); ++vfi) {
+                    MeshFace* f = vfi.F();
+                    for (int i = 0; i < 3; ++i) {
+                        Mesh::VertexPointer nv = f->V(i);
+                        if (!nv->IsD() && !nv->IsV()) {
+                            nv->SetV();
+                            q.push_back(nv);
+                        }
+                    }
+                }
+            }
+        }
+        LOG_WARN << "  Component " << compIdx++ << ": " << vCount << " vertices, " << fixedCount << " fixed";
+    }
+}
+
 #define PERF_TIMER_RESET (perf = {}, perf.timer.Reset())
 #define PERF_TIMER_START double perf_timer_t0 = perf.timer.TimeElapsed()
 #define PERF_TIMER_ACCUMULATE(field) perf.field += perf.timer.TimeElapsed() - perf_timer_t0
@@ -1452,6 +1491,7 @@ static CheckStatus OptimizeChart(SeamData& sd, GraphHandle graph, bool fixInters
                  << ") for charts " << sd.a->id
                  << (sd.a != sd.b ? ("/" + std::to_string(sd.b->id)) : "")
                  << ". Rejecting move to prevent packing failure.";
+        LogArapExplosionDiagnostics(sd.shell);
         return FAIL_DISTORTION_LOCAL;
     }
 
@@ -2512,9 +2552,10 @@ static CheckStatus OptimizeChart_Virtual(MergeJobResult& result, TopologyDiff& d
     double scaleAfter = std::max(optBoxAfter.DimX(), optBoxAfter.DimY());
     double scaleRatio = (scaleBefore > 0) ? scaleAfter / scaleBefore : 1.0;
 
-    const double MAX_LOCAL_SCALE_RATIO = 50.0;
+    const double MAX_LOCAL_SCALE_RATIO = 15.0;
     if (!std::isfinite(scaleRatio) || scaleRatio > MAX_LOCAL_SCALE_RATIO) {
         LOG_WARN << "[Parallel] ARAP produced extreme UV scale explosion (ratio=" << scaleRatio << ")";
+        LogArapExplosionDiagnostics(shell);
         return FAIL_DISTORTION_LOCAL;
     }
 

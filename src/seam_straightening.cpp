@@ -39,8 +39,6 @@ struct SeamChain {
 
 struct BoundaryVertexInfo {
     bool isImmutable = false;
-    bool isTJunction = false;
-    bool isTrueBoundary = false; // Truly a mesh hole
     bool isEar = false;
     std::vector<std::pair<Mesh::FacePointer, int>> incidentBoundaryEdges;
     std::vector<Mesh::VertexPointer> geometricTwins; // Vertices at same 3D position
@@ -66,6 +64,7 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
     }
 
     Mesh& m = graph->mesh;
+    // Ensure topology reflects texture connectivity (this makes seams look like borders in FF topology)
     tri::UpdateTopology<Mesh>::FaceFace(m);
     tri::UpdateTopology<Mesh>::VertexFace(m);
 
@@ -81,7 +80,7 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
     auto isBoundary = [&](Mesh::FacePointer f, int e) {
         Mesh::FacePointer ff = f->FFp(e);
         if (ff == f) return true; // Hole or Cut
-        if (ff->id != f->id) return true; // Seam
+        if (ff->id != f->id) return true; // Seam (if charts have different RegionIDs)
         return false;
     };
 
@@ -105,6 +104,7 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                 }
             }
             if (boundaryEdgesInFace >= 2) {
+                // "Ear" faces (peninsulas) must be pinned to prevent degeneracy
                 for (int i = 0; i < 3; ++i) vertexInfo[f->V(i)].isEar = true;
             }
         }
@@ -133,7 +133,7 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
         }
     }
 
-    // Map each vertex to a unique ID based on its representative in the Disjoint Set
+    // Map each vertex to a unique Geometric ID
     std::map<Mesh::VertexPointer, int> vertexToUniqueId;
     std::map<Mesh::VertexPointer, int> dsToUniqueId;
     int nextUniqueId = 0;
@@ -146,7 +146,7 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
         vertexToUniqueId[sortedVertices[i]] = dsToUniqueId[root];
     }
 
-    // Fill geometricTwins based on shared IDs
+    // Populate geometricTwins for referencing
     std::map<int, std::vector<Mesh::VertexPointer>> idToVertices;
     for (auto const& pair : vertexToUniqueId) idToVertices[pair.second].push_back(pair.first);
 
@@ -156,64 +156,105 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
             for (auto other : group) {
                 if (v != other) vertexInfo[v].geometricTwins.push_back(other);
             }
-            
-            // A vertex is on a true mesh boundary (hole) if any of its incident boundary edges 
-            // has no neighbor across it in the 3D surface mesh (FFp points to itself).
-            for (auto& be : vertexInfo[v].incidentBoundaryEdges) {
-                if (be.first->FFp(be.second) == be.first) {
-                    vertexInfo[v].isTrueBoundary = true;
-                    break;
-                }
-            }
         }
     }
 
-    // 3. Mark Immutable Vertices
+    // 3. Build Geometric Boundary Graph to classify Holes vs Seams
+    // We count how many times each unique 3D edge appears on the boundary.
+    // Count == 1: True Hole (unpaired).
+    // Count >= 2: Seam (paired).
+    std::map<std::pair<int, int>, int> geometricEdgeCounts;
+
     for (auto& pair : vertexInfo) {
         Mesh::VertexPointer v = pair.first;
-        BoundaryVertexInfo& info = pair.second;
+        int idStart = vertexToUniqueId[v];
 
-        // Count distinct 3D boundary edges incident to this vertex.
-        // In a welded mesh, a seam edge is shared by 2 face-edges. We count it once 
-        // by only considering the edge where the face pointer is <= its neighbor.
-        int num3DBoundaryEdges = 0;
-        for (auto& be : info.incidentBoundaryEdges) {
-            if (be.first <= be.first->FFp(be.second)) {
-                num3DBoundaryEdges++;
-            }
-        }
+        // incidentBoundaryEdges contains edges incident to v. 
+        // We need to identify the other endpoint to form the edge.
+        for (auto& be : pair.second.incidentBoundaryEdges) {
+            // be is (Face, index). Edge is from V(index) -> V(index+1).
+            Mesh::VertexPointer v0 = be.first->V(be.second);
+            Mesh::VertexPointer v1 = be.first->V((be.second + 1) % 3);
+            
+            // We only care about edges leaving v (to avoid double counting when iterating all verts)
+            if (v0 == v) {
+                int idEnd = vertexToUniqueId[v1];
+                if (idStart == idEnd) continue; // Degenerate edge, ignore
 
-        // Only "middle" vertices of a boundary (exactly 2 incident 3D edges) are mutable.
-        if (num3DBoundaryEdges != 2) info.isImmutable = true;
-        
-        if (info.isEar) info.isImmutable = true;
-        
-        // Pin mesh holes to preserve silhouette
-        if (info.isTrueBoundary) info.isImmutable = true; 
-        
-        // Multi-chart Hubs (where 3 or more charts meet at a single 3D position)
-        if (info.geometricTwins.size() > 1) info.isImmutable = true;
-    }
-
-    // 4. Propagate Protection
-    bool changes = true;
-    while (changes) {
-        changes = false;
-        for (auto& pair : vertexInfo) {
-            BoundaryVertexInfo& info = pair.second;
-            if (info.isImmutable) {
-                for (auto twin : info.geometricTwins) {
-                    auto& twinInfo = vertexInfo[twin];
-                    if (!twinInfo.isImmutable) {
-                        twinInfo.isImmutable = true;
-                        changes = true;
-                    }
-                }
+                // Undirected edge key
+                std::pair<int, int> key = std::minmax(idStart, idEnd);
+                geometricEdgeCounts[key]++;
             }
         }
     }
 
-    // 5. Extract Chains
+    // 4. Determine Immutability
+    // A vertex is mutable if and only if:
+    // 1. It is not part of a hole (no incident unpaired edges).
+    // 2. It has exactly 2 geometric neighbors (Valence 2, i.e., it's a line, not a junction).
+    // 3. It is not an Ear.
+    
+    // We compute this per Geometric ID.
+    std::vector<bool> idIsImmutable(nextUniqueId, false);
+    
+    // Iterate via idToVertices to check adjacency efficiently
+    for (auto const& groupPair : idToVertices) {
+        int id = groupPair.first;
+        
+        // Check "Ear" status (if any twin is an Ear, the geometric vertex is locked)
+        bool groupIsEar = false;
+        for (auto v : groupPair.second) {
+            if (vertexInfo[v].isEar) { groupIsEar = true; break; }
+        }
+        if (groupIsEar) {
+            idIsImmutable[id] = true;
+            continue;
+        }
+
+        std::set<int> neighbors;
+        bool hasHoleEdge = false;
+        bool hasNonManifoldEdge = false; // Edges shared by >2 surfaces (rare but possible)
+
+        // Gather neighbors from all twins
+        for (auto v : groupPair.second) {
+             for (auto& be : vertexInfo[v].incidentBoundaryEdges) {
+                Mesh::VertexPointer v0 = be.first->V(be.second);
+                Mesh::VertexPointer v1 = be.first->V((be.second + 1) % 3);
+                
+                // Identify neighbor
+                Mesh::VertexPointer neighborV = (v0 == v) ? v1 : v0;
+                int neighborId = vertexToUniqueId[neighborV];
+                if (id == neighborId) continue;
+
+                neighbors.insert(neighborId);
+                
+                // Check edge property
+                std::pair<int, int> key = std::minmax(id, neighborId);
+                int count = geometricEdgeCounts[key];
+                
+                if (count == 1) hasHoleEdge = true;
+                if (count > 2) hasNonManifoldEdge = true;
+             }
+        }
+
+        // Immutability Logic
+        if (hasHoleEdge) {
+            idIsImmutable[id] = true; // Pin holes to preserve silhouette
+        } else if (hasNonManifoldEdge) {
+            idIsImmutable[id] = true; // Pin complex geometry
+        } else if (neighbors.size() != 2) {
+            idIsImmutable[id] = true; // Pin endpoints and junctions (Valence != 2)
+        } else {
+            idIsImmutable[id] = false; // Simple Seam Interior -> Mutable
+        }
+    }
+
+    // Apply to individual vertices
+    for (auto& pair : vertexInfo) {
+        pair.second.isImmutable = idIsImmutable[vertexToUniqueId[pair.first]];
+    }
+
+    // 5. Extract Chains (Maximal)
     std::vector<SeamChain> chains;
     std::set<std::pair<Mesh::FacePointer, int>> visitedEdges;
 
@@ -222,40 +263,94 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
         for (auto f : chart->fpVec) {
             for (int i = 0; i < 3; ++i) {
                 if (isBoundary(f, i) && visitedEdges.find({f, i}) == visitedEdges.end()) {
-                    SeamChain chain;
-                    chain.chart = chart;
                     
-                    std::vector<std::pair<Mesh::FacePointer, int>> path;
-                    path.push_back({f, i});
-                    visitedEdges.insert({f, i});
+                    // Found a seed edge. 
+                    // To extract maximal chains, we must find the *beginning* of this chain segment.
+                    // Backtrack while the start vertex is Mutable and we haven't looped.
+                    
+                    std::pair<Mesh::FacePointer, int> currEdge = {f, i};
+                    std::vector<std::pair<Mesh::FacePointer, int>> backtrackingPath; 
 
-                    auto curr = path.back();
                     while (true) {
-                        Mesh::VertexPointer vEnd = curr.first->V((curr.second + 1) % 3);
-                        if (vertexInfo[vEnd].isImmutable) break;
-                        
-                        std::pair<Mesh::FacePointer, int> next = {nullptr, -1};
-                        for (auto& edge : vertexInfo[vEnd].incidentBoundaryEdges) {
-                            if (edge.first->id == chart->id && visitedEdges.find(edge) == visitedEdges.end()) {
-                                if (edge.first->V(edge.second) == vEnd) {
-                                    next = edge;
-                                    break;
-                                }
+                        Mesh::VertexPointer vStart = currEdge.first->V(currEdge.second);
+                        if (vertexInfo[vStart].isImmutable) break; // Start is pinned, so this is the start.
+
+                        // Find the previous edge in the chain (incident to vStart, ending at vStart)
+                        std::pair<Mesh::FacePointer, int> prevEdge = {nullptr, -1};
+                        for (auto& inc : vertexInfo[vStart].incidentBoundaryEdges) {
+                            if (inc.first->id != chart->id) continue;
+                            
+                            // Check if this edge *ends* at vStart
+                            Mesh::VertexPointer eEnd = inc.first->V((inc.second + 1) % 3);
+                            if (eEnd == vStart) {
+                                // Must be unvisited to backtrack safely (or the one we just came from if looping)
+                                if (inc == currEdge) continue; 
+                                prevEdge = inc;
+                                break;
                             }
                         }
+
+                        if (prevEdge.first == nullptr) break; 
+                        
+                        // Loop detection
+                        if (visitedEdges.find(prevEdge) != visitedEdges.end()) {
+                             bool inCurrentLoop = false;
+                             if(prevEdge == std::make_pair(f,i)) inCurrentLoop = true; 
+                             if(inCurrentLoop) break; 
+                             break; 
+                        }
+                        
+                        currEdge = prevEdge;
+                        if (currEdge == std::make_pair(f,i)) break; // Full loop
+                    }
+
+                    // Now trace forward from currEdge
+                    SeamChain chain;
+                    chain.chart = chart;
+                    std::vector<std::pair<Mesh::FacePointer, int>> path;
+                    
+                    if (visitedEdges.find(currEdge) != visitedEdges.end()) continue;
+
+                    std::pair<Mesh::FacePointer, int> trace = currEdge;
+                    path.push_back(trace);
+                    visitedEdges.insert(trace);
+
+                    while (true) {
+                        Mesh::VertexPointer vEnd = trace.first->V((trace.second + 1) % 3);
+                        
+                        // Stop if we hit a pinned vertex
+                        if (vertexInfo[vEnd].isImmutable) break;
+                        
+                        // Stop if we loop back to start of this specific path
+                        if (vEnd == path.front().first->V(path.front().second)) break; 
+
+                        // Find next
+                        std::pair<Mesh::FacePointer, int> next = {nullptr, -1};
+                        for (auto& inc : vertexInfo[vEnd].incidentBoundaryEdges) {
+                            if (inc.first->id != chart->id) continue;
+                            if (visitedEdges.find(inc) != visitedEdges.end()) continue;
+                            
+                            // Must start at vEnd
+                            if (inc.first->V(inc.second) == vEnd) {
+                                next = inc;
+                                break;
+                            }
+                        }
+
                         if (next.first == nullptr) break;
                         path.push_back(next);
                         visitedEdges.insert(next);
-                        curr = next;
+                        trace = next;
                     }
 
                     for (auto& e : path) {
                         chain.vertices.push_back(e.first->V(e.second));
                         chain.edges.push_back(e);
                     }
+                    // Add final vertex
                     chain.vertices.push_back(path.back().first->V((path.back().second + 1) % 3));
                     
-                    chain.isSeam = true; // Mark potential seam (matched via geometric twins later)
+                    chain.isSeam = true; 
                     chains.push_back(chain);
                 }
             }
@@ -264,7 +359,8 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
 
     LOG_INFO << "Extracted " << chains.size() << " chains.";
 
-    // 6. Chain Matching
+    // 6. Chain Matching (Twin Identification)
+    // Key: Sequence of Geometric IDs
     struct ChainKey {
         std::vector<int> pointIds;
         bool operator<(const ChainKey& o) const {
@@ -300,7 +396,7 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                 chains[j].twinIsReversed = true;
                 numTwinPairs++;
             } else {
-                std::reverse(key.pointIds.begin(), key.pointIds.end());
+                std::reverse(key.pointIds.begin(), key.pointIds.end()); // restore
                 idToChain[key] = i;
             }
         }
@@ -412,21 +508,21 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                         boundaryTargets[chain.vertices[k]] = { p4.x(), p4.y() };
                     }
                 } else {
-                    // 2D Fallback: Pin to original to prevent drift of unpaired boundaries
+                    // 2D Fallback: Pin to original
                     for (int k = 0; k < (int)chain.vertices.size(); ++k) {
                         Point2d pA = GetSnapshotUV(globalSnapshot, chain, k);
                         boundaryTargets[chain.vertices[k]] = { pA.X(), pA.Y() };
                     }
-                if (attempt == 0) {
+                    if (attempt == 0) {
 #ifdef _OPENMP
-                    #pragma omp atomic
+                        #pragma omp atomic
 #endif
-                    totalSegmentsBefore += (int)chain.vertices.size() - 1;
+                        totalSegmentsBefore += (int)chain.vertices.size() - 1;
 #ifdef _OPENMP
-                    #pragma omp atomic
+                        #pragma omp atomic
 #endif
-                    totalSegmentsAfter += (int)chain.vertices.size() - 1;
-                }
+                        totalSegmentsAfter += (int)chain.vertices.size() - 1;
+                    }
                 }
             }
 
@@ -531,7 +627,6 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
             }
 
             if (ApplyCompositeWarp(ambientVerts, ambientFaces, fixedIndices, targetPositions)) {
-                // Buffer computed UVs to verify inversion before committing
                 std::map<Mesh::VertexPointer, Point2d> computedUVs;
                 for (auto f : chart->fpVec) {
                     for(int k=0; k<3; ++k) {
@@ -564,7 +659,6 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                     if (params.colorize) {
                         for (auto f : chart->fpVec) f->C() = vcg::Color4b(255, 165, 0, 255);
                     }
-                    // Commit to thread-safe Wedge attributes
                     for (auto f : chart->fpVec) {
                         for (int k = 0; k < 3; ++k) f->WT(k).P() = computedUVs[f->V(k)];
                     }

@@ -53,6 +53,9 @@
 
 #include <chrono>
 #include <limits>
+#include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "texture_conversion.h"
 
@@ -67,12 +70,10 @@ static const char *vs_text[] = {
     "out vec4 fcolor;                                            \n"
     "uniform vec2 tile_min;                                      \n"
     "uniform vec2 tile_scale;                                    \n"
-    "uniform vec2 roi_min;                                       \n"
-    "uniform vec2 roi_scale;                                     \n"
     "                                                            \n"
     "void main(void)                                             \n"
     "{                                                           \n"
-    "    uv = (texcoord - roi_min) / roi_scale;                  \n"
+    "    uv = texcoord;                                         \n"
     "    fcolor = color;                                         \n"
     "    vec2 local = (position - tile_min) / tile_scale;        \n"
     "    vec2 p = vec2(2.0 * local.x - 1.0, 1.0 - 2.0 * local.y);\n"
@@ -83,9 +84,13 @@ static const char *vs_text[] = {
 static const char *fs_text[] = {
     "#version 410 core                                                     \n"
     "                                                                      \n"
-    "uniform sampler2D img0;                                               \n"
+    "uniform sampler2DArray tile_cache;                                    \n"
+    "uniform usampler2D page_table;                                        \n"
     "                                                                      \n"
-    "uniform vec2 texture_size;                                            \n"
+    "uniform vec2 src_texture_size;                                        \n"
+    "uniform vec2 tile_tex_size;                                           \n"
+    "uniform float tile_size;                                              \n"
+    "uniform float border;                                                 \n"
     "uniform int render_mode;                                              \n"
     "                                                                      \n"
     "in vec2 uv;                                                           \n"
@@ -102,13 +107,33 @@ static const char *fs_text[] = {
     "    }                                                                 \n"
     "                                                                      \n"
     "    // Clamp UVs to handle floating point noise on chart edges        \n"
-    "    vec2 clamped_uv = clamp(uv, 0.0, 1.0);                            \n"
+    "    vec2 src_uv = clamp(uv, 0.0, 1.0);                                \n"
+    "                                                                      \n"
+    "    ivec2 ptSize = textureSize(page_table, 0);                        \n"
+    "    vec2 fileCoord = vec2(src_uv.x * src_texture_size.x,              \n"
+    "                         (1.0 - src_uv.y) * src_texture_size.y);      \n"
+    "    ivec2 vtile = ivec2(floor(fileCoord / tile_size));                \n"
+    "    vtile = clamp(vtile, ivec2(0,0), ptSize - ivec2(1,1));            \n"
+    "                                                                      \n"
+    "    uint layer = texelFetch(page_table, vtile, 0).r;                  \n"
+    "    if (layer == 0xFFFFFFFFu) {                                       \n"
+    "        texelColor = vec4(0, 0, 0, 1);                                \n"
+    "        return;                                                       \n"
+    "    }                                                                 \n"
+    "                                                                      \n"
+    "    // Compute tile-local UV (bottom-up) using the same ROI remap idea\n"
+    "    vec2 roi_min = vec2(float(vtile.x) * tile_size / src_texture_size.x,\n"
+    "                       1.0 - float(vtile.y + 1) * tile_size / src_texture_size.y);\n"
+    "    vec2 roi_scale = vec2(tile_size / src_texture_size.x,             \n"
+    "                         tile_size / src_texture_size.y);             \n"
+    "    vec2 local_uv = clamp((src_uv - roi_min) / roi_scale, 0.0, 1.0);  \n"
+    "    vec2 phys_uv = (local_uv * tile_size + border) / tile_tex_size;   \n"
     "                                                                      \n"
     "    if (render_mode == 0) {                                           \n"
-    "        texelColor = vec4(texture2D(img0, clamped_uv).rgb, 1);        \n"
+    "        texelColor = vec4(texture(tile_cache, vec3(phys_uv, float(layer))).rgb, 1);\n"
     "    } else if (render_mode == 1) {                                    \n"
-    "        // Bicubic interpolation logic using clamped_uv               \n"
-    "        vec2 coord = clamped_uv * texture_size - vec2(0.5, 0.5);      \n"
+    "        // Bicubic interpolation logic using phys_uv on the bordered tile\n"
+    "        vec2 coord = phys_uv * tile_tex_size - vec2(0.5, 0.5);        \n"
     "        vec2 idx = floor(coord);                                      \n"
     "        vec2 fraction = coord - idx;                                  \n"
     "        vec2 one_frac = vec2(1.0, 1.0) - fraction;                    \n"
@@ -122,10 +147,10 @@ static const char *fs_text[] = {
     "        vec2 g1 = w2 + w3;                                            \n"
     "        vec2 h0 = (w1 / g0) - 0.5 + idx;                              \n"
     "        vec2 h1 = (w3 / g1) + 1.5 + idx;                              \n"
-    "        vec4 tex00 = texture2D(img0, vec2(h0.x, h0.y) / texture_size);\n"
-    "        vec4 tex10 = texture2D(img0, vec2(h1.x, h0.y) / texture_size);\n"
-    "        vec4 tex01 = texture2D(img0, vec2(h0.x, h1.y) / texture_size);\n"
-    "        vec4 tex11 = texture2D(img0, vec2(h1.x, h1.y) / texture_size);\n"
+    "        vec4 tex00 = texture(tile_cache, vec3(vec2(h0.x, h0.y) / tile_tex_size, float(layer)));\n"
+    "        vec4 tex10 = texture(tile_cache, vec3(vec2(h1.x, h0.y) / tile_tex_size, float(layer)));\n"
+    "        vec4 tex01 = texture(tile_cache, vec3(vec2(h0.x, h1.y) / tile_tex_size, float(layer)));\n"
+    "        vec4 tex11 = texture(tile_cache, vec3(vec2(h1.x, h1.y) / tile_tex_size, float(layer)));\n"
     "        tex00 = mix(tex00, tex01, g1.y);                              \n"
     "        tex10 = mix(tex10, tex11, g1.y);                              \n"
     "        texelColor = mix(tex00, tex10, g1.x);                         \n"
@@ -153,13 +178,15 @@ struct RenderingContext {
     GLint initialDrawBuffer = 0;
 
     // Cached uniform locations
-    GLint loc_img0 = -1;
-    GLint loc_texture_size = -1;
+    GLint loc_tile_cache = -1;
+    GLint loc_page_table = -1;
+    GLint loc_src_texture_size = -1;
+    GLint loc_tile_tex_size = -1;
+    GLint loc_tile_size = -1;
+    GLint loc_border = -1;
     GLint loc_render_mode = -1;
     GLint loc_tile_min = -1;
     GLint loc_tile_scale = -1;
-    GLint loc_roi_min = -1;
-    GLint loc_roi_scale = -1;
 
     RenderingContext() {
         if (QOpenGLContext::currentContext() == nullptr) {
@@ -198,13 +225,15 @@ struct RenderingContext {
         glFuncs->glBindBuffer(GL_ARRAY_BUFFER, 0);
 
         // Cache uniform locations
-        loc_img0 = glFuncs->glGetUniformLocation(program, "img0");
-        loc_texture_size = glFuncs->glGetUniformLocation(program, "texture_size");
+        loc_tile_cache = glFuncs->glGetUniformLocation(program, "tile_cache");
+        loc_page_table = glFuncs->glGetUniformLocation(program, "page_table");
+        loc_src_texture_size = glFuncs->glGetUniformLocation(program, "src_texture_size");
+        loc_tile_tex_size = glFuncs->glGetUniformLocation(program, "tile_tex_size");
+        loc_tile_size = glFuncs->glGetUniformLocation(program, "tile_size");
+        loc_border = glFuncs->glGetUniformLocation(program, "border");
         loc_render_mode = glFuncs->glGetUniformLocation(program, "render_mode");
         loc_tile_min = glFuncs->glGetUniformLocation(program, "tile_min");
         loc_tile_scale = glFuncs->glGetUniformLocation(program, "tile_scale");
-        loc_roi_min = glFuncs->glGetUniformLocation(program, "roi_min");
-        loc_roi_scale = glFuncs->glGetUniformLocation(program, "roi_scale");
 
         glFuncs->glGenFramebuffers(1, &fbo);
         glFuncs->glGenTextures(1, &renderTarget);
@@ -458,6 +487,8 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
     int64_t total_pixels_rendered = 0;
 
     RenderingContext renderingContext;
+    // Initialize virtual texturing (tile cache + page tables) once per render pass
+    if (textureObject) textureObject->InitVirtualTexturing();
     ImageSaveQueue saveQueue(2);
     saveQueue.resetStats();
 
@@ -560,75 +591,15 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
                                              bool filter, RenderMode imode,
                                              int textureWidth, int textureHeight)
 {
+    ensure(textureObject && textureObject->ArraySize() > 0);
     auto WTCSh = GetWedgeTexCoordStorageAttribute(m);
-
-    // sort the faces in increasing order of input texture unit
-    auto FaceComparatorByInputTexIndex = [&WTCSh](const Mesh::FacePointer& f1, const Mesh::FacePointer& f2) {
-        return WTCSh[f1].tc[0].N() < WTCSh[f2].tc[0].N();
-    };
-
-    std::sort(fvec.begin(), fvec.end(), FaceComparatorByInputTexIndex);
 
     OpenGLFunctionsHandle glFuncs = ctx.glFuncs;
     glFuncs->glUseProgram(ctx.program);
     glFuncs->glBindVertexArray(ctx.vao);
     CHECK_GL_ERROR();
 
-    // Allocate vertex data
-
-    std::vector<TextureSize> inTexSizes;
-    for (std::size_t i = 0; i < textureObject->ArraySize(); ++i) {
-        int iw = textureObject->TextureWidth(i);
-        int ih = textureObject->TextureHeight(i);
-        inTexSizes.push_back({iw, ih});
-    }
-    if (inTexSizes.empty()) {
-        LOG_ERR << "[RENDER] No source textures loaded; cannot render.";
-        std::exit(-1);
-    }
-
-    auto t_vbo_start = std::chrono::high_resolution_clock::now();
-    glFuncs->glBindBuffer(GL_ARRAY_BUFFER, ctx.vertexbuf);
-    // Use streaming usage hint and buffer orphaning + map range to reduce stalls.
-    size_t bufferSize = fvec.size() * 15 * sizeof(float);
-    glFuncs->glBufferData(GL_ARRAY_BUFFER, bufferSize, NULL, GL_STREAM_DRAW);
-    float *p = (float *)glFuncs->glMapBufferRange(GL_ARRAY_BUFFER, 0, bufferSize, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
-    ensure(p != nullptr);
-    int invalidIndexFaces = 0;
-    for (auto fptr : fvec) {
-        int ti = WTCSh[fptr].tc[0].N();
-        bool valid = (ti >= 0 && ti < (int)inTexSizes.size() && inTexSizes[ti].w > 0 && inTexSizes[ti].h > 0);
-        if (!valid) invalidIndexFaces++;
-        for (int i = 0; i < 3; ++i) {
-            *p++ = fptr->cWT(i).U();
-            *p++ = fptr->cWT(i).V();
-            vcg::Point2d uv = WTCSh[fptr].tc[i].P();
-            if (valid) {
-                *p++ = uv.X() / inTexSizes[ti].w;
-                *p++ = uv.Y() / inTexSizes[ti].h;
-            } else {
-                *p++ = -1.0f; // sentinel to trigger green in shader
-                *p++ = 0.0f;
-            }
-            unsigned char *colorptr = (unsigned char *) p;
-            *colorptr++ = fptr->C()[0];
-            *colorptr++ = fptr->C()[1];
-            *colorptr++ = fptr->C()[2];
-            *colorptr++ = fptr->C()[3];
-            p++;
-        }
-    }
-    if (invalidIndexFaces > 0) {
-        LOG_WARN << "[RENDER] Faces with invalid source texture index or size: " << invalidIndexFaces;
-    }
-    glFuncs->glUnmapBuffer(GL_ARRAY_BUFFER);
-
-    p = nullptr;
-    glFuncs->glBindBuffer(GL_ARRAY_BUFFER, 0); // done, unbind
-    auto t_vbo_end = std::chrono::high_resolution_clock::now();
-    double t_vbo_s = std::chrono::duration<double>(t_vbo_end - t_vbo_start).count();
-
-    // Query GL limits and determine tile size for render target
+    // Query GL limits and determine output render-tile size
     GLint maxTexSize = 0;
     GLint maxRenderbufferSize = 0;
     GLint maxViewportDims[2] = {0, 0};
@@ -636,147 +607,265 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
     glFuncs->glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &maxRenderbufferSize);
     glFuncs->glGetIntegerv(GL_MAX_VIEWPORT_DIMS, maxViewportDims);
     int maxSide = std::min(std::min(maxTexSize, maxRenderbufferSize), std::min(maxViewportDims[0], maxViewportDims[1]));
-    int tileWMax = std::min(textureWidth, maxSide);
-    int tileHMax = std::min(textureHeight, maxSide);
+    int outTileWMax = std::min(textureWidth, maxSide);
+    int outTileHMax = std::min(textureHeight, maxSide);
 
-    std::shared_ptr<QImage> textureImage = std::make_shared<QImage>(textureWidth, textureHeight, QImage::Format_ARGB32);
-    if (textureImage->isNull()) {
-        LOG_ERR << "[DIAG] FATAL: QImage allocation FAILED. System is out of memory.";
-        logging::LogMemoryUsage();
-        std::exit(-1);
-    }
-
-    double t_draw_s = 0.0;
-    double t_read_s = 0.0;
-
-    // Render and read back per-tile
-    for (int y = 0; y < textureHeight; y += tileHMax) {
-        int tileH = std::min(tileHMax, textureHeight - y);
-        for (int x = 0; x < textureWidth; x += tileWMax) {
-            int tileW = std::min(tileWMax, textureWidth - x);
-
-            ctx.prepareRenderTarget(tileW, tileH);
-            glFuncs->glBindFramebuffer(GL_FRAMEBUFFER, ctx.fbo);
-
-            glFuncs->glDrawBuffer(GL_COLOR_ATTACHMENT0);
-
-            glFuncs->glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-            glFuncs->glClear(GL_COLOR_BUFFER_BIT);
-
-            // Set tile transform uniforms (in atlas normalized coordinates)
-            float tileMinX = float(x) / float(textureWidth);
-            float tileMinY = float(y) / float(textureHeight);
-            float tileScaleX = float(tileW) / float(textureWidth);
-            float tileScaleY = float(tileH) / float(textureHeight);
-            glFuncs->glUniform2f(ctx.loc_tile_min, tileMinX, tileMinY);
-            glFuncs->glUniform2f(ctx.loc_tile_scale, tileScaleX, tileScaleY);
-
-            auto t_draw_start = std::chrono::high_resolution_clock::now();
-            auto f0 = fvec.begin();
-            auto fbase = f0;
-            while (fbase != fvec.end()) {
-                auto fcurr = fbase;
-                int currTexIndex = WTCSh[*fcurr].tc[0].N();
-                
-                // Calculate UV bounding box of this face batch to determine ROI
-                vcg::Box2d roiPixels;
-                while (fcurr != fvec.end() && WTCSh[*fcurr].tc[0].N() == currTexIndex) {
-                    for (int k = 0; k < 3; ++k) {
-                        roiPixels.Add(WTCSh[*fcurr].tc[k].P());
-                    }
-                    fcurr++;
-                }
-
-                // IMPORTANT: Add 2-pixel margin to avoid interpolation/clamping artifacts 
-                // at the edges of the dynamically loaded patches.
-                roiPixels.min -= vcg::Point2d(2, 2);
-                roiPixels.max += vcg::Point2d(2, 2);
-
-                vcg::Box2d roiNormalized;
-                if (currTexIndex >= 0 && currTexIndex < (int)inTexSizes.size() && inTexSizes[currTexIndex].w > 0 && inTexSizes[currTexIndex].h > 0) {
-                    roiNormalized.min.X() = std::max(0.0, std::min(1.0, roiPixels.min.X() / inTexSizes[currTexIndex].w));
-                    roiNormalized.min.Y() = std::max(0.0, std::min(1.0, roiPixels.min.Y() / inTexSizes[currTexIndex].h));
-                    roiNormalized.max.X() = std::max(0.0, std::min(1.0, roiPixels.max.X() / inTexSizes[currTexIndex].w));
-                    roiNormalized.max.Y() = std::max(0.0, std::min(1.0, roiPixels.max.Y() / inTexSizes[currTexIndex].h));
-                }
-                int baseIndex = std::distance(f0, fbase) * 3;
-                int count = std::distance(fbase, fcurr) * 3;
-
-                // Load texture image
-                glFuncs->glActiveTexture(GL_TEXTURE0);
-                LOG_DEBUG << "Binding texture unit " << currTexIndex;
-                bool batchValid = (currTexIndex >= 0 && currTexIndex < (int)inTexSizes.size() && inTexSizes[currTexIndex].w > 0 && inTexSizes[currTexIndex].h > 0);
-                if (!batchValid) {
-                    LOG_WARN << "[RENDER] Skipping draw for faces with invalid texture index " << currTexIndex;
-                    fbase = fcurr;
-                    continue;
-                }
-                textureObject->BindRegion(currTexIndex, roiNormalized);
-
-                // Set ROI uniforms for UV remapping
-                vcg::Box2d actualROI = textureObject->GetCurrentROI(currTexIndex);
-                glFuncs->glUniform2f(ctx.loc_roi_min, (float)actualROI.min.X(), (float)actualROI.min.Y());
-                glFuncs->glUniform2f(ctx.loc_roi_scale, (float)actualROI.DimX(), (float)actualROI.DimY());
-
-                glFuncs->glUniform1i(ctx.loc_img0, 0);
-                glFuncs->glUniform2f(ctx.loc_texture_size, float(textureObject->TextureWidth(currTexIndex)), float(textureObject->TextureHeight(currTexIndex)));
-
-                glFuncs->glUniform1i(ctx.loc_render_mode, 0);
-
-                // Texture parameters are now set once in TextureObject::Bind, so we remove the redundant settings from here.
-                switch (imode) {
-                case Cubic:
-                    glFuncs->glUniform1i(ctx.loc_render_mode, 1);
-                    break;
-                case Linear:
-                    // Default render_mode 0
-                    break;
-                case Nearest:
-                    // Nearest filtering should be set on bound texture if needed
-                    break;
-                case FaceColor:
-                    glFuncs->glUniform1i(ctx.loc_render_mode, 2);
-                    break;
-                default:
-                    ensure(0 && "Should never happen");
-                }
-
-                glFuncs->glDrawArrays(GL_TRIANGLES, baseIndex, count);
-                CHECK_GL_ERROR();
-
-                fbase = fcurr;
-            }
-            auto t_draw_end = std::chrono::high_resolution_clock::now();
-            t_draw_s += std::chrono::duration<double>(t_draw_end - t_draw_start).count();
-
-            // Read back this tile directly into the final image using pixel pack offsets
-            glFuncs->glReadBuffer(GL_COLOR_ATTACHMENT0);
-            glFuncs->glPixelStorei(GL_PACK_ALIGNMENT, 4);
-            int rowPixels = textureImage->bytesPerLine() / 4;
-            glFuncs->glPixelStorei(GL_PACK_ROW_LENGTH, rowPixels);
-            int destSkipRows = textureHeight - (y + tileH);
-            glFuncs->glPixelStorei(GL_PACK_SKIP_ROWS, destSkipRows);
-            glFuncs->glPixelStorei(GL_PACK_SKIP_PIXELS, x);
-            auto t_read_start = std::chrono::high_resolution_clock::now();
-            glFuncs->glReadPixels(0, 0, tileW, tileH, GL_BGRA, GL_UNSIGNED_BYTE, textureImage->bits());
-            auto t_read_end = std::chrono::high_resolution_clock::now();
-            t_read_s += std::chrono::duration<double>(t_read_end - t_read_start).count();
-
-            // Reset pixel store state
-            glFuncs->glPixelStorei(GL_PACK_ROW_LENGTH, 0);
-            glFuncs->glPixelStorei(GL_PACK_SKIP_ROWS, 0);
-            glFuncs->glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+    struct OutputTile {
+        int x, y, w, h;
+        std::vector<Mesh::FacePointer> faces;
+    };
+    std::vector<OutputTile> outputTiles;
+    for (int y = 0; y < textureHeight; y += outTileHMax) {
+        int th = std::min(outTileHMax, textureHeight - y);
+        for (int x = 0; x < textureWidth; x += outTileWMax) {
+            int tw = std::min(outTileWMax, textureWidth - x);
+            outputTiles.push_back({x, y, tw, th, {}});
         }
     }
 
+    // Spatial face partitioning: assign faces to output tiles they intersect (output UV space)
+    for (auto fptr : fvec) {
+        vcg::Box2d bbox;
+        for (int i = 0; i < 3; ++i) bbox.Add(fptr->cWT(i).P());
+        // Be conservative about Y axis convention (some parts of the pipeline use top-down image space).
+        // If we get the convention wrong, we might incorrectly drop faces for a tile and leave holes.
+        vcg::Box2d bboxFlipY(
+            vcg::Point2d(bbox.min.X(), 1.0 - bbox.max.Y()),
+            vcg::Point2d(bbox.max.X(), 1.0 - bbox.min.Y()));
+
+        for (auto& otile : outputTiles) {
+            vcg::Box2d otileBox(
+                vcg::Point2d((double)otile.x / textureWidth, (double)otile.y / textureHeight),
+                vcg::Point2d((double)(otile.x + otile.w) / textureWidth, (double)(otile.y + otile.h) / textureHeight));
+            if (bbox.Collide(otileBox) || bboxFlipY.Collide(otileBox)) otile.faces.push_back(fptr);
+        }
+    }
+
+    std::shared_ptr<QImage> textureImage = std::make_shared<QImage>(textureWidth, textureHeight, QImage::Format_ARGB32);
+    if (textureImage->isNull()) {
+        LOG_ERR << "[DIAG] FATAL: QImage allocation FAILED.";
+        std::exit(-1);
+    }
+    textureImage->fill(qRgba(0, 0, 0, 255));
+
+    double t_vbo_s = 0.0;
+    double t_draw_s = 0.0;
+    double t_read_s = 0.0;
+
+    const int tileSize = textureObject->TileSize();
+    const int border = textureObject->TileBorder();
+    const int physTileSize = textureObject->PhysicalTileSize();
+
+    // Bind sampler units once
+    glFuncs->glUniform1i(ctx.loc_tile_cache, 0);
+    glFuncs->glUniform1i(ctx.loc_page_table, 1);
+    glFuncs->glUniform1f(ctx.loc_tile_size, (float)tileSize);
+    glFuncs->glUniform1f(ctx.loc_border, (float)border);
+    glFuncs->glUniform2f(ctx.loc_tile_tex_size, (float)physTileSize, (float)physTileSize);
+
+    int renderMode = 0;
+    if (imode == Cubic) renderMode = 1;
+    else if (imode == FaceColor) renderMode = 2;
+
+    // Render output tile-by-tile (GPU limits), but sample inputs via page-table virtual texturing
+    for (auto& otile : outputTiles) {
+        if (otile.faces.empty()) continue;
+
+        ctx.prepareRenderTarget(otile.w, otile.h);
+        glFuncs->glBindFramebuffer(GL_FRAMEBUFFER, ctx.fbo);
+        glFuncs->glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        glFuncs->glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        glFuncs->glClear(GL_COLOR_BUFFER_BIT);
+
+        glFuncs->glUniform2f(ctx.loc_tile_min, (float)otile.x / textureWidth, (float)otile.y / textureHeight);
+        glFuncs->glUniform2f(ctx.loc_tile_scale, (float)otile.w / textureWidth, (float)otile.h / textureHeight);
+
+        // Group faces by source texture index (input)
+        std::unordered_map<int, std::vector<Mesh::FacePointer>> bySrc;
+        bySrc.reserve(64);
+        for (auto fptr : otile.faces) {
+            int ti = WTCSh[fptr].tc[0].N();
+            if (ti < 0 || ti >= (int)textureObject->ArraySize()) continue;
+            bySrc[ti].push_back(fptr);
+        }
+
+        for (auto &entry : bySrc) {
+            int ti = entry.first;
+            auto &faces = entry.second;
+            if (faces.empty()) continue;
+
+            const int srcW = textureObject->TextureWidth(ti);
+            const int srcH = textureObject->TextureHeight(ti);
+            if (srcW <= 0 || srcH <= 0) continue;
+
+            const int tilesX = (srcW + tileSize - 1) / tileSize;
+            const int tilesY = (srcH + tileSize - 1) / tileSize;
+
+            // Bind VT resources and per-texture uniforms
+            textureObject->BindVirtualTexturing(ti, 0, 1);
+            glFuncs->glUniform2f(ctx.loc_src_texture_size, (float)srcW, (float)srcH);
+            glFuncs->glUniform1i(ctx.loc_render_mode, renderMode);
+
+            struct FaceReq {
+                Mesh::FacePointer f;
+                std::vector<std::pair<int,int>> tiles; // (tx,ty) in .rawtile space (top-down)
+            };
+            std::vector<FaceReq> freqs;
+            freqs.reserve(faces.size());
+
+            for (auto fptr : faces) {
+                vcg::Box2d srcBox;
+                for (int k = 0; k < 3; ++k) srcBox.Add(WTCSh[fptr].tc[k].P());
+
+                double minX = std::max(0.0, std::min((double)srcW - 1.0, srcBox.min.X()));
+                double maxX = std::max(0.0, std::min((double)srcW - 1.0, srcBox.max.X()));
+                double minY = std::max(0.0, std::min((double)srcH - 1.0, srcBox.min.Y()));
+                double maxY = std::max(0.0, std::min((double)srcH - 1.0, srcBox.max.Y()));
+
+                int tx0 = std::max(0, std::min(tilesX - 1, (int)std::floor(minX / tileSize)));
+                int tx1 = std::max(0, std::min(tilesX - 1, (int)std::floor(maxX / tileSize)));
+
+                // Convert bottom-up pixel Y to top-down file Y for tile addressing
+                double fileYTop = (double)srcH - maxY;
+                double fileYBottom = (double)srcH - minY;
+                int ty0 = std::max(0, std::min(tilesY - 1, (int)std::floor(fileYTop / tileSize)));
+                int ty1 = std::max(0, std::min(tilesY - 1, (int)std::floor(fileYBottom / tileSize)));
+
+                FaceReq fr;
+                fr.f = fptr;
+                fr.tiles.reserve((tx1 - tx0 + 1) * (ty1 - ty0 + 1));
+                for (int ty = ty0; ty <= ty1; ++ty) {
+                    for (int tx = tx0; tx <= tx1; ++tx) {
+                        fr.tiles.push_back({tx, ty});
+                    }
+                }
+                freqs.push_back(std::move(fr));
+            }
+
+            std::vector<char> done(freqs.size(), 0);
+            size_t remaining = freqs.size();
+
+            auto t_draw_start = std::chrono::high_resolution_clock::now();
+            while (remaining > 0) {
+                // Build tile demand counts among remaining faces
+                std::unordered_map<uint64_t, int> demand;
+                demand.reserve(4096);
+                for (size_t fi = 0; fi < freqs.size(); ++fi) {
+                    if (done[fi]) continue;
+                    for (auto &t : freqs[fi].tiles) {
+                        uint64_t key = (uint64_t(uint32_t(t.first)) << 32) | uint64_t(uint32_t(t.second));
+                        demand[key] += 1;
+                    }
+                }
+
+                std::vector<std::pair<uint64_t, int>> dv;
+                dv.reserve(demand.size());
+                for (auto &d : demand) dv.push_back({d.first, d.second});
+                std::sort(dv.begin(), dv.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+
+                int cap = textureObject->TileCacheLayers();
+                if (cap <= 0) cap = 1024;
+                int pinCount = std::min((int)dv.size(), cap);
+
+                std::vector<std::pair<int,int>> pins;
+                pins.reserve(pinCount);
+                for (int k = 0; k < pinCount; ++k) {
+                    uint32_t tx = (uint32_t)(dv[k].first >> 32);
+                    uint32_t ty = (uint32_t)(dv[k].first & 0xFFFFFFFFu);
+                    pins.push_back({(int)tx, (int)ty});
+                }
+
+                // Load pinned tiles (protect during eviction)
+                textureObject->BeginTilePinning(ti, pins);
+                for (auto &t : pins) textureObject->EnsureTileResident(ti, t.first, t.second);
+                textureObject->EndTilePinning();
+
+                // Find ready faces (all required tiles resident)
+                std::vector<size_t> ready;
+                ready.reserve(freqs.size());
+                for (size_t fi = 0; fi < freqs.size(); ++fi) {
+                    if (done[fi]) continue;
+                    bool ok = true;
+                    for (auto &t : freqs[fi].tiles) {
+                        if (!textureObject->IsTileResident(ti, t.first, t.second)) { ok = false; break; }
+                    }
+                    if (ok) ready.push_back(fi);
+                }
+
+                if (ready.empty()) {
+                    // Fallback: force-load tiles for one face to guarantee forward progress
+                    size_t first = 0;
+                    while (first < freqs.size() && done[first]) ++first;
+                    if (first >= freqs.size()) break;
+                    textureObject->BeginTilePinning(ti, freqs[first].tiles);
+                    for (auto &t : freqs[first].tiles) textureObject->EnsureTileResident(ti, t.first, t.second);
+                    textureObject->EndTilePinning();
+                    ready.push_back(first);
+                }
+
+                // Build VBO for ready faces and draw them
+                auto t_vbo_start = std::chrono::high_resolution_clock::now();
+                glFuncs->glBindBuffer(GL_ARRAY_BUFFER, ctx.vertexbuf);
+                size_t bufferSize = ready.size() * 15 * sizeof(float);
+                glFuncs->glBufferData(GL_ARRAY_BUFFER, bufferSize, NULL, GL_STREAM_DRAW);
+                float *vp = (float *)glFuncs->glMapBufferRange(GL_ARRAY_BUFFER, 0, bufferSize, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+                ensure(vp != nullptr);
+                for (auto fi : ready) {
+                    Mesh::FacePointer fptr = freqs[fi].f;
+                    for (int k = 0; k < 3; ++k) {
+                        *vp++ = (float)fptr->cWT(k).U();
+                        *vp++ = (float)fptr->cWT(k).V();
+                        vcg::Point2d inuvPix = WTCSh[fptr].tc[k].P();
+                        *vp++ = (float)(inuvPix.X() / (double)srcW);
+                        *vp++ = (float)(inuvPix.Y() / (double)srcH);
+
+                        unsigned char *colorptr = (unsigned char *) vp;
+                        *colorptr++ = fptr->C()[0];
+                        *colorptr++ = fptr->C()[1];
+                        *colorptr++ = fptr->C()[2];
+                        *colorptr++ = fptr->C()[3];
+                        vp++;
+                    }
+                }
+                glFuncs->glUnmapBuffer(GL_ARRAY_BUFFER);
+                auto t_vbo_end = std::chrono::high_resolution_clock::now();
+                t_vbo_s += std::chrono::duration<double>(t_vbo_end - t_vbo_start).count();
+
+                glFuncs->glDrawArrays(GL_TRIANGLES, 0, (GLsizei)ready.size() * 3);
+                CHECK_GL_ERROR();
+
+                for (auto fi : ready) {
+                    if (!done[fi]) { done[fi] = 1; remaining--; }
+                }
+            }
+            auto t_draw_end = std::chrono::high_resolution_clock::now();
+            t_draw_s += std::chrono::duration<double>(t_draw_end - t_draw_start).count();
+        }
+
+        // Read back this output tile into the final image
+        glFuncs->glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glFuncs->glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        int rowPixels = textureImage->bytesPerLine() / 4;
+        glFuncs->glPixelStorei(GL_PACK_ROW_LENGTH, rowPixels);
+        glFuncs->glPixelStorei(GL_PACK_SKIP_ROWS, textureHeight - (otile.y + otile.h));
+        glFuncs->glPixelStorei(GL_PACK_SKIP_PIXELS, otile.x);
+        auto t_read_start = std::chrono::high_resolution_clock::now();
+        glFuncs->glReadPixels(0, 0, otile.w, otile.h, GL_BGRA, GL_UNSIGNED_BYTE, textureImage->bits());
+        auto t_read_end = std::chrono::high_resolution_clock::now();
+        t_read_s += std::chrono::duration<double>(t_read_end - t_read_start).count();
+    }
+
+    // Reset pixel store state
+    glFuncs->glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+    glFuncs->glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+    glFuncs->glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
     glFuncs->glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    if (filter)
-        vcg::PullPush(*textureImage, qRgba(0, 0, 0, 255));
+    if (filter) vcg::PullPush(*textureImage, qRgba(0, 0, 0, 255));
 
     LOG_INFO << "[RENDER-PROFILE] vbo_s=" << t_vbo_s
              << " draw_s=" << t_draw_s
-             << " readPixels_s=" << t_read_s
+             << " read_s=" << t_read_s
              << " image=" << textureWidth << "x" << textureHeight;
     return textureImage;
 }

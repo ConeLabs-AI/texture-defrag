@@ -40,7 +40,7 @@ struct SeamChain {
 
 struct BoundaryVertexInfo {
     bool isImmutable = false;
-    bool isEar = false;
+    bool isIsolated = false; // Only pin isolated triangles, not ears
     std::vector<std::pair<Mesh::FacePointer, int>> incidentBoundaryEdges;
     std::vector<Mesh::VertexPointer> geometricTwins; // Vertices at same 3D position
 };
@@ -74,7 +74,7 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
     // Diagnostic Counters
     struct DiagStats {
         int v_total = 0;
-        int v_ear = 0;
+        int v_isolated = 0;
         int v_hole = 0;
         int v_nonmanifold = 0;
         int v_junction = 0;
@@ -118,22 +118,10 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                 }
             }
             
-            // Fix: Refined Ear Logic
-            // Only pin the "tip" of the ear (vertex incident to 2 boundary edges)
-            // Pinning the whole face fragments chains at every corner.
-            if (boundaryEdgesInFace == 2) {
-                for(int i=0; i<3; ++i) {
-                   // V(i) connects edge(i-1) and edge(i). 
-                   // Edge i is f->V(i)->V(i+1). Edge i-1 is f->V(i-1)->V(i).
-                   bool e_next = isBoundary(f, i);
-                   bool e_prev = isBoundary(f, (i+2)%3); // (i-1) mod 3
-                   if (e_next && e_prev) {
-                       vertexInfo[f->V(i)].isEar = true;
-                   }
-                }
-            } else if (boundaryEdgesInFace == 3) {
-                // Isolated triangle, pin everything
-                for (int i = 0; i < 3; ++i) vertexInfo[f->V(i)].isEar = true;
+            // Only pin isolated triangles (3 boundary edges).
+            // Standard ears (2 boundary edges) are left mutable to allow straightening.
+            if (boundaryEdgesInFace == 3) {
+                for (int i = 0; i < 3; ++i) vertexInfo[f->V(i)].isIsolated = true;
             }
         }
     }
@@ -154,7 +142,7 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
             // Early out based on X-axis distance
             if (sortedVertices[j]->P().X() - sortedVertices[i]->P().X() > params.geometricTolerance) break;
             
-            // Fix: Use <= to allow exact welding when tolerance is 0.0
+            // Use <= to allow exact welding when tolerance is 0.0
             if (Distance(sortedVertices[i]->P(), sortedVertices[j]->P()) <= params.geometricTolerance) {
                 ds.Union(sortedVertices[i], sortedVertices[j]);
             }
@@ -216,15 +204,15 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
         int id = groupPair.first;
         diag.v_total++;
         
-        // Check "Ear" status
-        bool groupIsEar = false;
+        // Check Isolated status
+        bool groupIsIsolated = false;
         for (auto v : groupPair.second) {
-            if (vertexInfo[v].isEar) { groupIsEar = true; break; }
+            if (vertexInfo[v].isIsolated) { groupIsIsolated = true; break; }
         }
         
-        if (groupIsEar) {
+        if (groupIsIsolated) {
             idIsImmutable[id] = true;
-            diag.v_ear++;
+            diag.v_isolated++;
             continue;
         }
 
@@ -410,7 +398,7 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
 
     LOG_INFO << "=== SEAM DIAGNOSTICS ===";
     LOG_INFO << "Geometric Vertices: " << diag.v_total;
-    LOG_INFO << "  Immutable (Ear): " << diag.v_ear << " (" << std::fixed << std::setprecision(1) << (100.0*diag.v_ear/diag.v_total) << "%)";
+    LOG_INFO << "  Immutable (Isolated): " << diag.v_isolated << " (" << std::fixed << std::setprecision(1) << (100.0*diag.v_isolated/diag.v_total) << "%)";
     LOG_INFO << "  Immutable (Hole): " << diag.v_hole << " (" << (100.0*diag.v_hole/diag.v_total) << "%)";
     LOG_INFO << "  Immutable (Non-Manifold): " << diag.v_nonmanifold << " (" << (100.0*diag.v_nonmanifold/diag.v_total) << "%)";
     LOG_INFO << "  Immutable (Junction/Terminus): " << diag.v_junction << " (" << (100.0*diag.v_junction/diag.v_total) << "%)";

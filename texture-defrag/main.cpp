@@ -258,7 +258,7 @@ int main(int argc, char *argv[])
     timings["Greedy optimization"] = t.TimeSinceLastCheck();
 
     double maxRes = (textureObject) ? (double)textureObject->MaxSize() : 1024.0;
-    double straightenToleranceEpsilon = args.straightenTolerancePixels / maxRes;
+    double straightenToleranceEpsilon = args.straightenTolerancePixels;
 
     if (args.straightenTolerancePixels > 0) {
         LOG_INFO << "Straightening seams...";

@@ -86,6 +86,8 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
 
     int numChartsAttempted = 0;
     int numChartsSucceeded = 0;
+    int numInversions = 0;
+    int numWarpFailures = 0;
     int totalSegmentsBefore = 0;
     int totalSegmentsAfter = 0;
 
@@ -659,7 +661,17 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                     for (auto f : chart->fpVec) {
                         for (int k = 0; k < 3; ++k) f->WT(k).P() = computedUVs[f->V(k)];
                     }
+                } else {
+#ifdef _OPENMP
+                    #pragma omp atomic
+#endif
+                    numInversions++;
                 }
+            } else {
+#ifdef _OPENMP
+                #pragma omp atomic
+#endif
+                numWarpFailures++;
             }
 
             free(in.pointlist); free(in.segmentlist);
@@ -672,6 +684,9 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
 
     LOG_INFO << "Seam Straightening completed:";
     LOG_INFO << "  - Charts: " << numChartsSucceeded << " / " << numChartsAttempted << " straightened successfully";
+    if (numInversions > 0 || numWarpFailures > 0) {
+        LOG_INFO << "  - Failures: " << numInversions << " inversions, " << numWarpFailures << " warp solver failures";
+    }
     for (int i = 0; i < params.maxWarpAttempts; ++i) {
         if (retryStats[i] > 0) {
             LOG_INFO << "    * " << retryStats[i] << " succeeded at attempt " << (i + 1);

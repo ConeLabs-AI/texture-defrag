@@ -594,7 +594,7 @@ void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoPara
 
 }
 
-void Finalize(GraphHandle graph, const std::string& outname, int *vndup)
+void Finalize(GraphHandle graph, const std::string& /*outname*/, int *vndup)
 {
     std::unordered_set<Mesh::ConstVertexPointer> vset;
     for (const MeshFace& f : graph->mesh.face)
@@ -1103,7 +1103,9 @@ static std::vector<HalfEdge> ExtractHalfEdges(const std::vector<ChartHandle>& ch
 {
     std::vector<HalfEdge> hvec;
     for (auto ch : charts) {
-        if (!ch->UVBox().Intersects(box))
+        vcg::Box2d chartBox = ch->UVBox();
+        if (chartBox.min[0] > box.max[0] || chartBox.max[0] < box.min[0] ||
+            chartBox.min[1] > box.max[1] || chartBox.max[1] < box.min[1])
             continue;
         for (auto fptr : ch->fpVec) {
             for (int i = 0; i < 3; ++i) {
@@ -2056,7 +2058,7 @@ static TopologyDiff AlignAndMerge_Virtual(ClusteredSeamHandle csh, const ChartHa
 // Helper to compute vertices within offset threshold using virtual positions
 // CRITICAL: Uses mergeGroups to traverse across the virtual seam merge
 static std::unordered_set<Mesh::VertexPointer> ComputeVerticesWithinOffsetThreshold_Virtual(
-    const OffsetMap& om, const ChartHandle a, const ChartHandle b,
+    const OffsetMap& om,
     const std::unordered_map<Mesh::VertexPointer, Mesh::VertexPointer>& replacements,
     const std::unordered_map<Mesh::VertexPointer, std::vector<Mesh::VertexPointer>>& mergeGroups,
     const std::unordered_map<Mesh::VertexPointer, vcg::Point2d>& virtualUV)
@@ -2154,7 +2156,7 @@ static void ComputeOptimizationArea_Virtual(MergeJobResult& result, const Topolo
                                             const ChartHandle a, const ChartHandle b)
 {
     result.verticesWithinThreshold = ComputeVerticesWithinOffsetThreshold_Virtual(
-        diff.offsetMap, a, b, diff.replacements, diff.mergeGroups, diff.newUVPositions);
+        diff.offsetMap, diff.replacements, diff.mergeGroups, diff.newUVPositions);
 
     result.optimizationArea.clear();
 

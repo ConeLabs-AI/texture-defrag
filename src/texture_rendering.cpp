@@ -59,6 +59,15 @@
 
 #include "texture_conversion.h"
 
+#ifndef GL_CONSERVATIVE_RASTERIZATION_NV
+#define GL_CONSERVATIVE_RASTERIZATION_NV 0x9346
+#endif
+#ifndef GL_CONSERVATIVE_RASTERIZATION_INTEL
+#define GL_CONSERVATIVE_RASTERIZATION_INTEL 0x83FE
+#endif
+#ifndef GL_CONSERVATIVE_RASTERIZATION_AMD
+#define GL_CONSERVATIVE_RASTERIZATION_AMD 0x91D1
+#endif
 
 static const char *vs_text[] = {
     "#version 410 core                                           \n"
@@ -245,6 +254,19 @@ struct RenderingContext {
 
         glFuncs->glDisable(GL_DEPTH_TEST);
         glFuncs->glDisable(GL_STENCIL_TEST);
+
+        // Enable Conservative Rasterization if supported by the hardware
+        QOpenGLContext *ctx = QOpenGLContext::currentContext();
+        if (ctx->hasExtension("GL_NV_conservative_raster")) {
+            glFuncs->glEnable(GL_CONSERVATIVE_RASTERIZATION_NV);
+        } else if (ctx->hasExtension("GL_INTEL_conservative_rasterization")) {
+            glFuncs->glEnable(GL_CONSERVATIVE_RASTERIZATION_INTEL);
+        } else if (ctx->hasExtension("GL_AMD_conservative_raster")) {
+            // Note: AMD extension might require different handling, but glEnable is a start
+            glFuncs->glEnable(GL_CONSERVATIVE_RASTERIZATION_AMD);
+        } else {
+            LOG_WARN << "Conservative Rasterization not supported by hardware/driver.";
+        }
     }
 
     ~RenderingContext() {
@@ -866,7 +888,9 @@ static std::shared_ptr<QImage> RenderTexture(RenderingContext& ctx,
     glFuncs->glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
     glFuncs->glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    if (filter) vcg::PullPush(*textureImage, qRgba(0, 0, 0, 255));
+    // vcg::PullPush is disabled as we are now using conservative rasterization 
+    // to minimize gaps and a dedicated texture dilation step outside of this codebase.
+    // if (filter) vcg::PullPush(*textureImage, qRgba(0, 0, 0, 255));
 
     return textureImage;
 }

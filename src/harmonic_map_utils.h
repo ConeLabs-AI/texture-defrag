@@ -110,7 +110,13 @@ public:
         SparseMat L_ii(freeNodes_.size(), freeNodes_.size());
         L_ii.setFromTriplets(triplets_ii.begin(), triplets_ii.end());
 
-        // 4. Pre-Factorize
+        // 4. Regularization: Add 10^-8 to the diagonal to ensure the system is always solvable
+        // and well-conditioned even if some triangles are collapsed (unpinned ears).
+        for (int i = 0; i < (int)freeNodes_.size(); ++i) {
+            L_ii.coeffRef(i, i) += 1e-8;
+        }
+
+        // 5. Pre-Factorize
         solver_.compute(L_ii);
     }
 
@@ -154,8 +160,10 @@ public:
             double area = (b.x() - a.x()) * (c.y() - a.y()) - 
                           (b.y() - a.y()) * (c.x() - a.x());
 
-            // Check for inversion (epsilon to handle degenerate input safely)
-            if (area <= 1e-12) return true;
+            // Check for inversion (negative area). 
+            // Note: We allow zero-area (collapsed) triangles as part of the 
+            // "Aggressive Straightening" strategy.
+            if (area < -1e-12) return true;
         }
         return false;
     }
@@ -177,11 +185,19 @@ private:
         Scalar cross = u.x()*v.y() - u.y()*v.x();
         
         // CLAMP: Prevent division by zero or infinity on degenerate geometry
-        // This is crucial for photogrammetry data.
-        if (std::abs(cross) < 1e-8) {
-            return 0.0; // Effectively disconnects this part of the triangle
+        if (std::abs(cross) < 1e-12) {
+            return 1000.0; // Cap weights for needle triangles
         }
-        return dot / cross;
+        
+        Scalar cot = dot / cross;
+        
+        // Final Clamping: By capping weights at 1000.0, we prevent the matrix 
+        // condition number from exploding. Effectively treats the edge as a 
+        // very stiff spring rather than a rigid constraint.
+        if (cot > 1000.0) return 1000.0;
+        if (cot < -1000.0) return -1000.0;
+        
+        return cot;
     }
 };
 

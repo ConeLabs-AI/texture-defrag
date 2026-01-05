@@ -640,7 +640,7 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                     Point2d p1 = computedUVs[f->V(1)];
                     Point2d p2 = computedUVs[f->V(2)];
                     double area = ((p1.X()-p0.X())*(p2.Y()-p0.Y()) - (p1.Y()-p0.Y())*(p2.X()-p0.X())) / 2.0;
-                    if (area <= 1e-12) { inverted = true; break; }
+                    if (area < -1e-12) { inverted = true; break; }
                 }
                 
                 if (!inverted) {

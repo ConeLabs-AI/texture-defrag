@@ -489,7 +489,7 @@ void GreedyOptimization(GraphHandle graph, AlgoStateHandle state, const AlgoPara
         if (ws.second == Infinity()) {
             // sanity check
             for (auto& entry : state->cost)
-                ensure(entry.second == Infinity());
+                ensure(!std::isfinite(entry.second));
             LOG_INFO << "Queue is empty, interrupting.";
             break;
         } else {
@@ -768,6 +768,9 @@ static CostInfo ComputeCost(ClusteredSeamHandle csh, GraphHandle graph, const Al
 
     ci.cost *= penalty;
 
+    if (!std::isfinite(ci.cost))
+        ci.cost = Infinity();
+
     return ci;
 }
 
@@ -790,7 +793,7 @@ static inline void PurgeQueue(AlgoStateHandle state)
     LOG_INFO << "Purging queue of size " << state->queue.size() << " (cost map size is " << state->cost.size() << ")";
     decltype(state->queue) newQueue;
     for (const auto& costEntry : state->cost) {
-        if (costEntry.second != Infinity()) {
+        if (std::isfinite(costEntry.second)) {
             newQueue.push(std::make_pair(costEntry.first, costEntry.second));
         }
     }
@@ -3149,7 +3152,7 @@ void GreedyOptimization_Parallel(GraphHandle graph, AlgoStateHandle state, const
                 continue;
             }
 
-            if (ws.second == Infinity()) {
+            if (!std::isfinite(ws.second)) {
                 // Sanity check - push it back if we have other work
                 if (!currentBatch.empty()) {
                     state->queue.push(ws);

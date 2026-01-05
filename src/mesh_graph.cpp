@@ -122,10 +122,12 @@ void FaceGroup::UpdateCache() const
     double areaUV = 0;
     double area3D = 0;
     vcg::Point3d weightedSumNormal = vcg::Point3d::Zero();
+    vcg::Box2d uvBox;
     for (auto fptr : fpVec) {
         areaUV += AreaUV(*fptr);
         area3D += Area3D(*fptr);
         weightedSumNormal += (fptr->P(1) - fptr->P(0)) ^ (fptr->P(2) ^ fptr->P(0));
+        for (int i = 0; i < 3; ++i) uvBox.Add(fptr->WT(i).P());
     }
 
     double border3D = 0.0;
@@ -145,6 +147,7 @@ void FaceGroup::UpdateCache() const
     cache.border3D = border3D;
     cache.weightedSumNormal = weightedSumNormal;
     cache.uvFlipped = (areaUV < 0);
+    cache.uvBox = uvBox;
 
     dirty = false;
 }
@@ -213,13 +216,9 @@ bool FaceGroup::UVFlipped() const
 
 vcg::Box2d FaceGroup::UVBox() const
 {
-    vcg::Box2d box;
-    for (auto fptr : fpVec) {
-        box.Add(fptr->WT(0).P());
-        box.Add(fptr->WT(1).P());
-        box.Add(fptr->WT(2).P());
-    }
-    return box;
+    if (dirty)
+        UpdateCache();
+    return cache.uvBox;
 }
 
 bool FaceGroup::UVFlipped()

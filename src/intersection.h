@@ -52,4 +52,7 @@ bool SegmentBoxIntersection(const Segment& seg, const vcg::Box2d& box);
 std::vector<HalfEdgePair> Intersection(const std::vector<HalfEdge>& heVec);
 std::vector<HalfEdgePair> CrossIntersection(const std::vector<HalfEdge>& heVec1, const std::vector<HalfEdge>& heVec2);
 
+bool HasAnyIntersection(const std::vector<HalfEdge>& heVec);
+bool HasAnyCrossIntersection(const std::vector<HalfEdge>& heVec1, const std::vector<HalfEdge>& heVec2);
+
 #endif // INTERSECTION_H

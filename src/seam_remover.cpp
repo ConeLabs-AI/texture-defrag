@@ -1102,11 +1102,16 @@ static std::unordered_set<Mesh::VertexPointer> ComputeVerticesWithinOffsetThresh
 static std::vector<HalfEdge> ExtractHalfEdges(const std::vector<ChartHandle>& charts, const vcg::Box2d& box, bool internalOnly)
 {
     std::vector<HalfEdge> hvec;
-    for (auto ch : charts)
-        for (auto fptr : ch->fpVec)
-            for (int i = 0; i < 3; ++i)
+    for (auto ch : charts) {
+        if (!ch->UVBox().Intersects(box))
+            continue;
+        for (auto fptr : ch->fpVec) {
+            for (int i = 0; i < 3; ++i) {
                 if ((!internalOnly || !face::IsBorder(*fptr, i)) && SegmentBoxIntersection(Segment(fptr->V0(i)->T().P(), fptr->V1(i)->T().P()), box))
                     hvec.push_back(HalfEdge{fptr, i});
+            }
+        }
+    }
     return hvec;
 }
 
@@ -1130,8 +1135,7 @@ static CheckStatus CheckBoundaryAfterAlignmentInner(SeamData& sd)
                     bVec.push_back(HalfEdge{fptr, i});
 
     if ((aVec.size() > 0) && (bVec.size() > 0)) {
-        std::vector<HalfEdgePair> heVec = CrossIntersection(aVec, bVec);
-        if (heVec.size() > 0)
+        if (HasAnyCrossIntersection(aVec, bVec))
             return FAIL_GLOBAL_OVERLAP_BEFORE;
     }
 #if 0
@@ -1144,8 +1148,7 @@ static CheckStatus CheckBoundaryAfterAlignmentInner(SeamData& sd)
     aVec = ExtractHalfEdges({sd.a}, box, false);
     bVec = ExtractHalfEdges({sd.b}, box, false);
     if ((aVec.size() > 0) && (bVec.size() > 0)) {
-        std::vector<HalfEdgePair> heVec = CrossIntersection(aVec, bVec);
-        if (heVec.size() > 0)
+        if (HasAnyCrossIntersection(aVec, bVec))
             return FAIL_GLOBAL_OVERLAP_BEFORE;
     }
 #endif
@@ -1316,8 +1319,7 @@ static CheckStatus CheckAfterLocalOptimizationInner(SeamData& sd, AlgoStateHandl
     std::vector<HalfEdge> aVec = ExtractHalfEdges({sd.a}, box, false);
     std::vector<HalfEdge> bVec = ExtractHalfEdges({sd.b}, box, false);
     if ((aVec.size() > 0) && (bVec.size() > 0)) {
-        std::vector<HalfEdgePair> heVec = CrossIntersection(aVec, bVec);
-        if (heVec.size() > 0)
+        if (HasAnyCrossIntersection(aVec, bVec))
             return FAIL_GLOBAL_OVERLAP_UNFIXABLE;
     }
 

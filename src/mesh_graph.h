@@ -56,6 +56,7 @@ struct FaceGroup {
         double border3D;
         vcg::Point3d weightedSumNormal;
         bool uvFlipped;
+        vcg::Box2d uvBox;
     };
 
     void UpdateCache() const;

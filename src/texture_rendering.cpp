@@ -470,7 +470,6 @@ void RenderTextureAndSave(const std::string& outFileName, Mesh& m, TextureObject
         std::string inputPath = textureObject->texInfoVec[i].path;
         std::string rawPath = TextureConversion::GetRawTilePath(inputPath);
         if (!QFile::exists(QString::fromStdString(rawPath))) {
-            LOG_INFO << "  [Preparing Cache] " << inputPath;
             if (!TextureConversion::ConvertToRawTile(inputPath, rawPath)) {
                 LOG_ERR << "  - Conversion failed. Tiled I/O disabled for this file.";
             }

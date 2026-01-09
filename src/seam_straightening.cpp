@@ -41,6 +41,7 @@ struct SeamChain {
 struct BoundaryVertexInfo {
     bool isImmutable = false;
     bool isIsolated = false; // Only pin isolated triangles, not ears
+    bool isEar = false; // Incident on a face with 2 boundary/seam edges
     std::vector<std::pair<Mesh::FacePointer, int>> incidentBoundaryEdges;
     std::vector<Mesh::VertexPointer> geometricTwins; // Vertices at same 3D position
 };
@@ -94,9 +95,12 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
     struct TierStats {
         int count = 0;
         int success = 0;
+        int successPinnedEars = 0;
         int before = 0;
         int after = 0;
         int inversions = 0;
+        std::vector<int> successPerAttempt;
+        TierStats() : successPerAttempt(10, 0) {} // Accommodate 2x attempts
     };
     std::vector<TierStats> tiers(10);
     std::vector<double> binThresholds(9);
@@ -130,10 +134,12 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                 }
             }
             
-            // Only pin isolated triangles (3 boundary edges).
-            // Standard ears (2 boundary edges) are left mutable to allow straightening.
+            // Standard ears (2 boundary edges) are left mutable to allow straightening initially,
+            // but tracked for fallback pinning.
             if (boundaryEdgesInFace == 3) {
                 for (int i = 0; i < 3; ++i) vertexInfo[f->V(i)].isIsolated = true;
+            } else if (boundaryEdgesInFace == 2) {
+                for (int i = 0; i < 3; ++i) vertexInfo[f->V(i)].isEar = true;
             }
         }
     }
@@ -443,8 +449,9 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
     for(auto& entry : graph->charts) chartVec.push_back(entry.second);
 
     GlobalUVSnapshot globalSnapshot;
-    std::vector<double> allFaceAreas;
+    std::vector<double> chartMedianAreas;
     for (auto& entry : graph->charts) {
+        std::vector<double> faceAreas;
         for (auto f : entry.second->fpVec) {
             Point2d p0 = f->WT(0).P();
             Point2d p1 = f->WT(1).P();
@@ -453,17 +460,22 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
             
             if (params.adaptiveTolerance) {
                 double area = std::abs((p1.X() - p0.X()) * (p2.Y() - p0.Y()) - (p1.Y() - p0.Y()) * (p2.X() - p0.X())) * 0.5;
-                if (area > 1e-12) allFaceAreas.push_back(area);
+                if (area > 1e-12) faceAreas.push_back(area);
             }
+        }
+        if (params.adaptiveTolerance && !faceAreas.empty()) {
+            size_t mid = faceAreas.size() / 2;
+            std::nth_element(faceAreas.begin(), faceAreas.begin() + mid, faceAreas.end());
+            chartMedianAreas.push_back(faceAreas[mid]);
         }
     }
 
-    double globalMedianArea = 1.0;
-    if (params.adaptiveTolerance && !allFaceAreas.empty()) {
-        size_t mid = allFaceAreas.size() / 2;
-        std::nth_element(allFaceAreas.begin(), allFaceAreas.begin() + mid, allFaceAreas.end());
-        globalMedianArea = allFaceAreas[mid];
-        LOG_INFO << "Adaptive tolerance enabled. Global median UV face area: " << globalMedianArea;
+    double globalReferenceArea = 1.0;
+    if (params.adaptiveTolerance && !chartMedianAreas.empty()) {
+        size_t mid = chartMedianAreas.size() / 2;
+        std::nth_element(chartMedianAreas.begin(), chartMedianAreas.begin() + mid, chartMedianAreas.end());
+        globalReferenceArea = chartMedianAreas[mid];
+        LOG_INFO << "Adaptive tolerance enabled. Global baseline (median of chart-median areas): " << globalReferenceArea;
     }
 
     // Pre-calculate base chart tolerances
@@ -480,9 +492,11 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
             if (!localAreas.empty()) {
                 size_t mid = localAreas.size() / 2;
                 std::nth_element(localAreas.begin(), localAreas.begin() + mid, localAreas.end());
-                tol *= std::sqrt(localAreas[mid] / globalMedianArea);
+                tol *= std::sqrt(localAreas[mid] / globalReferenceArea);
             }
         }
+        // Apply safety bounds
+        tol = std::max(params.minTolerancePixels, std::min(params.maxTolerancePixels, tol));
         chartToTol[chart] = tol;
     }
 
@@ -577,15 +591,19 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
              success = true; // Nothing to do
         } else {
             const std::vector<int>& myChains = chainIt->second;
+            int maxTotalAttempts = params.maxWarpAttempts * 2;
 
-            for (int attempt = 0; attempt < params.maxWarpAttempts; ++attempt) {
+            for (int attempt = 0; attempt < maxTotalAttempts; ++attempt) {
+                bool pinEars = (attempt >= params.maxWarpAttempts);
+                int subAttempt = attempt % params.maxWarpAttempts;
+                
                 std::map<Mesh::VertexPointer, Point2D> boundaryTargets;
                 int currentBefore = 0;
                 int currentAfter = 0;
 
                 for (int ci : myChains) {
                     const auto& chain = chains[ci];
-                    const auto& simplified = chainLODs[ci][attempt];
+                    const auto& simplified = chainLODs[ci][subAttempt];
                     
                     currentBefore += (int)chain.vertices.size() - 1;
                     currentAfter += (int)simplified.size() - 1;
@@ -620,6 +638,14 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                     double simplifiedTotalLen = simplifiedLengths.back();
 
                     for (int k = 0; k < (int)chain.vertices.size(); ++k) {
+                        Mesh::VertexPointer v = chain.vertices[k];
+                        Point2d startUV = GetSnapshotUV(globalSnapshot, chain, k);
+                        
+                        if (pinEars && vertexInfo[v].isEar) {
+                            boundaryTargets[v] = { startUV.X(), startUV.Y() };
+                            continue;
+                        }
+
                         double l = origLengths[k];
                         Eigen::Vector4d p4;
                         if (simplifiedTotalLen < 1e-12) p4 = simplified[0];
@@ -634,7 +660,7 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                                 p4 = (1.0 - t) * simplified[idx - 1] + t * simplified[idx];
                             }
                         }
-                        boundaryTargets[chain.vertices[k]] = { p4.x(), p4.y() };
+                        boundaryTargets[v] = { p4.x(), p4.y() };
                     }
                 }
 
@@ -668,11 +694,12 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                 if (!rawPoints.empty()) {
                     uniquePoints.push_back({rawPoints[0].x, rawPoints[0].y});
                     vToTriIdx[rawPoints[0].v] = 0;
+                    const double weldThresholdSq = 1e-8; // Robust threshold (~0.0001 pixels squared)
                     for (size_t k = 1; k < rawPoints.size(); ++k) {
                         const auto& prev = uniquePoints.back();
                         double dx = rawPoints[k].x - prev.x;
                         double dy = rawPoints[k].y - prev.y;
-                        if (dx*dx + dy*dy < 1e-20) {
+                        if (dx*dx + dy*dy < weldThresholdSq) {
                             vToTriIdx[rawPoints[k].v] = (int)uniquePoints.size() - 1;
                         } else {
                             vToTriIdx[rawPoints[k].v] = (int)uniquePoints.size();
@@ -765,10 +792,23 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                         #pragma omp atomic
 #endif
                         tiers[binIdx].success++;
+                        
+                        if (pinEars) {
+#ifdef _OPENMP
+                            #pragma omp atomic
+#endif
+                            tiers[binIdx].successPinnedEars++;
+                        }
+
 #ifdef _OPENMP
                         #pragma omp atomic
 #endif
-                        retryStats[attempt]++;
+                        tiers[binIdx].successPerAttempt[attempt]++;
+
+#ifdef _OPENMP
+                        #pragma omp atomic
+#endif
+                        retryStats[subAttempt]++; // Keep retryStats based on subAttempt for existing logs
 
 #ifdef _OPENMP
                         #pragma omp atomic
@@ -838,7 +878,7 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
     }
 
     LOG_INFO << "=== SIZE-ADAPTIVE PERFORMANCE (10 Tiers) ===";
-    LOG_INFO << std::setw(12) << "Bin (Area3D)" << " | " << std::setw(8) << "Charts" << " | " << std::setw(10) << "Reduction" << " | " << "Inversions";
+    LOG_INFO << std::setw(12) << "Bin (Area3D)" << " | " << std::setw(8) << "Charts" << " | " << std::setw(10) << "Reduction" << " | " << "Inv." << " | Attempts (Regular / Pinned)";
     for (int i = 0; i < 10; ++i) {
         const auto& s = tiers[i];
         double low = (i == 0) ? 0 : binThresholds[i-1];
@@ -848,10 +888,22 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
         std::stringstream ss;
         ss << std::scientific << std::setprecision(1) << low << "-" << high;
         
+        std::stringstream attempts;
+        for (int a = 0; a < params.maxWarpAttempts; ++a) {
+            if (a > 0) attempts << ",";
+            attempts << s.successPerAttempt[a];
+        }
+        attempts << " / ";
+        for (int a = 0; a < params.maxWarpAttempts; ++a) {
+            if (a > 0) attempts << ",";
+            attempts << s.successPerAttempt[a + params.maxWarpAttempts];
+        }
+
         LOG_INFO << std::setw(12) << ss.str() << " | " 
                  << std::setw(3) << s.success << "/" << std::setw(3) << s.count << " | "
                  << std::fixed << std::setprecision(1) << std::setw(8) << red << "% | "
-                 << s.inversions;
+                 << std::setw(4) << s.inversions << " | "
+                 << attempts.str();
     }
     LOG_INFO << "============================================";
 }

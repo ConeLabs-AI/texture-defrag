@@ -91,6 +91,16 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
     int totalSegmentsBefore = 0;
     int totalSegmentsAfter = 0;
 
+    struct TierStats {
+        int count = 0;
+        int success = 0;
+        int before = 0;
+        int after = 0;
+        int inversions = 0;
+    };
+    std::vector<TierStats> tiers(10);
+    std::vector<double> binThresholds(9);
+
     std::map<Mesh::VertexPointer, BoundaryVertexInfo> vertexInfo;
     
     auto isBoundary = [&](Mesh::FacePointer f, int e) {
@@ -409,7 +419,22 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
     LOG_INFO << "Avg Chain Length (verts): " << diag.len_avg;
     LOG_INFO << "========================";
 
-    // 7. Processing Loop (Parallel)
+    // 7. Bin Setup for Tiered Logging
+    std::vector<double> chartAreas3D;
+    for (auto& entry : graph->charts) chartAreas3D.push_back(entry.second->Area3D());
+    std::sort(chartAreas3D.begin(), chartAreas3D.end());
+    if (!chartAreas3D.empty()) {
+        for (int i = 0; i < 9; ++i) {
+            int idx = (int)((i + 1) * chartAreas3D.size() / 10);
+            binThresholds[i] = chartAreas3D[std::min(idx, (int)chartAreas3D.size() - 1)];
+        }
+    }
+    auto getBin = [&](double area) {
+        for (int i = 0; i < 9; ++i) if (area < binThresholds[i]) return i;
+        return 9;
+    };
+
+    // 8. Processing Loop (Parallel)
     std::map<ChartHandle, std::vector<int>> chartToChains;
     for(int i = 0; i < (int)chains.size(); ++i) chartToChains[chains[i].chart].push_back(i);
 
@@ -418,10 +443,47 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
     for(auto& entry : graph->charts) chartVec.push_back(entry.second);
 
     GlobalUVSnapshot globalSnapshot;
+    std::vector<double> allFaceAreas;
     for (auto& entry : graph->charts) {
         for (auto f : entry.second->fpVec) {
-            globalSnapshot[f] = { f->WT(0).P(), f->WT(1).P(), f->WT(2).P() };
+            Point2d p0 = f->WT(0).P();
+            Point2d p1 = f->WT(1).P();
+            Point2d p2 = f->WT(2).P();
+            globalSnapshot[f] = { p0, p1, p2 };
+            
+            if (params.adaptiveTolerance) {
+                double area = std::abs((p1.X() - p0.X()) * (p2.Y() - p0.Y()) - (p1.Y() - p0.Y()) * (p2.X() - p0.X())) * 0.5;
+                if (area > 1e-12) allFaceAreas.push_back(area);
+            }
         }
+    }
+
+    double globalMedianArea = 1.0;
+    if (params.adaptiveTolerance && !allFaceAreas.empty()) {
+        size_t mid = allFaceAreas.size() / 2;
+        std::nth_element(allFaceAreas.begin(), allFaceAreas.begin() + mid, allFaceAreas.end());
+        globalMedianArea = allFaceAreas[mid];
+        LOG_INFO << "Adaptive tolerance enabled. Global median UV face area: " << globalMedianArea;
+    }
+
+    // Pre-calculate base chart tolerances
+    std::map<ChartHandle, double> chartToTol;
+    for (auto chart : chartVec) {
+        double tol = params.initialTolerance;
+        if (params.adaptiveTolerance) {
+            std::vector<double> localAreas;
+            for (auto f : chart->fpVec) {
+                const auto& uvs = globalSnapshot.at(f);
+                double area = std::abs((uvs[1].X() - uvs[0].X()) * (uvs[2].Y() - uvs[0].Y()) - (uvs[1].Y() - uvs[0].Y()) * (uvs[2].X() - uvs[0].X())) * 0.5;
+                if (area > 1e-12) localAreas.push_back(area);
+            }
+            if (!localAreas.empty()) {
+                size_t mid = localAreas.size() / 2;
+                std::nth_element(localAreas.begin(), localAreas.begin() + mid, localAreas.end());
+                tol *= std::sqrt(localAreas[mid] / globalMedianArea);
+            }
+        }
+        chartToTol[chart] = tol;
     }
 
     int num_threads = 1;
@@ -430,6 +492,66 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
 #endif
     LOG_INFO << "Phase 2 & 3: Straightening & Warping (Parallel " << num_threads << " threads)...";
 
+    // 9. Pre-Simplify Chains for Consistency across Charts
+    // Lod index k corresponds to attempt k (halving tolerance each time)
+    std::vector<std::vector<std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>>>> chainLODs(chains.size(), 
+        std::vector<std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>>>(params.maxWarpAttempts));
+
+    for (int ci = 0; ci < (int)chains.size(); ++ci) {
+        const auto& chain = chains[ci];
+        int twinIdx = chain.twinChainIdx;
+        
+        // Ensure we only process each pair once for consistency, but populate both slots
+        if (twinIdx != -1 && twinIdx < ci) continue; 
+
+        double baseTol = chartToTol[chain.chart];
+        if (twinIdx != -1) {
+            baseTol = std::min(baseTol, chartToTol[chains[twinIdx].chart]);
+        }
+
+        // Prepare input polyline
+        std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>> poly4D;
+        if (twinIdx != -1) {
+            const auto& chainB = chains[twinIdx];
+            bool reversed = chain.twinIsReversed;
+            for (int k = 0; k < (int)chain.vertices.size(); ++k) {
+                int kB = reversed ? (chainB.vertices.size() - 1 - k) : k;
+                Point2d pA = GetSnapshotUV(globalSnapshot, chain, k);
+                Point2d pB = GetSnapshotUV(globalSnapshot, chainB, kB); 
+                poly4D.push_back(Eigen::Vector4d(pA.X(), pA.Y(), pB.X(), pB.Y()));
+            }
+        } else {
+             for (int k = 0; k < (int)chain.vertices.size(); ++k) {
+                Point2d pA = GetSnapshotUV(globalSnapshot, chain, k);
+                poly4D.push_back(Eigen::Vector4d(pA.X(), pA.Y(), 0, 0));
+            }
+        }
+
+        for (int attempt = 0; attempt < params.maxWarpAttempts; ++attempt) {
+            double tol = baseTol * std::pow(0.5, attempt);
+            std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>> simplified = GeometryUtils::simplifyRDP(poly4D, tol);
+            chainLODs[ci][attempt] = simplified;
+            
+            if (twinIdx != -1) {
+                // For twin, the 4D points need to be swapped (pB is now pA) and potentially reversed
+                std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>> twinSimplified;
+                bool reversed = chain.twinIsReversed;
+                if (reversed) {
+                    for (int k = (int)simplified.size() - 1; k >= 0; --k) {
+                        const auto& p4 = simplified[k];
+                        twinSimplified.push_back(Eigen::Vector4d(p4.z(), p4.w(), p4.x(), p4.y()));
+                    }
+                } else {
+                    for (size_t k = 0; k < simplified.size(); ++k) {
+                        const auto& p4 = simplified[k];
+                        twinSimplified.push_back(Eigen::Vector4d(p4.z(), p4.w(), p4.x(), p4.y()));
+                    }
+                }
+                chainLODs[twinIdx][attempt] = twinSimplified;
+            }
+        }
+    }
+
     std::vector<int> retryStats(params.maxWarpAttempts, 0);
 
 #ifdef _OPENMP
@@ -437,56 +559,62 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
 #endif
     for (int i = 0; i < (int)chartVec.size(); ++i) {
         ChartHandle chart = chartVec[i];
+        int binIdx = getBin(chart->Area3D());
         
 #ifdef _OPENMP
         #pragma omp atomic
 #endif
         numChartsAttempted++;
+#ifdef _OPENMP
+        #pragma omp atomic
+#endif
+        tiers[binIdx].count++;
 
-        double chartTol = params.initialTolerance;
         bool success = false;
         
         auto chainIt = chartToChains.find(chart);
-        if (chainIt == chartToChains.end()) continue;
-        const std::vector<int>& myChains = chainIt->second;
+        if (chainIt == chartToChains.end()) {
+             success = true; // Nothing to do
+        } else {
+            const std::vector<int>& myChains = chainIt->second;
 
-        for (int attempt = 0; attempt < params.maxWarpAttempts; ++attempt) {
-            std::map<Mesh::VertexPointer, Point2D> boundaryTargets;
+            for (int attempt = 0; attempt < params.maxWarpAttempts; ++attempt) {
+                std::map<Mesh::VertexPointer, Point2D> boundaryTargets;
+                int currentBefore = 0;
+                int currentAfter = 0;
 
-            for (int ci : myChains) {
-                const auto& chain = chains[ci];
-                int twinIdx = chain.twinChainIdx;
+                for (int ci : myChains) {
+                    const auto& chain = chains[ci];
+                    const auto& simplified = chainLODs[ci][attempt];
+                    
+                    currentBefore += (int)chain.vertices.size() - 1;
+                    currentAfter += (int)simplified.size() - 1;
 
-                if (twinIdx != -1) {
-                    const auto& chainB = chains[twinIdx];
-                    bool reversed = chain.twinIsReversed;
-                    
-                    std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>> poly4D;
-                    for (int k = 0; k < (int)chain.vertices.size(); ++k) {
-                        int kB = reversed ? (chainB.vertices.size() - 1 - k) : k;
-                        Point2d pA = GetSnapshotUV(globalSnapshot, chain, k);
-                        Point2d pB = GetSnapshotUV(globalSnapshot, chainB, kB); 
-                        poly4D.push_back(Eigen::Vector4d(pA.X(), pA.Y(), pB.X(), pB.Y()));
-                    }
-                    std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>> simplified = GeometryUtils::simplifyRDP(poly4D, chartTol);
-                    
-                    if (attempt == 0) {
-#ifdef _OPENMP
-                        #pragma omp atomic
-#endif
-                        totalSegmentsBefore += (int)poly4D.size() - 1;
-#ifdef _OPENMP
-                        #pragma omp atomic
-#endif
-                        totalSegmentsAfter += (int)simplified.size() - 1;
-                    }
-                    
                     auto computeArcLengths = [](const std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>>& poly) {
                         std::vector<double> lengths(poly.size(), 0.0);
                         for (size_t k = 1; k < poly.size(); ++k) lengths[k] = lengths[k - 1] + (poly[k] - poly[k - 1]).norm();
                         return lengths;
                     };
-                    std::vector<double> origLengths = computeArcLengths(poly4D);
+                    
+                    // Input 4D points for this chain (at full resolution)
+                    std::vector<Eigen::Vector4d, Eigen::aligned_allocator<Eigen::Vector4d>> poly4D_full;
+                    if (chain.twinChainIdx != -1) {
+                        const auto& chainB = chains[chain.twinChainIdx];
+                        bool reversed = chain.twinIsReversed;
+                        for (int k = 0; k < (int)chain.vertices.size(); ++k) {
+                            int kB = reversed ? (chainB.vertices.size() - 1 - k) : k;
+                            Point2d pA = GetSnapshotUV(globalSnapshot, chain, k);
+                            Point2d pB = GetSnapshotUV(globalSnapshot, chainB, kB); 
+                            poly4D_full.push_back(Eigen::Vector4d(pA.X(), pA.Y(), pB.X(), pB.Y()));
+                        }
+                    } else {
+                        for (int k = 0; k < (int)chain.vertices.size(); ++k) {
+                            Point2d pA = GetSnapshotUV(globalSnapshot, chain, k);
+                            poly4D_full.push_back(Eigen::Vector4d(pA.X(), pA.Y(), 0, 0));
+                        }
+                    }
+
+                    std::vector<double> origLengths = computeArcLengths(poly4D_full);
                     std::vector<double> simplifiedLengths = computeArcLengths(simplified);
                     double totalLen = origLengths.back();
                     double simplifiedTotalLen = simplifiedLengths.back();
@@ -508,177 +636,187 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                         }
                         boundaryTargets[chain.vertices[k]] = { p4.x(), p4.y() };
                     }
-                } else {
-                    for (int k = 0; k < (int)chain.vertices.size(); ++k) {
-                        Point2d pA = GetSnapshotUV(globalSnapshot, chain, k);
-                        boundaryTargets[chain.vertices[k]] = { pA.X(), pA.Y() };
-                    }
-                    if (attempt == 0) {
-#ifdef _OPENMP
-                        #pragma omp atomic
-#endif
-                        totalSegmentsBefore += (int)chain.vertices.size() - 1;
-#ifdef _OPENMP
-                        #pragma omp atomic
-#endif
-                        totalSegmentsAfter += (int)chain.vertices.size() - 1;
-                    }
                 }
-            }
 
-            vcg::Box2d bbox = chart->UVBox();
-            double dimX = std::max(bbox.DimX(), 1e-6);
-            double dimY = std::max(bbox.DimY(), 1e-6);
-            bbox.min -= vcg::Point2d(dimX * 0.2, dimY * 0.2);
-            bbox.max += vcg::Point2d(dimX * 0.2, dimY * 0.2);
+                vcg::Box2d bbox = chart->UVBox();
+                double dimX = std::max(bbox.DimX(), 1e-6);
+                double dimY = std::max(bbox.DimY(), 1e-6);
+                bbox.min -= vcg::Point2d(dimX * 0.2, dimY * 0.2);
+                bbox.max += vcg::Point2d(dimX * 0.2, dimY * 0.2);
 
-            struct triangulateio in, out;
-            memset(&in, 0, sizeof(in));
-            memset(&out, 0, sizeof(out));
+                struct triangulateio in, out;
+                memset(&in, 0, sizeof(in));
+                memset(&out, 0, sizeof(out));
 
-            struct RawPt { Mesh::VertexPointer v; double x, y; };
-            std::vector<RawPt> rawPoints;
-            rawPoints.reserve(chart->fpVec.size() * 3);
+                struct RawPt { Mesh::VertexPointer v; double x, y; };
+                std::vector<RawPt> rawPoints;
+                rawPoints.reserve(chart->fpVec.size() * 3);
 
-            for (auto f : chart->fpVec) {
-                const auto& uvs = globalSnapshot.at(f);
-                for(int k=0; k<3; ++k) rawPoints.push_back({f->V(k), uvs[k].X(), uvs[k].Y()});
-            }
-
-            std::sort(rawPoints.begin(), rawPoints.end(), [](const RawPt& a, const RawPt& b) {
-                if (a.x != b.x) return a.x < b.x;
-                return a.y < b.y;
-            });
-
-            std::map<Mesh::VertexPointer, int> vToTriIdx;
-            std::vector<Point2D> uniquePoints;
-            
-            if (!rawPoints.empty()) {
-                uniquePoints.push_back({rawPoints[0].x, rawPoints[0].y});
-                vToTriIdx[rawPoints[0].v] = 0;
-                for (size_t k = 1; k < rawPoints.size(); ++k) {
-                    const auto& prev = uniquePoints.back();
-                    double dx = rawPoints[k].x - prev.x;
-                    double dy = rawPoints[k].y - prev.y;
-                    if (dx*dx + dy*dy < 1e-20) {
-                        vToTriIdx[rawPoints[k].v] = (int)uniquePoints.size() - 1;
-                    } else {
-                        vToTriIdx[rawPoints[k].v] = (int)uniquePoints.size();
-                        uniquePoints.push_back({rawPoints[k].x, rawPoints[k].y});
-                    }
-                }
-            }
-
-            in.numberofpoints = (int)uniquePoints.size() + 4;
-            in.pointlist = (TRI_REAL *) malloc(in.numberofpoints * 2 * sizeof(TRI_REAL));
-            for (int k = 0; k < (int)uniquePoints.size(); ++k) {
-                in.pointlist[k * 2] = uniquePoints[k].x;
-                in.pointlist[k * 2 + 1] = uniquePoints[k].y;
-            }
-
-            int nextIdx = (int)uniquePoints.size();
-            in.pointlist[nextIdx * 2] = bbox.min.X(); in.pointlist[nextIdx * 2 + 1] = bbox.min.Y(); int bb0 = nextIdx++;
-            in.pointlist[nextIdx * 2] = bbox.max.X(); in.pointlist[nextIdx * 2 + 1] = bbox.min.Y(); int bb1 = nextIdx++;
-            in.pointlist[nextIdx * 2] = bbox.max.X(); in.pointlist[nextIdx * 2 + 1] = bbox.max.Y(); int bb2 = nextIdx++;
-            in.pointlist[nextIdx * 2] = bbox.min.X(); in.pointlist[nextIdx * 2 + 1] = bbox.max.Y(); int bb3 = nextIdx++;
-
-            in.numberofsegments = 4;
-            in.segmentlist = (int *) malloc(in.numberofsegments * 2 * sizeof(int));
-            in.segmentlist[0] = bb0; in.segmentlist[1] = bb1;
-            in.segmentlist[2] = bb1; in.segmentlist[3] = bb2;
-            in.segmentlist[4] = bb2; in.segmentlist[5] = bb3;
-            in.segmentlist[6] = bb3; in.segmentlist[7] = bb0;
-
-#ifdef _OPENMP
-            #pragma omp critical(triangulate_lib)
-#endif
-            {
-                triangulate((char*)"zpQ", &in, &out, nullptr);
-            }
-
-            std::vector<Eigen::Vector2d, Eigen::aligned_allocator<Eigen::Vector2d>> ambientVerts(out.numberofpoints);
-            for (int k = 0; k < out.numberofpoints; ++k) ambientVerts[k] = Eigen::Vector2d(out.pointlist[k * 2], out.pointlist[k * 2 + 1]);
-            std::vector<Triangle> ambientFaces(out.numberoftriangles);
-            for (int k = 0; k < out.numberoftriangles; ++k) {
-                ambientFaces[k].v[0] = out.trianglelist[k * 3];
-                ambientFaces[k].v[1] = out.trianglelist[k * 3 + 1];
-                ambientFaces[k].v[2] = out.trianglelist[k * 3 + 2];
-            }
-
-            std::vector<int> fixedIndices;
-            std::vector<Eigen::Vector2d, Eigen::aligned_allocator<Eigen::Vector2d>> targetPositions;
-            std::vector<bool> isFixed(ambientVerts.size(), false);
-
-            fixedIndices.push_back(bb0); targetPositions.push_back(ambientVerts[bb0]); isFixed[bb0] = true;
-            fixedIndices.push_back(bb1); targetPositions.push_back(ambientVerts[bb1]); isFixed[bb1] = true;
-            fixedIndices.push_back(bb2); targetPositions.push_back(ambientVerts[bb2]); isFixed[bb2] = true;
-            fixedIndices.push_back(bb3); targetPositions.push_back(ambientVerts[bb3]); isFixed[bb3] = true;
-
-            for (auto const& pair : boundaryTargets) {
-                Mesh::VertexPointer v = pair.first;
-                const Point2D& pos = pair.second;
-                int idx = vToTriIdx[v];
-                if (!isFixed[idx]) {
-                    fixedIndices.push_back(idx);
-                    targetPositions.push_back(Eigen::Vector2d(pos.x, pos.y));
-                    isFixed[idx] = true;
-                }
-            }
-
-            if (ApplyCompositeWarp(ambientVerts, ambientFaces, fixedIndices, targetPositions)) {
-                std::map<Mesh::VertexPointer, Point2d> computedUVs;
                 for (auto f : chart->fpVec) {
-                    for(int k=0; k<3; ++k) {
-                        int idx = vToTriIdx[f->V(k)];
-                        computedUVs[f->V(k)] = Point2d(ambientVerts[idx].x(), ambientVerts[idx].y());
-                    }
+                    const auto& uvs = globalSnapshot.at(f);
+                    for(int k=0; k<3; ++k) rawPoints.push_back({f->V(k), uvs[k].X(), uvs[k].Y()});
                 }
 
-                bool inverted = false;
-                for (auto f : chart->fpVec) {
-                    Point2d p0 = computedUVs[f->V(0)];
-                    Point2d p1 = computedUVs[f->V(1)];
-                    Point2d p2 = computedUVs[f->V(2)];
-                    double area = ((p1.X()-p0.X())*(p2.Y()-p0.Y()) - (p1.Y()-p0.Y())*(p2.X()-p0.X())) / 2.0;
-                    if (area < -1e-12) { inverted = true; break; }
-                }
+                std::sort(rawPoints.begin(), rawPoints.end(), [](const RawPt& a, const RawPt& b) {
+                    if (a.x != b.x) return a.x < b.x;
+                    return a.y < b.y;
+                });
+
+                std::map<Mesh::VertexPointer, int> vToTriIdx;
+                std::vector<Point2D> uniquePoints;
                 
-                if (!inverted) {
-                    success = true;
-#ifdef _OPENMP
-                    #pragma omp atomic
-#endif
-                    numChartsSucceeded++;
-#ifdef _OPENMP
-                    #pragma omp atomic
-#endif
-                    retryStats[attempt]++;
-
-                    chart->isSeamStraightened = true;
-                    if (params.colorize) {
-                        for (auto f : chart->fpVec) f->C() = vcg::Color4b(255, 165, 0, 255);
+                if (!rawPoints.empty()) {
+                    uniquePoints.push_back({rawPoints[0].x, rawPoints[0].y});
+                    vToTriIdx[rawPoints[0].v] = 0;
+                    for (size_t k = 1; k < rawPoints.size(); ++k) {
+                        const auto& prev = uniquePoints.back();
+                        double dx = rawPoints[k].x - prev.x;
+                        double dy = rawPoints[k].y - prev.y;
+                        if (dx*dx + dy*dy < 1e-20) {
+                            vToTriIdx[rawPoints[k].v] = (int)uniquePoints.size() - 1;
+                        } else {
+                            vToTriIdx[rawPoints[k].v] = (int)uniquePoints.size();
+                            uniquePoints.push_back({rawPoints[k].x, rawPoints[k].y});
+                        }
                     }
+                }
+
+                in.numberofpoints = (int)uniquePoints.size() + 4;
+                in.pointlist = (TRI_REAL *) malloc(in.numberofpoints * 2 * sizeof(TRI_REAL));
+                for (int k = 0; k < (int)uniquePoints.size(); ++k) {
+                    in.pointlist[k * 2] = uniquePoints[k].x;
+                    in.pointlist[k * 2 + 1] = uniquePoints[k].y;
+                }
+
+                int nextIdx = (int)uniquePoints.size();
+                in.pointlist[nextIdx * 2] = bbox.min.X(); in.pointlist[nextIdx * 2 + 1] = bbox.min.Y(); int bb0 = nextIdx++;
+                in.pointlist[nextIdx * 2] = bbox.max.X(); in.pointlist[nextIdx * 2 + 1] = bbox.min.Y(); int bb1 = nextIdx++;
+                in.pointlist[nextIdx * 2] = bbox.max.X(); in.pointlist[nextIdx * 2 + 1] = bbox.max.Y(); int bb2 = nextIdx++;
+                in.pointlist[nextIdx * 2] = bbox.min.X(); in.pointlist[nextIdx * 2 + 1] = bbox.max.Y(); int bb3 = nextIdx++;
+
+                in.numberofsegments = 4;
+                in.segmentlist = (int *) malloc(in.numberofsegments * 2 * sizeof(int));
+                in.segmentlist[0] = bb0; in.segmentlist[1] = bb1;
+                in.segmentlist[2] = bb1; in.segmentlist[3] = bb2;
+                in.segmentlist[4] = bb2; in.segmentlist[5] = bb3;
+                in.segmentlist[6] = bb3; in.segmentlist[7] = bb0;
+
+#ifdef _OPENMP
+                #pragma omp critical(triangulate_lib)
+#endif
+                {
+                    triangulate((char*)"zpQ", &in, &out, nullptr);
+                }
+
+                std::vector<Eigen::Vector2d, Eigen::aligned_allocator<Eigen::Vector2d>> ambientVerts(out.numberofpoints);
+                for (int k = 0; k < out.numberofpoints; ++k) ambientVerts[k] = Eigen::Vector2d(out.pointlist[k * 2], out.pointlist[k * 2 + 1]);
+                std::vector<Triangle> ambientFaces(out.numberoftriangles);
+                for (int k = 0; k < out.numberoftriangles; ++k) {
+                    ambientFaces[k].v[0] = out.trianglelist[k * 3];
+                    ambientFaces[k].v[1] = out.trianglelist[k * 3 + 1];
+                    ambientFaces[k].v[2] = out.trianglelist[k * 3 + 2];
+                }
+
+                std::vector<int> fixedIndices;
+                std::vector<Eigen::Vector2d, Eigen::aligned_allocator<Eigen::Vector2d>> targetPositions;
+                std::vector<bool> isFixed(ambientVerts.size(), false);
+
+                fixedIndices.push_back(bb0); targetPositions.push_back(ambientVerts[bb0]); isFixed[bb0] = true;
+                fixedIndices.push_back(bb1); targetPositions.push_back(ambientVerts[bb1]); isFixed[bb1] = true;
+                fixedIndices.push_back(bb2); targetPositions.push_back(ambientVerts[bb2]); isFixed[bb2] = true;
+                fixedIndices.push_back(bb3); targetPositions.push_back(ambientVerts[bb3]); isFixed[bb3] = true;
+
+                for (auto const& pair : boundaryTargets) {
+                    Mesh::VertexPointer v = pair.first;
+                    const Point2D& pos = pair.second;
+                    int idx = vToTriIdx[v];
+                    if (!isFixed[idx]) {
+                        fixedIndices.push_back(idx);
+                        targetPositions.push_back(Eigen::Vector2d(pos.x, pos.y));
+                        isFixed[idx] = true;
+                    }
+                }
+
+                if (ApplyCompositeWarp(ambientVerts, ambientFaces, fixedIndices, targetPositions)) {
+                    std::map<Mesh::VertexPointer, Point2d> computedUVs;
                     for (auto f : chart->fpVec) {
-                        for (int k = 0; k < 3; ++k) f->WT(k).P() = computedUVs[f->V(k)];
+                        for(int k=0; k<3; ++k) {
+                            int idx = vToTriIdx[f->V(k)];
+                            computedUVs[f->V(k)] = Point2d(ambientVerts[idx].x(), ambientVerts[idx].y());
+                        }
+                    }
+
+                    bool inverted = false;
+                    for (auto f : chart->fpVec) {
+                        Point2d p0 = computedUVs[f->V(0)];
+                        Point2d p1 = computedUVs[f->V(1)];
+                        Point2d p2 = computedUVs[f->V(2)];
+                        double area = ((p1.X()-p0.X())*(p2.Y()-p0.Y()) - (p1.Y()-p0.Y())*(p2.X()-p0.X())) / 2.0;
+                        if (area < -1e-12) { inverted = true; break; }
+                    }
+                    
+                    if (!inverted) {
+                        success = true;
+#ifdef _OPENMP
+                        #pragma omp atomic
+#endif
+                        numChartsSucceeded++;
+#ifdef _OPENMP
+                        #pragma omp atomic
+#endif
+                        tiers[binIdx].success++;
+#ifdef _OPENMP
+                        #pragma omp atomic
+#endif
+                        retryStats[attempt]++;
+
+#ifdef _OPENMP
+                        #pragma omp atomic
+#endif
+                        totalSegmentsBefore += currentBefore;
+#ifdef _OPENMP
+                        #pragma omp atomic
+#endif
+                        totalSegmentsAfter += currentAfter;
+
+#ifdef _OPENMP
+                        #pragma omp atomic
+#endif
+                        tiers[binIdx].before += currentBefore;
+#ifdef _OPENMP
+                        #pragma omp atomic
+#endif
+                        tiers[binIdx].after += currentAfter;
+
+                        chart->isSeamStraightened = true;
+                        if (params.colorize) {
+                            for (auto f : chart->fpVec) f->C() = vcg::Color4b(255, 165, 0, 255);
+                        }
+                        for (auto f : chart->fpVec) {
+                            for (int k = 0; k < 3; ++k) f->WT(k).P() = computedUVs[f->V(k)];
+                        }
+                    } else {
+#ifdef _OPENMP
+                        #pragma omp atomic
+#endif
+                        numInversions++;
+#ifdef _OPENMP
+                        #pragma omp atomic
+#endif
+                        tiers[binIdx].inversions++;
                     }
                 } else {
 #ifdef _OPENMP
                     #pragma omp atomic
 #endif
-                    numInversions++;
+                    numWarpFailures++;
                 }
-            } else {
-#ifdef _OPENMP
-                #pragma omp atomic
-#endif
-                numWarpFailures++;
-            }
 
-            free(in.pointlist); free(in.segmentlist);
-            trifree(out.pointlist); trifree(out.trianglelist); trifree(out.segmentlist);
-            
-            if (success) break;
-            chartTol *= 0.5;
+                free(in.pointlist); free(in.segmentlist);
+                trifree(out.pointlist); trifree(out.trianglelist); trifree(out.segmentlist);
+                
+                if (success) break;
+            }
         }
     }
 
@@ -698,6 +836,24 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
         LOG_INFO << "  - Boundary Complexity: " << totalSegmentsBefore << " -> " << totalSegmentsAfter 
                  << " segments (" << reduction << "% reduction)";
     }
+
+    LOG_INFO << "=== SIZE-ADAPTIVE PERFORMANCE (10 Tiers) ===";
+    LOG_INFO << std::setw(12) << "Bin (Area3D)" << " | " << std::setw(8) << "Charts" << " | " << std::setw(10) << "Reduction" << " | " << "Inversions";
+    for (int i = 0; i < 10; ++i) {
+        const auto& s = tiers[i];
+        double low = (i == 0) ? 0 : binThresholds[i-1];
+        double high = (i == 9) ? (chartAreas3D.empty() ? 0 : chartAreas3D.back()) : binThresholds[i];
+        double red = s.before > 0 ? 100.0 * (1.0 - (double)s.after/s.before) : 0;
+        
+        std::stringstream ss;
+        ss << std::scientific << std::setprecision(1) << low << "-" << high;
+        
+        LOG_INFO << std::setw(12) << ss.str() << " | " 
+                 << std::setw(3) << s.success << "/" << std::setw(3) << s.count << " | "
+                 << std::fixed << std::setprecision(1) << std::setw(8) << red << "% | "
+                 << s.inversions;
+    }
+    LOG_INFO << "============================================";
 }
 
 } // namespace UVDefrag

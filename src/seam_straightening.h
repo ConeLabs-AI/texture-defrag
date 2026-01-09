@@ -22,6 +22,7 @@ struct SeamStraighteningParameters {
     double geometricTolerance = 1e-6; // Tolerance for welding 3D vertices at seams
     int maxWarpAttempts = 2;
     bool colorize = true;
+    bool adaptiveTolerance = true; // Scale tolerance by sqrt(chart_median_area / global_median_area)
 };
 
 void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParameters& params = SeamStraighteningParameters());

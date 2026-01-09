@@ -91,19 +91,36 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
     int numWarpFailures = 0;
     int totalSegmentsBefore = 0;
     int totalSegmentsAfter = 0;
+    int chartsNoWork = 0;
+    int chartsWithWork = 0;
+    int chartsFailedAllAttempts = 0;
+    int chartsReachedPinnedStage = 0;
+    int chartsSucceededRegular = 0;
+    int chartsSucceededPinned = 0;
+    long long attemptsTotal = 0;      // counts attempts (not charts)
+    long long attemptsToSuccess = 0;  // counts attempts-to-first-success (successful charts only)
 
     struct TierStats {
         int count = 0;
         int success = 0;
         int successPinnedEars = 0;
+        int noWork = 0;
+        int withWork = 0;
+        int failedAllAttempts = 0;
+        int reachedPinnedStage = 0;
+        int succeededRegular = 0;
+        int succeededPinned = 0;
         int before = 0;
         int after = 0;
-        int inversions = 0;
+        int inversions = 0;    // attempt-level
+        int warpFailures = 0;  // attempt-level
+        long long attemptsTotal = 0;     // attempt-level
+        long long attemptsToSuccess = 0; // chart-level sum of attempts-to-first-success
         std::vector<int> successPerAttempt;
-        TierStats() : successPerAttempt(10, 0) {} // Accommodate 2x attempts
     };
     std::vector<TierStats> tiers(10);
     std::vector<double> binThresholds(9);
+    for (auto& t : tiers) t.successPerAttempt.assign(std::max(2, params.maxWarpAttempts * 2), 0);
 
     std::map<Mesh::VertexPointer, BoundaryVertexInfo> vertexInfo;
     
@@ -574,6 +591,7 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
     for (int i = 0; i < (int)chartVec.size(); ++i) {
         ChartHandle chart = chartVec[i];
         int binIdx = getBin(chart->Area3D());
+        const int maxTotalAttempts = params.maxWarpAttempts * 2;
         
 #ifdef _OPENMP
         #pragma omp atomic
@@ -585,15 +603,35 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
         tiers[binIdx].count++;
 
         bool success = false;
+        int successAttempt = -1;
+        bool successWasPinned = false;
+        int attemptsRun = 0;
         
         auto chainIt = chartToChains.find(chart);
         if (chainIt == chartToChains.end()) {
-             success = true; // Nothing to do
+             // No boundary/seam chains in this chart => nothing to warp/straighten.
+             success = true;
+#ifdef _OPENMP
+            #pragma omp atomic
+#endif
+            chartsNoWork++;
+#ifdef _OPENMP
+            #pragma omp atomic
+#endif
+            tiers[binIdx].noWork++;
         } else {
             const std::vector<int>& myChains = chainIt->second;
-            int maxTotalAttempts = params.maxWarpAttempts * 2;
+#ifdef _OPENMP
+            #pragma omp atomic
+#endif
+            chartsWithWork++;
+#ifdef _OPENMP
+            #pragma omp atomic
+#endif
+            tiers[binIdx].withWork++;
 
             for (int attempt = 0; attempt < maxTotalAttempts; ++attempt) {
+                attemptsRun++;
                 bool pinEars = (attempt >= params.maxWarpAttempts);
                 int subAttempt = attempt % params.maxWarpAttempts;
                 
@@ -784,6 +822,8 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                     
                     if (!inverted) {
                         success = true;
+                        successAttempt = attempt;
+                        successWasPinned = pinEars;
 #ifdef _OPENMP
                         #pragma omp atomic
 #endif
@@ -850,6 +890,10 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                     #pragma omp atomic
 #endif
                     numWarpFailures++;
+#ifdef _OPENMP
+                    #pragma omp atomic
+#endif
+                    tiers[binIdx].warpFailures++;
                 }
 
                 free(in.pointlist); free(in.segmentlist);
@@ -857,13 +901,89 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
                 
                 if (success) break;
             }
+
+            // Chart-level accounting (attempt counts etc.)
+            if (attemptsRun > params.maxWarpAttempts) {
+#ifdef _OPENMP
+                #pragma omp atomic
+#endif
+                chartsReachedPinnedStage++;
+#ifdef _OPENMP
+                #pragma omp atomic
+#endif
+                tiers[binIdx].reachedPinnedStage++;
+            }
+
+            if (!success) {
+#ifdef _OPENMP
+                #pragma omp atomic
+#endif
+                chartsFailedAllAttempts++;
+#ifdef _OPENMP
+                #pragma omp atomic
+#endif
+                tiers[binIdx].failedAllAttempts++;
+            } else {
+                // attempts-to-first-success
+                long long atts = (long long)successAttempt + 1;
+#ifdef _OPENMP
+                #pragma omp atomic
+#endif
+                attemptsToSuccess += atts;
+#ifdef _OPENMP
+                #pragma omp atomic
+#endif
+                tiers[binIdx].attemptsToSuccess += atts;
+
+                if (successWasPinned) {
+#ifdef _OPENMP
+                    #pragma omp atomic
+#endif
+                    chartsSucceededPinned++;
+#ifdef _OPENMP
+                    #pragma omp atomic
+#endif
+                    tiers[binIdx].succeededPinned++;
+                } else {
+#ifdef _OPENMP
+                    #pragma omp atomic
+#endif
+                    chartsSucceededRegular++;
+#ifdef _OPENMP
+                    #pragma omp atomic
+#endif
+                    tiers[binIdx].succeededRegular++;
+                }
+            }
+
+#ifdef _OPENMP
+            #pragma omp atomic
+#endif
+            attemptsTotal += (long long)attemptsRun;
+#ifdef _OPENMP
+            #pragma omp atomic
+#endif
+            tiers[binIdx].attemptsTotal += (long long)attemptsRun;
         }
     }
 
     LOG_INFO << "Seam Straightening completed:";
     LOG_INFO << "  - Charts: " << numChartsSucceeded << " / " << numChartsAttempted << " straightened successfully";
+    LOG_INFO << "  - Charts (diagnostics): no-work=" << chartsNoWork
+             << ", with-work=" << chartsWithWork
+             << ", failed-all-attempts=" << chartsFailedAllAttempts
+             << ", reached-pinned-stage=" << chartsReachedPinnedStage
+             << ", succeeded-regular=" << chartsSucceededRegular
+             << ", succeeded-pinned=" << chartsSucceededPinned;
     if (numInversions > 0 || numWarpFailures > 0) {
-        LOG_INFO << "  - Failures: " << numInversions << " inversions, " << numWarpFailures << " warp solver failures";
+        LOG_INFO << "  - Failures (attempt-level): " << numInversions << " inversions, " << numWarpFailures << " warp solver failures";
+    }
+    if (chartsWithWork > 0) {
+        double avgAttemptsAll = (double)attemptsTotal / (double)chartsWithWork;
+        double avgAttemptsSuccess = (numChartsSucceeded > 0) ? ((double)attemptsToSuccess / (double)numChartsSucceeded) : 0.0;
+        LOG_INFO << "  - Attempts: avg-per-chart(with-work)=" << std::fixed << std::setprecision(2) << avgAttemptsAll
+                 << ", avg-to-success(successful charts)=" << avgAttemptsSuccess
+                 << ", total-attempts(with-work)=" << attemptsTotal;
     }
     for (int i = 0; i < params.maxWarpAttempts; ++i) {
         if (retryStats[i] > 0) {
@@ -878,12 +998,25 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
     }
 
     LOG_INFO << "=== SIZE-ADAPTIVE PERFORMANCE (10 Tiers) ===";
-    LOG_INFO << std::setw(12) << "Bin (Area3D)" << " | " << std::setw(8) << "Charts" << " | " << std::setw(10) << "Reduction" << " | " << "Inv." << " | Attempts (Regular / Pinned)";
+    LOG_INFO << std::setw(12) << "Bin (Area3D)" << " | "
+             << std::setw(8) << "Charts" << " | "
+             << std::setw(8) << "Work" << " | "
+             << std::setw(7) << "FailAll" << " | "
+             << std::setw(7) << "PinTry" << " | "
+             << std::setw(7) << "PinOK" << " | "
+             << std::setw(8) << "AttAll" << " | "
+             << std::setw(8) << "AttOK" << " | "
+             << std::setw(10) << "Reduction" << " | "
+             << std::setw(5) << "Inv" << "/"
+             << std::setw(5) << "Warp" << " | "
+             << "Success@Attempt (Regular / Pinned)";
     for (int i = 0; i < 10; ++i) {
         const auto& s = tiers[i];
         double low = (i == 0) ? 0 : binThresholds[i-1];
         double high = (i == 9) ? (chartAreas3D.empty() ? 0 : chartAreas3D.back()) : binThresholds[i];
         double red = s.before > 0 ? 100.0 * (1.0 - (double)s.after/s.before) : 0;
+        double attAll = (s.withWork > 0) ? ((double)s.attemptsTotal / (double)s.withWork) : 0.0;
+        double attOk = (s.success > 0) ? ((double)s.attemptsToSuccess / (double)s.success) : 0.0;
         
         std::stringstream ss;
         ss << std::scientific << std::setprecision(1) << low << "-" << high;
@@ -901,8 +1034,15 @@ void IntegrateSeamStraightening(GraphHandle graph, const SeamStraighteningParame
 
         LOG_INFO << std::setw(12) << ss.str() << " | " 
                  << std::setw(3) << s.success << "/" << std::setw(3) << s.count << " | "
+                 << std::setw(3) << s.withWork << "/" << std::setw(3) << s.count << " | "
+                 << std::setw(7) << s.failedAllAttempts << " | "
+                 << std::setw(7) << s.reachedPinnedStage << " | "
+                 << std::setw(7) << s.succeededPinned << " | "
+                 << std::fixed << std::setprecision(2) << std::setw(8) << attAll << " | "
+                 << std::fixed << std::setprecision(2) << std::setw(8) << attOk << " | "
                  << std::fixed << std::setprecision(1) << std::setw(8) << red << "% | "
-                 << std::setw(4) << s.inversions << " | "
+                 << std::setw(5) << s.inversions << "/"
+                 << std::setw(5) << s.warpFailures << " | "
                  << attempts.str();
     }
     LOG_INFO << "============================================";

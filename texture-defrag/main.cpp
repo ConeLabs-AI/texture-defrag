@@ -70,10 +70,12 @@ struct Args {
     double boundaryTolerance = 0.2;
     double localDistortionTolerance = 0.5;
     double globalDistortionThreshold = 0.025;
+    double maxErrorTexels = 0.0;
     double borderReductionTarget = 0.0;
     double alpha = 5.0;
     double timelimit = 0.0;
     double straightenTolerancePixels = 2.0;
+    std::string objective = "uv-border"; // or "seam-edges"
     std::string infile = "";
     std::string outfile = "";
     int rotationNum = 4;
@@ -105,10 +107,12 @@ int main(int argc, char *argv[])
     ap.boundaryTolerance = args.boundaryTolerance;
     ap.distortionTolerance = args.localDistortionTolerance;
     ap.globalDistortionThreshold = args.globalDistortionThreshold;
+    ap.maxErrorTexels = args.maxErrorTexels;
     ap.UVBorderLengthReduction = args.borderReductionTarget;
     ap.offsetFactor = args.alpha;
     ap.timelimit = args.timelimit;
     ap.rotationNum = args.rotationNum;
+    ap.minimizeSeamEdges = (args.objective == "seam-edges");
 
     LOG_INIT(args.loggingLevel);
 
@@ -583,10 +587,12 @@ void PrintArgsUsage(const char *binary) {
     std::cout << "  -b, --boundary-tolerance <val>  " << "Max tolerance on seam-length to perimeter ratio [0,1]." << " (default: " << def.boundaryTolerance << ")" << std::endl;
     std::cout << "  -d, --local-distortion <val>    " << "Local ARAP distortion tolerance for UV optimization." << " (default: " << def.localDistortionTolerance << ")" << std::endl;
     std::cout << "  -g, --global-distortion <val>   " << "Global ARAP distortion threshold." << " (default: " << def.globalDistortionThreshold << ")" << std::endl;
+    std::cout << "  -e, --max-error-texels <val>    " << "Absolute distortion tolerance in texels (0 disables)." << " (default: " << def.maxErrorTexels << ")" << std::endl;
     std::cout << "  -u, --reduction-target <val>    " << "UV border reduction target percentage [0,1]." << " (default: " << def.borderReductionTarget << ")" << std::endl;
     std::cout << "  -a, --alpha <val>               " << "Alpha parameter for UV optimization area size." << " (default: " << def.alpha << ")" << std::endl;
     std::cout << "  -t, --time-limit <val>          " << "Time-limit for atlas clustering (seconds)." << " (default: " << def.timelimit << ")" << std::endl;
     std::cout << "  -k, --straighten-pixels <val>   " << "Allowable deviation in pixels for seam straightening." << " (default: " << def.straightenTolerancePixels << ")" << std::endl;
+    std::cout << "  -j, --objective <val>           " << "Merge objective: uv-border|seam-edges." << " (default: " << def.objective << ")" << std::endl;
     std::cout << "  -o, --output <val>              " << "Output mesh file (obj or ply)." << " (default: out_MESHFILE" << ")" << std::endl;
     std::cout << "  -r, --rotations <val>           " << "Number of rotations to try (must be multiple of 4)." << " (default: " << def.rotationNum << ")" << std::endl;
     std::cout << "  -l, --loglevel <val>            " << "Logging level (0: minimal, 1: verbose, 2: debug)." << " (default: " << def.loggingLevel << ")" << std::endl;
@@ -601,10 +607,18 @@ bool ParseOption(const std::string& option, const std::string& argument, Args *a
         else if (option == "-b" || option == "--boundary-tolerance") args->boundaryTolerance = std::stod(argument);
         else if (option == "-d" || option == "--local-distortion") args->localDistortionTolerance = std::stod(argument);
         else if (option == "-g" || option == "--global-distortion") args->globalDistortionThreshold = std::stod(argument);
+        else if (option == "-e" || option == "--max-error-texels") args->maxErrorTexels = std::stod(argument);
         else if (option == "-u" || option == "--reduction-target") args->borderReductionTarget = std::stod(argument);
         else if (option == "-a" || option == "--alpha") args->alpha = std::stod(argument);
         else if (option == "-t" || option == "--time-limit") args->timelimit = std::stod(argument);
         else if (option == "-k" || option == "--straighten-pixels") args->straightenTolerancePixels = std::stod(argument);
+        else if (option == "-j" || option == "--objective") {
+            args->objective = argument;
+            if (args->objective != "uv-border" && args->objective != "seam-edges") {
+                std::cerr << "Objective must be one of: uv-border, seam-edges" << std::endl << std::endl;
+                return false;
+            }
+        }
         else if (option == "-o" || option == "--output") args->outfile = argument;
         else if (option == "-r" || option == "--rotations") args->rotationNum = std::stoi(argument);
         else if (option == "-l" || option == "--loglevel") {

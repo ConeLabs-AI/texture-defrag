@@ -40,6 +40,7 @@
 #include <string>
 #include <atomic>
 #include <mutex>
+#include <array>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -740,7 +741,7 @@ static CostInfo ComputeCost(ClusteredSeamHandle csh, GraphHandle graph, const Al
     ci.matching = mi;
     ci.mvalue = CostInfo::FEASIBLE;
 
-    if (a != b) {
+    if (a != b && !params.minimizeSeamEdges) {
         double maxSeamToBoundaryRatio = std::max(bmap[a->id] / a->BorderUV(), bmap[b->id] / b->BorderUV());
         if (maxSeamToBoundaryRatio < params.boundaryTolerance && (!params.visitComponents || !IslandLookahead(a, b, 5))) {
             ci.cost = Infinity();
@@ -752,16 +753,28 @@ static CostInfo ComputeCost(ClusteredSeamHandle csh, GraphHandle graph, const Al
     double totErr = MatchingErrorTotal(mi, bpa, bpb);
     double avgErr = totErr / (double) bpa.size();
 
-    if (avgErr > params.matchingThreshold * ((bmap[a->id] + bmap[b->id]) / 2.0)) {
+    if (params.maxErrorTexels > 0.0) {
+        if (avgErr > params.maxErrorTexels) {
+            ci.cost = Infinity();
+            ci.mvalue = CostInfo::UNFEASIBLE_MATCHING;
+            return ci;
+        }
+    } else if (avgErr > params.matchingThreshold * ((bmap[a->id] + bmap[b->id]) / 2.0)) {
         ci.cost = Infinity();
         ci.mvalue = CostInfo::UNFEASIBLE_MATCHING;
         return ci;
     }
 
-    double lossgain = avgErr * std::pow(std::min(a->BorderUV() / bmap[a->id], b->BorderUV() / bmap[b->id]), params.expb);
     double sizebonus = std::min(a->AreaUV(), b->AreaUV());
-
-    ci.cost = lossgain * sizebonus;
+    if (params.minimizeSeamEdges) {
+        // Favor operations that remove more seam-edges, within a given matching tolerance.
+        // Use avg seam matching error as a proxy for operation "difficulty".
+        const double seamEdgeCount = std::max(1, ne);
+        ci.cost = (avgErr / seamEdgeCount) * sizebonus;
+    } else {
+        double lossgain = avgErr * std::pow(std::min(a->BorderUV() / bmap[a->id], b->BorderUV() / bmap[b->id]), params.expb);
+        ci.cost = lossgain * sizebonus;
+    }
 
     if (ci.cost == 0 && penalty > 1.0)
         ci.cost = 1;
@@ -1167,6 +1180,82 @@ static CheckStatus CheckBoundaryAfterAlignment(SeamData& sd)
     return status;
 }
 
+static inline bool IsFiniteUV(const vcg::Point2d& p)
+{
+    return std::isfinite(p.X()) && std::isfinite(p.Y());
+}
+
+// Computes the max residual (in texels) after factoring out the best-fit 2D rigid motion
+// between the original (stored) triangle and the current triangle. This provides an
+// absolute, translation/rotation-invariant distortion estimate in pixel space.
+static double TriangleRigidResidualTexels(const std::array<vcg::Point2d, 3>& orig,
+                                         const std::array<vcg::Point2d, 3>& curr)
+{
+    // Skip invalid triangles early
+    for (int i = 0; i < 3; ++i) {
+        if (!IsFiniteUV(orig[i]) || !IsFiniteUV(curr[i])) return Infinity();
+    }
+
+    const vcg::Point2d o10 = orig[1] - orig[0];
+    const vcg::Point2d o20 = orig[2] - orig[0];
+    const double area2 = std::abs(o10 ^ o20);
+    if (area2 <= 1e-12) return 0.0; // degenerate in the input: ignore
+
+    const vcg::Point2d co = (orig[0] + orig[1] + orig[2]) / 3.0;
+    const vcg::Point2d cc = (curr[0] + curr[1] + curr[2]) / 3.0;
+
+    // 2D Procrustes / Kabsch: optimal rotation angle can be computed from dot/cross accumulators.
+    double a = 0.0;
+    double b = 0.0;
+    for (int i = 0; i < 3; ++i) {
+        const vcg::Point2d qo = orig[i] - co;
+        const vcg::Point2d pc = curr[i] - cc;
+        a += qo.X() * pc.X() + qo.Y() * pc.Y();
+        b += qo.X() * pc.Y() - qo.Y() * pc.X();
+    }
+
+    double c = 1.0;
+    double s = 0.0;
+    if (std::abs(a) + std::abs(b) > 1e-20) {
+        const double theta = std::atan2(b, a);
+        c = std::cos(theta);
+        s = std::sin(theta);
+    }
+
+    double maxErr = 0.0;
+    for (int i = 0; i < 3; ++i) {
+        const vcg::Point2d qo = orig[i] - co;
+        const vcg::Point2d qoR(c * qo.X() - s * qo.Y(), s * qo.X() + c * qo.Y());
+        const vcg::Point2d mapped = qoR + cc;
+        maxErr = std::max(maxErr, (curr[i] - mapped).Norm());
+    }
+    return maxErr;
+}
+
+static double ComputeMaxRigidResidualTexels(const std::unordered_set<Mesh::FacePointer>& faces, Mesh& mesh)
+{
+    if (!HasWedgeTexCoordStorageAttribute(mesh)) return Infinity();
+    auto tsa = GetWedgeTexCoordStorageAttribute(mesh);
+
+    double maxErr = 0.0;
+    for (auto fptr : faces) {
+        std::array<vcg::Point2d, 3> orig = {
+            tsa[fptr].tc[0].P(),
+            tsa[fptr].tc[1].P(),
+            tsa[fptr].tc[2].P(),
+        };
+        std::array<vcg::Point2d, 3> curr = {
+            fptr->WT(0).P(),
+            fptr->WT(1).P(),
+            fptr->WT(2).P(),
+        };
+        const double triErr = TriangleRigidResidualTexels(orig, curr);
+        if (!std::isfinite(triErr)) return Infinity();
+        maxErr = std::max(maxErr, triErr);
+    }
+    return maxErr;
+}
+
 static CheckStatus CheckAfterLocalOptimizationInner(SeamData& sd, AlgoStateHandle state, const AlgoParameters& params)
 {
     double newArapVal = (state->arapNum + (sd.outputArapNum - sd.inputArapNum)) / state->arapDenom;
@@ -1185,6 +1274,18 @@ static CheckStatus CheckAfterLocalOptimizationInner(SeamData& sd, AlgoStateHandl
                   << " due to local ARAP distortion " << localDistortion
                   << " > threshold " << params.distortionTolerance;
         return FAIL_DISTORTION_LOCAL;
+    }
+
+    if (params.maxErrorTexels > 0.0) {
+        Mesh& mesh = sd.a->mesh;
+        const double maxRigidErr = ComputeMaxRigidResidualTexels(sd.optimizationArea, mesh);
+        if (!std::isfinite(maxRigidErr) || maxRigidErr > params.maxErrorTexels) {
+            LOG_DEBUG << "[DIAG] Rejecting move for charts " << sd.a->id
+                      << (sd.a != sd.b ? ("/" + std::to_string(sd.b->id)) : "")
+                      << " due to max rigid residual " << maxRigidErr
+                      << " texels > threshold " << params.maxErrorTexels;
+            return FAIL_DISTORTION_LOCAL;
+        }
     }
 
     // Check if the combined chart exceeds the physical texture limit (~32k)
@@ -2612,7 +2713,39 @@ static vcg::Point2d GetVirtualUV(Mesh::VertexPointer v, const TopologyDiff& diff
 {
     auto it = diff.newUVPositions.find(v);
     if (it != diff.newUVPositions.end()) return it->second;
+    // If this vertex is being merged, query its representative.
+    auto repIt = diff.replacements.find(v);
+    if (repIt != diff.replacements.end()) {
+        auto it2 = diff.newUVPositions.find(repIt->second);
+        if (it2 != diff.newUVPositions.end()) return it2->second;
+    }
     return v->T().P();
+}
+
+static double ComputeMaxRigidResidualTexels_Virtual(const std::unordered_set<Mesh::FacePointer>& faces,
+                                                    Mesh& mesh,
+                                                    const TopologyDiff& diff)
+{
+    if (!HasWedgeTexCoordStorageAttribute(mesh)) return Infinity();
+    auto tsa = GetWedgeTexCoordStorageAttribute(mesh);
+
+    double maxErr = 0.0;
+    for (auto fptr : faces) {
+        std::array<vcg::Point2d, 3> orig = {
+            tsa[fptr].tc[0].P(),
+            tsa[fptr].tc[1].P(),
+            tsa[fptr].tc[2].P(),
+        };
+        std::array<vcg::Point2d, 3> curr = {
+            GetVirtualUV(fptr->V(0), diff),
+            GetVirtualUV(fptr->V(1), diff),
+            GetVirtualUV(fptr->V(2), diff),
+        };
+        const double triErr = TriangleRigidResidualTexels(orig, curr);
+        if (!std::isfinite(triErr)) return Infinity();
+        maxErr = std::max(maxErr, triErr);
+    }
+    return maxErr;
 }
 
 // Helper to check if two segments intersect (using virtual positions)
@@ -2662,6 +2795,16 @@ static CheckStatus CheckAfterOptimization_Virtual(MergeJobResult& result, const 
         double localDistortion = result.outputArapNum / result.outputArapDenom;
         if (localDistortion > params.distortionTolerance) {
             LOG_DEBUG << "[Parallel] Rejecting for local distortion " << localDistortion << " > " << params.distortionTolerance;
+            return FAIL_DISTORTION_LOCAL;
+        }
+    }
+
+    if (params.maxErrorTexels > 0.0) {
+        Mesh& mesh = a->mesh;
+        const double maxRigidErr = ComputeMaxRigidResidualTexels_Virtual(result.optimizationArea, mesh, diff);
+        if (!std::isfinite(maxRigidErr) || maxRigidErr > params.maxErrorTexels) {
+            LOG_DEBUG << "[Parallel] Rejecting for max rigid residual " << maxRigidErr
+                      << " texels > " << params.maxErrorTexels;
             return FAIL_DISTORTION_LOCAL;
         }
     }

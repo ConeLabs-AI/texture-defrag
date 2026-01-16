@@ -85,7 +85,7 @@ xvfb-run --auto-servernum ./texture-defrag \
 ```
 
 ```
-Usage: ./texture-defrag MESHFILE [-mbdgutao]
+Usage: ./texture-defrag MESHFILE [OPTIONS]
 
 MESHFILE specifies the input mesh file (supported formats are obj, ply and fbx)
 
@@ -93,9 +93,11 @@ MESHFILE specifies the input mesh file (supported formats are obj, ply and fbx)
 -b  <val>      Maximum tolerance on the seam-length to chart-perimeter ratio when attempting merge operations. Range is [0,1]. (default: 0.2)
 -d  <val>      Local ARAP distortion tolerance when performing the local UV optimization. (default: 0.5)
 -g  <val>      Global ARAP distortion tolerance when performing the local UV optimization. (default: 0.025)
+-e  <val>      Absolute distortion tolerance in texels (0 disables). (default: 0)
 -u  <val>      UV border reduction target in percentage relative to the input. Range is [0,1]. (default: 0)
 -a  <val>      Alpha parameter to control the UV optimization area size. (default: 5)
 -t  <val>      Time-limit for the atlas clustering (in seconds). (default: 0)
+-j  <val>      Merge objective: uv-border|seam-edges. (default: uv-border)
 -o  <val>      Output mesh file. Supported formats are obj and ply. (default: out_MESHFILE)
 -l  <val>      Logging level. 0 for minimal verbosity, 1 for verbose output, 2 for debug output. (default: 0)
 

@@ -46,6 +46,9 @@ typedef std::unordered_map<Mesh::VertexPointer, double> OffsetMap;
 
 struct AlgoParameters {
     double matchingThreshold         = 2.0;
+    // If > 0, uses an absolute tolerance in texels (UVs are in pixel space after `ScaleTextureCoordinatesToImage`)
+    // for both seam matching feasibility and post-optimization distortion checks.
+    double maxErrorTexels            = 0.0;
     double offsetFactor              = 5.0;
     double boundaryTolerance         = 0.2;
     double distortionTolerance       = 0.5;
@@ -59,6 +62,8 @@ struct AlgoParameters {
     bool   ignoreOnReject            = false;
     double resolutionScaling         = 1.0;
     int    rotationNum               = 4;
+    // If true, rank/attempt operations primarily by seam-edge removal (within tolerances).
+    bool   minimizeSeamEdges         = false;
 };
 
 struct SeamData {

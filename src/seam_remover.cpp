@@ -1207,6 +1207,11 @@ static inline bool IsFiniteUV(const vcg::Point2d& p)
     return std::isfinite(p.X()) && std::isfinite(p.Y());
 }
 
+static inline double ClampDouble(double x, double lo, double hi)
+{
+    return (x < lo) ? lo : ((x > hi) ? hi : x);
+}
+
 enum class UVOverlapCheckResult {
     NONE = 0,
     OVERLAP,
@@ -1376,7 +1381,7 @@ static UVOverlapCheckResult CheckUVOverlapFast(const std::vector<Mesh::FacePoint
     const double area = dimX * dimY;
     double cellSize = std::sqrt(area / double(n));
     if (!std::isfinite(cellSize) || cellSize <= 0.0) cellSize = std::max(dimX, dimY);
-    cellSize = std::clamp(cellSize, 1.0, 128.0);
+    cellSize = ClampDouble(cellSize, 1.0, 128.0);
 
     const double invCell = 1.0 / cellSize;
     const double originX = globalMinX;
@@ -2731,6 +2736,8 @@ static CheckStatus OptimizeChart_Virtual(MergeJobResult& result, TopologyDiff& d
     if (supportFaces.empty()) {
         return FAIL_TOPOLOGY;
     }
+    (void)mesh;
+    (void)params;
 
     // [UV SCALE GUARD] Measure UV bounding box before ARAP optimization using virtual positions
     vcg::Box2d optBoxBefore;

@@ -36,7 +36,11 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <algorithm>
+#include <limits>
+#include <unordered_map>
 #include <unordered_set>
+#include <cstdint>
 #include <string>
 #include <atomic>
 #include <mutex>
@@ -86,6 +90,8 @@ static OffsetMap AlignAndMerge(ClusteredSeamHandle csh, SeamData& sd, const Matc
 static void ComputeOptimizationArea(SeamData& sd, Mesh& mesh, OffsetMap& om);
 static std::unordered_set<Mesh::VertexPointer> ComputeVerticesWithinOffsetThreshold(Mesh& m, const OffsetMap& om, const SeamData& sd);
 static CheckStatus CheckBoundaryAfterAlignment(SeamData& sd);
+static CheckStatus CheckFixedAreaOverlapAfterAlignment(const std::vector<Mesh::FacePointer>& fixedFacesA,
+                                                       const std::vector<Mesh::FacePointer>& fixedFacesB);
 static CheckStatus CheckAfterLocalOptimization(SeamData& sd, AlgoStateHandle state, const AlgoParameters& params);
 static CheckStatus OptimizeChart(SeamData& sd, GraphHandle graph, bool fixIntersectingEdges);
 static void AcceptMove(const SeamData& sd, AlgoStateHandle state, GraphHandle graph, const AlgoParameters& params);
@@ -1136,22 +1142,38 @@ static CheckStatus CheckBoundaryAfterAlignmentInner(SeamData& sd)
 
     // check if the borders of the fixed areas of a and b intersect each other
     std::vector<HalfEdge> aVec;
+    std::vector<Mesh::FacePointer> fixedFacesA;
+    fixedFacesA.reserve(sd.a->fpVec.size());
     for (auto fptr : sd.a->fpVec)
-        if (sd.optimizationArea.find(fptr) == sd.optimizationArea.end())
+        if (sd.optimizationArea.find(fptr) == sd.optimizationArea.end()) {
+            fixedFacesA.push_back(fptr);
             for (int i = 0; i < 3; ++i)
                 if (face::IsBorder(*fptr, i) || (sd.optimizationArea.find(fptr->FFp(i)) != sd.optimizationArea.end()))
                     aVec.push_back(HalfEdge{fptr, i});
+        }
 
     std::vector<HalfEdge> bVec;
+    std::vector<Mesh::FacePointer> fixedFacesB;
+    fixedFacesB.reserve(sd.b->fpVec.size());
     for (auto fptr : sd.b->fpVec)
-        if (sd.optimizationArea.find(fptr) == sd.optimizationArea.end())
+        if (sd.optimizationArea.find(fptr) == sd.optimizationArea.end()) {
+            fixedFacesB.push_back(fptr);
             for (int i = 0; i < 3; ++i)
                 if (face::IsBorder(*fptr, i) || (sd.optimizationArea.find(fptr->FFp(i)) != sd.optimizationArea.end()))
                     bVec.push_back(HalfEdge{fptr, i});
+        }
 
     if ((aVec.size() > 0) && (bVec.size() > 0)) {
         if (HasAnyCrossIntersection(aVec, bVec))
             return FAIL_GLOBAL_OVERLAP_BEFORE;
+    }
+
+    // Robust fixed-area overlap check: border-only tests miss containment overlaps.
+    // If the fixed areas already overlap, ARAP cannot fix it (fixed vertices cannot move),
+    // so reject early to avoid wasting time on optimization.
+    {
+        const CheckStatus fixedAreaOverlap = CheckFixedAreaOverlapAfterAlignment(fixedFacesA, fixedFacesB);
+        if (fixedAreaOverlap != PASS) return fixedAreaOverlap;
     }
 #if 0
     vcg::Box2d box;
@@ -1183,6 +1205,249 @@ static CheckStatus CheckBoundaryAfterAlignment(SeamData& sd)
 static inline bool IsFiniteUV(const vcg::Point2d& p)
 {
     return std::isfinite(p.X()) && std::isfinite(p.Y());
+}
+
+enum class UVOverlapCheckResult {
+    NONE = 0,
+    OVERLAP,
+    NON_FINITE
+};
+
+static inline double Orient2D(const vcg::Point2d& a, const vcg::Point2d& b, const vcg::Point2d& c)
+{
+    return (b - a) ^ (c - a);
+}
+
+static inline bool SegmentIntersectProper(const vcg::Point2d& a0, const vcg::Point2d& a1,
+                                          const vcg::Point2d& b0, const vcg::Point2d& b1,
+                                          double eps)
+{
+    const double o1 = Orient2D(a0, a1, b0);
+    const double o2 = Orient2D(a0, a1, b1);
+    const double o3 = Orient2D(b0, b1, a0);
+    const double o4 = Orient2D(b0, b1, a1);
+
+    if (std::abs(o1) <= eps || std::abs(o2) <= eps || std::abs(o3) <= eps || std::abs(o4) <= eps) return false;
+    if ((o1 > eps && o2 > eps) || (o1 < -eps && o2 < -eps)) return false;
+    if ((o3 > eps && o4 > eps) || (o3 < -eps && o4 < -eps)) return false;
+    return true;
+}
+
+static inline bool PointInTriStrict(const vcg::Point2d& p,
+                                    const std::array<vcg::Point2d, 3>& tri,
+                                    double eps)
+{
+    const double a0 = Orient2D(tri[0], tri[1], p);
+    const double a1 = Orient2D(tri[1], tri[2], p);
+    const double a2 = Orient2D(tri[2], tri[0], p);
+
+    const bool pos = (a0 > eps && a1 > eps && a2 > eps);
+    const bool neg = (a0 < -eps && a1 < -eps && a2 < -eps);
+    return pos || neg;
+}
+
+struct UVTri2 {
+    std::array<vcg::Point2d, 3> p;
+    double minX, maxX, minY, maxY;
+    std::uint8_t flags;
+};
+
+static inline bool UVTriBoxesOverlap(const UVTri2& a, const UVTri2& b, double eps)
+{
+    if (a.minX > b.maxX - eps || b.minX > a.maxX - eps) return false;
+    if (a.minY > b.maxY - eps || b.minY > a.maxY - eps) return false;
+    return true;
+}
+
+static inline bool UVTrianglesOverlapProper(const UVTri2& a, const UVTri2& b, double eps)
+{
+    if (!UVTriBoxesOverlap(a, b, eps)) return false;
+
+    const auto& A = a.p;
+    const auto& B = b.p;
+
+    const vcg::Point2d a0 = A[0], a1 = A[1], a2 = A[2];
+    const vcg::Point2d b0 = B[0], b1 = B[1], b2 = B[2];
+
+    if (SegmentIntersectProper(a0, a1, b0, b1, eps) || SegmentIntersectProper(a0, a1, b1, b2, eps) || SegmentIntersectProper(a0, a1, b2, b0, eps) ||
+        SegmentIntersectProper(a1, a2, b0, b1, eps) || SegmentIntersectProper(a1, a2, b1, b2, eps) || SegmentIntersectProper(a1, a2, b2, b0, eps) ||
+        SegmentIntersectProper(a2, a0, b0, b1, eps) || SegmentIntersectProper(a2, a0, b1, b2, eps) || SegmentIntersectProper(a2, a0, b2, b0, eps)) {
+        return true;
+    }
+
+    if (PointInTriStrict(a0, B, eps) || PointInTriStrict(a1, B, eps) || PointInTriStrict(a2, B, eps) ||
+        PointInTriStrict(b0, A, eps) || PointInTriStrict(b1, A, eps) || PointInTriStrict(b2, A, eps)) {
+        return true;
+    }
+
+    return false;
+}
+
+struct UVOverlapScratch {
+    std::unordered_map<std::uint64_t, std::vector<int>> cellToTri;
+    std::vector<std::uint64_t> usedKeys;
+    std::vector<std::uint32_t> seen;
+    std::uint32_t stampBase = 0;
+    std::vector<UVTri2> tris;
+
+    void Reset()
+    {
+        for (std::uint64_t key : usedKeys) {
+            auto it = cellToTri.find(key);
+            if (it != cellToTri.end()) it->second.clear();
+        }
+        usedKeys.clear();
+        tris.clear();
+    }
+};
+
+static inline std::uint64_t PackCellKey(std::uint32_t ix, std::uint32_t iy)
+{
+    return (std::uint64_t(ix) << 32) | std::uint64_t(iy);
+}
+
+static inline bool ShouldTestOverlapPair(std::uint8_t flagsA, std::uint8_t flagsB)
+{
+    constexpr std::uint8_t MOVED = 1u << 0;
+    constexpr std::uint8_t CHART_B = 1u << 1;
+    const bool moved = (flagsA & MOVED) || (flagsB & MOVED);
+    const bool differentCharts = ((flagsA ^ flagsB) & CHART_B) != 0;
+    return moved || differentCharts;
+}
+
+template <typename PointGetter>
+static UVOverlapCheckResult CheckUVOverlapFast(const std::vector<Mesh::FacePointer>& facesA,
+                                               const std::vector<Mesh::FacePointer>& facesB,
+                                               const std::unordered_set<Mesh::FacePointer>& movedFaces,
+                                               PointGetter&& getPoint)
+{
+    static thread_local UVOverlapScratch scratch;
+    scratch.Reset();
+
+    const std::size_t estimate = facesA.size() + facesB.size();
+    scratch.tris.reserve(estimate);
+
+    double globalMinX = std::numeric_limits<double>::infinity();
+    double globalMinY = std::numeric_limits<double>::infinity();
+    double globalMaxX = -std::numeric_limits<double>::infinity();
+    double globalMaxY = -std::numeric_limits<double>::infinity();
+
+    auto addFace = [&](Mesh::FacePointer f, std::uint8_t baseFlags) -> bool {
+        UVTri2 tri;
+        tri.flags = baseFlags | (movedFaces.find(f) != movedFaces.end() ? (1u << 0) : 0u);
+        tri.p[0] = getPoint(f, 0);
+        tri.p[1] = getPoint(f, 1);
+        tri.p[2] = getPoint(f, 2);
+        for (int i = 0; i < 3; ++i) {
+            if (!IsFiniteUV(tri.p[i])) return false;
+        }
+
+        tri.minX = std::min({tri.p[0].X(), tri.p[1].X(), tri.p[2].X()});
+        tri.maxX = std::max({tri.p[0].X(), tri.p[1].X(), tri.p[2].X()});
+        tri.minY = std::min({tri.p[0].Y(), tri.p[1].Y(), tri.p[2].Y()});
+        tri.maxY = std::max({tri.p[0].Y(), tri.p[1].Y(), tri.p[2].Y()});
+
+        globalMinX = std::min(globalMinX, tri.minX);
+        globalMinY = std::min(globalMinY, tri.minY);
+        globalMaxX = std::max(globalMaxX, tri.maxX);
+        globalMaxY = std::max(globalMaxY, tri.maxY);
+
+        scratch.tris.push_back(tri);
+        return true;
+    };
+
+    constexpr std::uint8_t FLAG_CHART_B = 1u << 1;
+    for (auto f : facesA) {
+        if (!addFace(f, 0u)) return UVOverlapCheckResult::NON_FINITE;
+    }
+    for (auto f : facesB) {
+        if (!addFace(f, FLAG_CHART_B)) return UVOverlapCheckResult::NON_FINITE;
+    }
+
+    const int n = (int)scratch.tris.size();
+    if (n < 2) return UVOverlapCheckResult::NONE;
+
+    const double dimX = globalMaxX - globalMinX;
+    const double dimY = globalMaxY - globalMinY;
+    if (!(dimX > 0.0) || !(dimY > 0.0) || !std::isfinite(dimX) || !std::isfinite(dimY)) {
+        return UVOverlapCheckResult::NONE;
+    }
+
+    const double area = dimX * dimY;
+    double cellSize = std::sqrt(area / double(n));
+    if (!std::isfinite(cellSize) || cellSize <= 0.0) cellSize = std::max(dimX, dimY);
+    cellSize = std::clamp(cellSize, 1.0, 128.0);
+
+    const double invCell = 1.0 / cellSize;
+    const double originX = globalMinX;
+    const double originY = globalMinY;
+
+    if (scratch.seen.size() < (std::size_t)n) scratch.seen.resize((std::size_t)n, 0);
+    std::uint32_t stampBase = scratch.stampBase;
+    // Avoid clearing the entire `seen` array every call: use a monotonically increasing stamp base.
+    // If we would overflow, reset once.
+    if (stampBase + (std::uint32_t)n + 1u < stampBase) {
+        std::fill(scratch.seen.begin(), scratch.seen.end(), 0u);
+        stampBase = 0u;
+    }
+    scratch.stampBase = stampBase + (std::uint32_t)n + 1u;
+
+    // Epsilon in texel-space for robust strict tests (avoid counting shared edges/vertices).
+    const double eps = 1e-9;
+
+    for (int i = 0; i < n; ++i) {
+        const UVTri2& t = scratch.tris[i];
+
+        const int ix0 = (int)std::floor((t.minX - originX) * invCell);
+        const int ix1 = (int)std::floor((t.maxX - originX) * invCell);
+        const int iy0 = (int)std::floor((t.minY - originY) * invCell);
+        const int iy1 = (int)std::floor((t.maxY - originY) * invCell);
+
+        const std::uint32_t token = stampBase + (std::uint32_t)(i + 1);
+
+        for (int ix = ix0; ix <= ix1; ++ix) {
+            for (int iy = iy0; iy <= iy1; ++iy) {
+                const std::uint64_t key = PackCellKey((std::uint32_t)ix, (std::uint32_t)iy);
+                auto it = scratch.cellToTri.find(key);
+                if (it == scratch.cellToTri.end()) continue;
+                const auto& cell = it->second;
+                for (int j : cell) {
+                    if (scratch.seen[(std::size_t)j] == token) continue;
+                    scratch.seen[(std::size_t)j] = token;
+
+                    const UVTri2& u = scratch.tris[j];
+                    if (!ShouldTestOverlapPair(t.flags, u.flags)) continue;
+                    if (!UVTriBoxesOverlap(t, u, eps)) continue;
+                    if (UVTrianglesOverlapProper(t, u, eps)) {
+                        return UVOverlapCheckResult::OVERLAP;
+                    }
+                }
+            }
+        }
+
+        for (int ix = ix0; ix <= ix1; ++ix) {
+            for (int iy = iy0; iy <= iy1; ++iy) {
+                const std::uint64_t key = PackCellKey((std::uint32_t)ix, (std::uint32_t)iy);
+                auto& cell = scratch.cellToTri[key];
+                if (cell.empty()) scratch.usedKeys.push_back(key);
+                cell.push_back(i);
+            }
+        }
+    }
+
+    return UVOverlapCheckResult::NONE;
+}
+
+static CheckStatus CheckFixedAreaOverlapAfterAlignment(const std::vector<Mesh::FacePointer>& fixedFacesA,
+                                                       const std::vector<Mesh::FacePointer>& fixedFacesB)
+{
+    if (fixedFacesA.empty() || fixedFacesB.empty()) return PASS;
+    const std::unordered_set<Mesh::FacePointer> emptyMoved;
+    const auto overlap = CheckUVOverlapFast(
+        fixedFacesA, fixedFacesB, emptyMoved, [&](Mesh::FacePointer f, int k) { return f->V(k)->T().P(); });
+    if (overlap == UVOverlapCheckResult::NON_FINITE) return FAIL_NUMERICAL_ERROR;
+    if (overlap == UVOverlapCheckResult::OVERLAP) return FAIL_GLOBAL_OVERLAP_BEFORE;
+    return PASS;
 }
 
 // Computes the max residual (in texels) after factoring out the best-fit 2D rigid motion
@@ -1424,6 +1689,30 @@ static CheckStatus CheckAfterLocalOptimizationInner(SeamData& sd, AlgoStateHandl
     if ((aVec.size() > 0) && (bVec.size() > 0)) {
         if (HasAnyCrossIntersection(aVec, bVec))
             return FAIL_GLOBAL_OVERLAP_UNFIXABLE;
+    }
+
+    // Robust UV injectivity check: boundary intersections can miss triangle containment overlaps.
+    // This prevents silent UV overlaps that later cause incorrect resampling / wrong texturing.
+    {
+        const std::vector<Mesh::FacePointer> empty;
+        const auto overlap = CheckUVOverlapFast(
+            sd.a->fpVec,
+            (sd.a != sd.b) ? sd.b->fpVec : empty,
+            sd.optimizationArea,
+            [&](Mesh::FacePointer f, int k) { return f->WT(k).P(); });
+
+        if (overlap == UVOverlapCheckResult::NON_FINITE) {
+            LOG_DEBUG << "[DIAG] Rejecting move for charts " << sd.a->id
+                      << (sd.a != sd.b ? ("/" + std::to_string(sd.b->id)) : "")
+                      << " due to non-finite UVs detected during overlap check.";
+            return FAIL_NUMERICAL_ERROR;
+        }
+        if (overlap == UVOverlapCheckResult::OVERLAP) {
+            LOG_DEBUG << "[DIAG] Rejecting move for charts " << sd.a->id
+                      << (sd.a != sd.b ? ("/" + std::to_string(sd.b->id)) : "")
+                      << " due to UV triangle overlap after optimization.";
+            return FAIL_GLOBAL_OVERLAP_UNFIXABLE;
+        }
     }
 
     return PASS;
@@ -2945,6 +3234,19 @@ static CheckStatus CheckAfterOptimization_Virtual(MergeJobResult& result, const 
 
     if (!result.intersectionBoundary.empty()) {
         return FAIL_GLOBAL_OVERLAP_AFTER_BND;
+    }
+
+    // Robust UV injectivity check: edge-only intersection tests can miss triangle containment overlaps.
+    {
+        const std::vector<Mesh::FacePointer> empty;
+        const auto overlap = CheckUVOverlapFast(
+            a->fpVec,
+            (a != b) ? b->fpVec : empty,
+            result.optimizationArea,
+            [&](Mesh::FacePointer f, int k) { return GetVirtualUV(f->V(k), diff); });
+
+        if (overlap == UVOverlapCheckResult::NON_FINITE) return FAIL_NUMERICAL_ERROR;
+        if (overlap == UVOverlapCheckResult::OVERLAP) return FAIL_GLOBAL_OVERLAP_UNFIXABLE;
     }
 
     return PASS;

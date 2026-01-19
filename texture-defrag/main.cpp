@@ -47,6 +47,9 @@
 #include <memory>
 #include <algorithm>
 #include <functional>
+#include <cstdint>
+#include <limits>
+#include <iomanip>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -89,6 +92,219 @@ bool ParseOption(const std::string& option, const std::string& argument, Args *a
 Args ParseArgs(int argc, char *argv[]);
 
 void EnsureOpenGLContextOrExit(std::unique_ptr<QOpenGLContext>& context, std::unique_ptr<QOffscreenSurface>& surface);
+
+namespace {
+
+struct UVRangeStats {
+    std::uint64_t wedgeCount = 0;
+    std::uint64_t nonFiniteCount = 0;
+    std::uint64_t outOfRangeCount = 0;
+    double minU = std::numeric_limits<double>::infinity();
+    double minV = std::numeric_limits<double>::infinity();
+    double maxU = -std::numeric_limits<double>::infinity();
+    double maxV = -std::numeric_limits<double>::infinity();
+    double maxAbsDeviation = 0.0;
+    int worstFaceIndex = -1;
+    int worstCorner = -1;
+    int worstTextureIndex = -1;
+    vcg::Point2d worstUV = vcg::Point2d::Zero();
+};
+
+static UVRangeStats ComputeUVRangeStats(const Mesh& m, double eps = 1e-9)
+{
+    UVRangeStats stats;
+
+    for (std::size_t fi = 0; fi < m.face.size(); ++fi) {
+        const auto& f = m.face[fi];
+        if (f.IsD()) continue;
+        const int faceVN = f.VN();
+        for (int k = 0; k < faceVN; ++k) {
+            const vcg::Point2d uv = f.cWT(k).P();
+            stats.wedgeCount++;
+
+            if (!std::isfinite(uv.X()) || !std::isfinite(uv.Y())) {
+                stats.nonFiniteCount++;
+                continue;
+            }
+
+            stats.minU = std::min(stats.minU, uv.X());
+            stats.minV = std::min(stats.minV, uv.Y());
+            stats.maxU = std::max(stats.maxU, uv.X());
+            stats.maxV = std::max(stats.maxV, uv.Y());
+
+            double deviation = 0.0;
+            if (uv.X() < 0.0 - eps) deviation = std::max(deviation, -uv.X());
+            if (uv.X() > 1.0 + eps) deviation = std::max(deviation, uv.X() - 1.0);
+            if (uv.Y() < 0.0 - eps) deviation = std::max(deviation, -uv.Y());
+            if (uv.Y() > 1.0 + eps) deviation = std::max(deviation, uv.Y() - 1.0);
+
+            if (deviation > 0.0) {
+                stats.outOfRangeCount++;
+                if (deviation > stats.maxAbsDeviation) {
+                    stats.maxAbsDeviation = deviation;
+                    stats.worstFaceIndex = (int)fi;
+                    stats.worstCorner = k;
+                    stats.worstTextureIndex = f.cWT(0).N();
+                    stats.worstUV = uv;
+                }
+            }
+        }
+    }
+
+    if (!std::isfinite(stats.minU)) stats.minU = 0.0;
+    if (!std::isfinite(stats.minV)) stats.minV = 0.0;
+    if (!std::isfinite(stats.maxU)) stats.maxU = 0.0;
+    if (!std::isfinite(stats.maxV)) stats.maxV = 0.0;
+
+    return stats;
+}
+
+static void LogUVRangeStats(const char* stage, const Mesh& m)
+{
+    const UVRangeStats stats = ComputeUVRangeStats(m);
+    std::ostringstream oss;
+    oss.setf(std::ios::fixed);
+    oss << std::setprecision(6);
+    oss << "[DIAG][UV] " << stage
+        << " wedges=" << stats.wedgeCount
+        << " nonFinite=" << stats.nonFiniteCount
+        << " rangeU=[" << stats.minU << ", " << stats.maxU << "]"
+        << " rangeV=[" << stats.minV << ", " << stats.maxV << "]"
+        << " outOfRangeWedges=" << stats.outOfRangeCount
+        << " maxDeviation=" << stats.maxAbsDeviation;
+    LOG_INFO << oss.str();
+
+    if (stats.nonFiniteCount > 0) {
+        LOG_WARN << "[DIAG][UV] " << stage << " contains non-finite UVs (count=" << stats.nonFiniteCount << ").";
+    }
+    if (stats.outOfRangeCount > 0) {
+        LOG_WARN << "[DIAG][UV] " << stage << " has out-of-range UVs. Worst deviation=" << stats.maxAbsDeviation
+                 << " at faceIndex=" << stats.worstFaceIndex
+                 << " corner=" << stats.worstCorner
+                 << " texIndex=" << stats.worstTextureIndex
+                 << " uv=(" << stats.worstUV.X() << ", " << stats.worstUV.Y() << ").";
+    }
+}
+
+static void LogTextureSizeChanges(const char* stage,
+                                  const std::vector<TextureSize>& before,
+                                  const std::vector<TextureSize>& after)
+{
+    const std::size_t n = std::min(before.size(), after.size());
+    std::size_t changed = 0;
+    int minAfter = std::numeric_limits<int>::max();
+    int maxAfter = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (before[i].w != after[i].w || before[i].h != after[i].h) changed++;
+        minAfter = std::min(minAfter, std::min(after[i].w, after[i].h));
+        maxAfter = std::max(maxAfter, std::max(after[i].w, after[i].h));
+    }
+
+    LOG_INFO << "[DIAG][TEX] " << stage
+             << " sheetsBefore=" << before.size()
+             << " sheetsAfter=" << after.size()
+             << " resized=" << changed
+             << " minAfterDim=" << (minAfter == std::numeric_limits<int>::max() ? -1 : minAfter)
+             << " maxAfterDim=" << maxAfter;
+
+    struct Change {
+        int index = -1;
+        int bw = 0, bh = 0;
+        int aw = 0, ah = 0;
+        int minAfter = 0;
+        double areaRatio = 1.0;
+    };
+
+    std::vector<Change> changes;
+    changes.reserve(changed);
+    for (std::size_t i = 0; i < n; ++i) {
+        if (before[i].w == after[i].w && before[i].h == after[i].h) continue;
+        Change c;
+        c.index = (int)i;
+        c.bw = before[i].w;
+        c.bh = before[i].h;
+        c.aw = after[i].w;
+        c.ah = after[i].h;
+        c.minAfter = std::min(c.aw, c.ah);
+        const double aBefore = (double)c.bw * (double)c.bh;
+        const double aAfter = (double)c.aw * (double)c.ah;
+        c.areaRatio = (aBefore > 0.0) ? (aAfter / aBefore) : 0.0;
+        changes.push_back(c);
+    }
+
+    if (!changes.empty()) {
+        std::sort(changes.begin(), changes.end(), [](const Change& a, const Change& b) {
+            if (a.minAfter != b.minAfter) return a.minAfter < b.minAfter;
+            return a.areaRatio < b.areaRatio;
+        });
+
+        const std::size_t maxPrint = std::min<std::size_t>(changes.size(), 12);
+        LOG_INFO << "[DIAG][TEX] " << stage << " resized sheets (showing " << maxPrint << " smallest):";
+        for (std::size_t i = 0; i < maxPrint; ++i) {
+            const auto& c = changes[i];
+            LOG_INFO << "  sheet=" << c.index
+                     << " " << c.bw << "x" << c.bh
+                     << " -> " << c.aw << "x" << c.ah
+                     << " areaRatio=" << c.areaRatio;
+        }
+    }
+}
+
+static void LogTextureSheetStats(const char* stage, Mesh& m, const std::vector<TextureSize>& texszVec)
+{
+    if (texszVec.empty()) return;
+
+    std::vector<std::vector<Mesh::FacePointer>> facesByTexture;
+    const int nTex = FacesByTextureIndex(m, facesByTexture);
+    const int n = std::min<int>(nTex, (int)texszVec.size());
+
+    struct Sheet {
+        int index = -1;
+        int w = 0, h = 0;
+        std::size_t faces = 0;
+    };
+
+    std::vector<Sheet> sheets;
+    sheets.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        Sheet s;
+        s.index = i;
+        s.w = texszVec[i].w;
+        s.h = texszVec[i].h;
+        s.faces = (i < (int)facesByTexture.size()) ? facesByTexture[i].size() : 0;
+        sheets.push_back(s);
+    }
+
+    auto minDim = [](const Sheet& s) { return std::min(s.w, s.h); };
+    std::sort(sheets.begin(), sheets.end(), [&](const Sheet& a, const Sheet& b) {
+        if (minDim(a) != minDim(b)) return minDim(a) < minDim(b);
+        const int areaA = a.w * a.h;
+        const int areaB = b.w * b.h;
+        return areaA < areaB;
+    });
+
+    int tiny16 = 0, tiny64 = 0;
+    for (const auto& s : sheets) {
+        if (minDim(s) <= 16) tiny16++;
+        if (minDim(s) <= 64) tiny64++;
+    }
+
+    LOG_INFO << "[DIAG][TEX] " << stage
+             << " sheets=" << n
+             << " tiny<=16=" << tiny16
+             << " tiny<=64=" << tiny64;
+
+    const std::size_t maxPrint = std::min<std::size_t>(sheets.size(), 12);
+    LOG_INFO << "[DIAG][TEX] " << stage << " smallest sheets (showing " << maxPrint << "):";
+    for (std::size_t i = 0; i < maxPrint; ++i) {
+        const auto& s = sheets[i];
+        LOG_INFO << "  sheet=" << s.index
+                 << " size=" << s.w << "x" << s.h
+                 << " faces=" << s.faces;
+    }
+}
+
+} // namespace
 
 int main(int argc, char *argv[])
 {
@@ -492,6 +708,8 @@ int main(int argc, char *argv[])
     timings["Packing"] = t.TimeSinceLastCheck();
 
     LOG_INFO << "Packed " << npacked << " charts in " << timings["Packing"] << " seconds";
+    LogUVRangeStats("After packing", m);
+    LogTextureSheetStats("After packing", m, texszVec);
 
     LOG_INFO << "[DIAG] Packing function finished.";
     if (npacked < (int) chartsToPack.size()) {
@@ -515,13 +733,18 @@ int main(int argc, char *argv[])
 
     LOG_INFO << "Trimming texture...";
 
+    const std::vector<TextureSize> texszBeforeTrim = texszVec;
     TrimTexture(m, texszVec, false);
     timings["Texture trimming"] = t.TimeSinceLastCheck();
+    LogTextureSizeChanges("After TrimTexture", texszBeforeTrim, texszVec);
+    LogUVRangeStats("After TrimTexture", m);
+    LogTextureSheetStats("After TrimTexture", m, texszVec);
 
     LOG_INFO << "Shifting charts...";
 
     IntegerShift(m, chartsToPack, texszVec, anchorMap, flipped);
     timings["Chart shifting"] = t.TimeSinceLastCheck();
+    LogUVRangeStats("After IntegerShift", m);
 
     LOG_INFO << "Rendering texture...";
 

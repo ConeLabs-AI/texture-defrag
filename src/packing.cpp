@@ -42,6 +42,8 @@
 #include <cmath>
 #include <random>
 #include <queue>
+#include <limits>
+#include <iomanip>
 
 struct PackingStats {
     double mesoTime = 0, parallelTime = 0, individualTime = 0, totalTime = 0;
@@ -815,8 +817,47 @@ void IntegerShift(Mesh& m, const std::vector<ChartHandle>& chartsToPack, const s
 
     auto Rotate = [] (vcg::Point2d p, double theta) -> vcg::Point2d { return p.Rotate(theta); };
 
+    struct ShiftOutlier {
+        RegionID chartId = INVALID_ID;
+        int anchorFaceIndex = -1;
+        int textureIndex = -1;
+        int textureW = 0;
+        int textureH = 0;
+        bool flipped = false;
+        int rotIndex = -1;
+        vcg::Point2d shiftNorm = vcg::Point2d::Zero();
+        vcg::Point2d shiftPx = vcg::Point2d::Zero();
+        vcg::Point2d fracSrc = vcg::Point2d::Zero();
+        vcg::Point2d fracDst = vcg::Point2d::Zero();
+        vcg::Box2d uvBoxBefore;
+        vcg::Box2d uvBoxAfter;
+        double maxDeviationAfter = 0.0;
+    };
+
+    struct ShiftStats {
+        std::size_t totalCharts = 0;
+        std::size_t skippedSeamStraightened = 0;
+        std::size_t missingAnchor = 0;
+        std::size_t shifted = 0;
+        std::size_t outOfRangeAfter = 0;
+        std::size_t outOfRangeBefore = 0;
+        std::size_t nonFiniteAnchor = 0;
+        double maxAbsShiftNorm = 0.0;
+        double maxAbsShiftPx = 0.0;
+        int minTextureDim = std::numeric_limits<int>::max();
+    };
+
+    ShiftStats stats;
+    stats.totalCharts = chartsToPack.size();
+    std::vector<ShiftOutlier> outliers;
+    outliers.reserve(64);
+    constexpr double EPS = 1e-9;
+
     for (auto c : chartsToPack) {
-        if (c->isSeamStraightened) continue;
+        if (c->isSeamStraightened) {
+            stats.skippedSeamStraightened++;
+            continue;
+        }
         auto it = anchorMap.find(c);
         if (it != anchorMap.end()) {
             Mesh::FacePointer fptr = &(m.face[it->second]);
@@ -858,6 +899,11 @@ void IntegerShift(Mesh& m, const std::vector<ChartHandle>& chartsToPack, const s
             vcg::Point2d u0 = wtcsh[fptr].tc[0].P();
             vcg::Point2d u1 = fptr->cWT(0).P();
 
+            if (!std::isfinite(u0.X()) || !std::isfinite(u0.Y()) || !std::isfinite(u1.X()) || !std::isfinite(u1.Y())) {
+                stats.nonFiniteAnchor++;
+                continue;
+            }
+
             double unused;
             double dx = std::modf(u0.X(), &unused);
             double dy = std::modf(u0.Y(), &unused);
@@ -894,12 +940,108 @@ void IntegerShift(Mesh& m, const std::vector<ChartHandle>& chartsToPack, const s
             t.X() = (dx - dx1) / textureSize.X();
             t.Y() = (dy - dy1) / textureSize.Y();
 
-            for (auto fptr : c->fpVec) {
+            stats.shifted++;
+            stats.maxAbsShiftNorm = std::max(stats.maxAbsShiftNorm, std::max(std::abs(t.X()), std::abs(t.Y())));
+            vcg::Point2d shiftPx(t.X() * textureSize.X(), t.Y() * textureSize.Y());
+            stats.maxAbsShiftPx = std::max(stats.maxAbsShiftPx, std::max(std::abs(shiftPx.X()), std::abs(shiftPx.Y())));
+            stats.minTextureDim = std::min(stats.minTextureDim, (int)std::min(textureSize.X(), textureSize.Y()));
+
+            // Apply translation while computing UV bounds before/after, to catch charts pushed outside [0,1]
+            vcg::Box2d uvBoxBefore;
+            vcg::Box2d uvBoxAfter;
+            for (auto chartFacePtr : c->fpVec) {
                 for (int i = 0; i < 3; ++i) {
-                    fptr->WT(i).P() += t;
-                    fptr->V(i)->T().P() = fptr->WT(i).P();
+                    const vcg::Point2d uv0 = chartFacePtr->WT(i).P();
+                    uvBoxBefore.Add(uv0);
+                    const vcg::Point2d uvNew = uv0 + t;
+                    uvBoxAfter.Add(uvNew);
+                    chartFacePtr->WT(i).P() = uvNew;
+                    chartFacePtr->V(i)->T().P() = chartFacePtr->WT(i).P();
                 }
             }
+
+            auto maxDeviationFromUnitSquare = [](const vcg::Box2d& b, double eps) -> double {
+                double d = 0.0;
+                if (b.min.X() < 0.0 - eps) d = std::max(d, -b.min.X());
+                if (b.min.Y() < 0.0 - eps) d = std::max(d, -b.min.Y());
+                if (b.max.X() > 1.0 + eps) d = std::max(d, b.max.X() - 1.0);
+                if (b.max.Y() > 1.0 + eps) d = std::max(d, b.max.Y() - 1.0);
+                return d;
+            };
+
+            const double devBefore = maxDeviationFromUnitSquare(uvBoxBefore, EPS);
+            const double devAfter = maxDeviationFromUnitSquare(uvBoxAfter, EPS);
+            if (devBefore > 0.0) stats.outOfRangeBefore++;
+            if (devAfter > 0.0) {
+                stats.outOfRangeAfter++;
+                ShiftOutlier o;
+                o.chartId = c->id;
+                o.anchorFaceIndex = it->second;
+                o.textureIndex = ti;
+                o.textureW = texszVec[ti].w;
+                o.textureH = texszVec[ti].h;
+                o.flipped = flipped;
+                o.rotIndex = minResidualIndex;
+                o.shiftNorm = t;
+                o.shiftPx = shiftPx;
+                o.fracSrc = vcg::Point2d(dx, dy);
+                o.fracDst = vcg::Point2d(dx1, dy1);
+                o.uvBoxBefore = uvBoxBefore;
+                o.uvBoxAfter = uvBoxAfter;
+                o.maxDeviationAfter = devAfter;
+                outliers.push_back(o);
+            }
+
+        } else {
+            stats.missingAnchor++;
+        }
+    }
+
+    // Summarize, then print a bounded list of outliers.
+    {
+        std::ostringstream oss;
+        oss.setf(std::ios::fixed);
+        oss << std::setprecision(6);
+        oss << "[DIAG][IntegerShift] charts=" << stats.totalCharts
+            << " shifted=" << stats.shifted
+            << " skippedSeamStraightened=" << stats.skippedSeamStraightened
+            << " missingAnchor=" << stats.missingAnchor
+            << " nonFiniteAnchor=" << stats.nonFiniteAnchor
+            << " outOfRangeBefore=" << stats.outOfRangeBefore
+            << " outOfRangeAfter=" << stats.outOfRangeAfter
+            << " maxAbsShiftNorm=" << stats.maxAbsShiftNorm
+            << " maxAbsShiftPx=" << stats.maxAbsShiftPx
+            << " minTextureDim=" << (stats.minTextureDim == std::numeric_limits<int>::max() ? -1 : stats.minTextureDim);
+        LOG_INFO << oss.str();
+    }
+
+    if (!outliers.empty()) {
+        std::sort(outliers.begin(), outliers.end(), [](const ShiftOutlier& a, const ShiftOutlier& b) {
+            return a.maxDeviationAfter > b.maxDeviationAfter;
+        });
+
+        const std::size_t maxPrint = std::min<std::size_t>(outliers.size(), 25);
+        LOG_WARN << "[DIAG][IntegerShift] " << outliers.size()
+                 << " charts ended up with UVs outside [0,1] after IntegerShift. Showing top "
+                 << maxPrint << " by deviation:";
+
+        for (std::size_t i = 0; i < maxPrint; ++i) {
+            const auto& o = outliers[i];
+            LOG_WARN << "  chartId=" << o.chartId
+                     << " texIndex=" << o.textureIndex
+                     << " texSize=" << o.textureW << "x" << o.textureH
+                     << " shiftNorm=(" << o.shiftNorm.X() << "," << o.shiftNorm.Y() << ")"
+                     << " shiftPx=(" << o.shiftPx.X() << "," << o.shiftPx.Y() << ")"
+                     << " fracSrc=(" << o.fracSrc.X() << "," << o.fracSrc.Y() << ")"
+                     << " fracDst=(" << o.fracDst.X() << "," << o.fracDst.Y() << ")"
+                     << " flipped=" << (o.flipped ? 1 : 0)
+                     << " rotIdx=" << o.rotIndex
+                     << " anchorFaceIndex=" << o.anchorFaceIndex
+                     << " uvBoxBefore=[(" << o.uvBoxBefore.min.X() << "," << o.uvBoxBefore.min.Y() << ")-("
+                     << o.uvBoxBefore.max.X() << "," << o.uvBoxBefore.max.Y() << ")]"
+                     << " uvBoxAfter=[(" << o.uvBoxAfter.min.X() << "," << o.uvBoxAfter.min.Y() << ")-("
+                     << o.uvBoxAfter.max.X() << "," << o.uvBoxAfter.max.Y() << ")]"
+                     << " maxDeviationAfter=" << o.maxDeviationAfter;
         }
     }
 }

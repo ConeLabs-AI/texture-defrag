@@ -44,6 +44,7 @@
 #include <queue>
 #include <limits>
 #include <iomanip>
+#include <sstream>
 
 struct PackingStats {
     double mesoTime = 0, parallelTime = 0, individualTime = 0, totalTime = 0;
@@ -104,8 +105,29 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
     outlines.reserve(charts.size());
     std::vector<float> chartScaleMul;
     chartScaleMul.reserve(charts.size());
+    // Per-chart UV origin offset (translation-invariant) to keep coordinates near zero for packing.
+    // This prevents large absolute UV translations accumulated during optimization from causing
+    // numeric issues (float precision) in rasterization/packing and later transform application.
+    std::vector<vcg::Point2d> chartUVOrigin;
+    chartUVOrigin.reserve(charts.size());
     std::vector<double> chartAreasOriginal;
     chartAreasOriginal.reserve(charts.size());
+
+    std::vector<double> chartMaxAbsCoord;
+    chartMaxAbsCoord.reserve(charts.size());
+    std::vector<double> floatQuantErrAbs;
+    floatQuantErrAbs.reserve(charts.size());
+    std::vector<double> floatQuantErrRebased;
+    floatQuantErrRebased.reserve(charts.size());
+
+    double worstAbsCoord = 0.0;
+    RegionID worstAbsCoordId = INVALID_ID;
+    vcg::Box2d worstAbsCoordBox;
+
+    double worstErrAbs = 0.0;
+    RegionID worstErrAbsId = INVALID_ID;
+    double worstErrRebased = 0.0;
+    RegionID worstErrRebasedId = INVALID_ID;
 
     for (auto c : charts) {
         // Determine per-chart scale from the pre-computed multipliers
@@ -115,16 +137,128 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             mul = it->second;
         }
         chartScaleMul.push_back(mul);
-        // Save the outline of the parameterization for this portion of the mesh and apply per-chart scaling
-        Outline2f outline = ExtractOutline2f(*c);
-        // Track original area before scaling
-        double originalAreaAbs = std::abs(vcg::tri::OutlineUtil<float>::Outline2Area(outline));
-        chartAreasOriginal.push_back(originalAreaAbs);
-        for (auto &p : outline) {
-            p.X() *= mul;
-            p.Y() *= mul;
+        // Rebase chart UVs to a local origin to avoid large absolute translations.
+        // Use the full chart UV box (all wedges), not just the outline, to ensure all vertices are covered.
+        const vcg::Box2d uvBox = c->UVBox();
+        const vcg::Point2d origin = uvBox.min;
+        chartUVOrigin.push_back(origin);
+
+        const double maxAbs = std::max(
+            std::max(std::abs(uvBox.min.X()), std::abs(uvBox.min.Y())),
+            std::max(std::abs(uvBox.max.X()), std::abs(uvBox.max.Y())));
+        chartMaxAbsCoord.push_back(maxAbs);
+        if (maxAbs > worstAbsCoord) {
+            worstAbsCoord = maxAbs;
+            worstAbsCoordId = c->id;
+            worstAbsCoordBox = uvBox;
         }
-        outlines.push_back(outline);
+
+        // Extract outline in double precision, shift to local origin, then scale by mul and convert to float.
+        const Outline2d outlineD = ExtractOutline2d(*c);
+        Outline2f outlineF;
+        outlineF.reserve(outlineD.size());
+
+        // Track original area before scaling (translation-invariant).
+        double originalAreaAbs = std::abs(vcg::tri::OutlineUtil<double>::Outline2Area(outlineD));
+        chartAreasOriginal.push_back(originalAreaAbs);
+
+        // Quantify how much precision would be lost by representing absolute (unrebased) UVs in float.
+        // This directly confirms the original failure mode: huge translations lead to large float quantization
+        // steps, which can make packing transforms inconsistent for some charts.
+        double maxErrAbs = 0.0;
+        double maxErrReb = 0.0;
+        for (const auto& p : outlineD) {
+            const double ax = p.X() * double(mul);
+            const double ay = p.Y() * double(mul);
+            const float fax = static_cast<float>(ax);
+            const float fay = static_cast<float>(ay);
+            maxErrAbs = std::max(maxErrAbs, std::abs(ax - double(fax)));
+            maxErrAbs = std::max(maxErrAbs, std::abs(ay - double(fay)));
+
+            const double rx = (p.X() - origin.X()) * double(mul);
+            const double ry = (p.Y() - origin.Y()) * double(mul);
+            const float frx = static_cast<float>(rx);
+            const float fry = static_cast<float>(ry);
+            maxErrReb = std::max(maxErrReb, std::abs(rx - double(frx)));
+            maxErrReb = std::max(maxErrReb, std::abs(ry - double(fry)));
+        }
+        floatQuantErrAbs.push_back(maxErrAbs);
+        floatQuantErrRebased.push_back(maxErrReb);
+        if (maxErrAbs > worstErrAbs) {
+            worstErrAbs = maxErrAbs;
+            worstErrAbsId = c->id;
+        }
+        if (maxErrReb > worstErrRebased) {
+            worstErrRebased = maxErrReb;
+            worstErrRebasedId = c->id;
+        }
+
+        for (const auto& p : outlineD) {
+            const double x = (p.X() - origin.X()) * double(mul);
+            const double y = (p.Y() - origin.Y()) * double(mul);
+            outlineF.push_back(vcg::Point2f(static_cast<float>(x), static_cast<float>(y)));
+        }
+        outlines.push_back(std::move(outlineF));
+    }
+
+    // [DIAG] Confirm the "large translation + float precision" failure mode without spamming per-chart logs.
+    if (!charts.empty()) {
+        auto quantileInPlace = [](std::vector<double>& v, double q) -> double {
+            if (v.empty()) return 0.0;
+            if (q <= 0.0) return *std::min_element(v.begin(), v.end());
+            if (q >= 1.0) return *std::max_element(v.begin(), v.end());
+            const std::size_t idx = std::min(v.size() - 1, (std::size_t)std::llround(q * double(v.size() - 1)));
+            std::nth_element(v.begin(), v.begin() + idx, v.end());
+            return v[idx];
+        };
+
+        auto countGreater = [](const std::vector<double>& v, double t) -> std::size_t {
+            return (std::size_t)std::count_if(v.begin(), v.end(), [&](double x) { return x > t; });
+        };
+
+        std::vector<double> absCoordTmp = chartMaxAbsCoord;
+        std::vector<double> errAbsTmp = floatQuantErrAbs;
+        std::vector<double> errRebTmp = floatQuantErrRebased;
+
+        const double absP50 = quantileInPlace(absCoordTmp, 0.50);
+        const double absP95 = quantileInPlace(absCoordTmp, 0.95);
+        const double absMax = *std::max_element(chartMaxAbsCoord.begin(), chartMaxAbsCoord.end());
+
+        const double errAbsP95 = quantileInPlace(errAbsTmp, 0.95);
+        const double errAbsMax = *std::max_element(floatQuantErrAbs.begin(), floatQuantErrAbs.end());
+        const double errRebP95 = quantileInPlace(errRebTmp, 0.95);
+        const double errRebMax = *std::max_element(floatQuantErrRebased.begin(), floatQuantErrRebased.end());
+
+        const std::size_t errAbsGt1 = countGreater(floatQuantErrAbs, 1.0);
+        const std::size_t errAbsGt4 = countGreater(floatQuantErrAbs, 4.0);
+        const std::size_t errRebGt1 = countGreater(floatQuantErrRebased, 1.0);
+        const std::size_t errRebGt4 = countGreater(floatQuantErrRebased, 4.0);
+
+        std::ostringstream oss;
+        oss.setf(std::ios::fixed);
+        oss << std::setprecision(3);
+        oss << "[DIAG][PackPrecision] charts=" << charts.size()
+            << " maxAbsCoordPx(p50/p95/max)=" << absP50 << "/" << absP95 << "/" << absMax
+            << " floatQuantErrAbsPx(p95/max)=" << errAbsP95 << "/" << errAbsMax
+            << " >1px=" << errAbsGt1 << " >4px=" << errAbsGt4
+            << " floatQuantErrRebasedPx(p95/max)=" << errRebP95 << "/" << errRebMax
+            << " >1px=" << errRebGt1 << " >4px=" << errRebGt4;
+        LOG_INFO << oss.str();
+
+        if (worstAbsCoordId != INVALID_ID && worstAbsCoord > 0.0) {
+            LOG_INFO << "[DIAG][PackPrecision] Worst abs-coord chartId=" << worstAbsCoordId
+                     << " maxAbsCoordPx=" << worstAbsCoord
+                     << " uvBox=[(" << worstAbsCoordBox.min.X() << "," << worstAbsCoordBox.min.Y()
+                     << ")-(" << worstAbsCoordBox.max.X() << "," << worstAbsCoordBox.max.Y() << ")]";
+        }
+        if (worstErrAbsId != INVALID_ID && worstErrAbs > 0.0) {
+            LOG_INFO << "[DIAG][PackPrecision] Worst abs float-quant chartId=" << worstErrAbsId
+                     << " maxErrPx=" << worstErrAbs;
+        }
+        if (worstErrRebasedId != INVALID_ID && worstErrRebased > 0.0) {
+            LOG_INFO << "[DIAG][PackPrecision] Worst rebased float-quant chartId=" << worstErrRebasedId
+                     << " maxErrPx=" << worstErrRebased;
+        }
     }
 
     // Precompute per-chart absolute UV area (after per-chart scaling)
@@ -572,6 +706,7 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         for (unsigned ci : remainingUnpacked) {
             float mul = chartScaleMul[ci];
             ChartHandle chartptr = charts[ci];
+            const vcg::Point2d origin = chartUVOrigin[ci];
             auto outline = ExtractOutline2d(*chartptr);
             
             vcg::Box2d bb;
@@ -594,7 +729,9 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
             singleOutlineVec.emplace_back();
             singleOutlineVec.back().reserve(outline.size());
             for (const auto &p : outline) {
-                singleOutlineVec.back().push_back(vcg::Point2f(static_cast<float>(p.X()*mul), static_cast<float>(p.Y()*mul)));
+                const double x = (p.X() - origin.X()) * double(mul);
+                const double y = (p.Y() - origin.Y()) * double(mul);
+                singleOutlineVec.back().push_back(vcg::Point2f(static_cast<float>(x), static_cast<float>(y)));
             }
  
             std::vector<vcg::Similarity2f> singleTrVec;
@@ -631,6 +768,37 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
         }
     }
 
+    // Validate post-packing UV bounds per chart (bounded logging).
+    // This catches the original failure mode (charts not ending up in [0,1]) as close as possible to the source.
+    struct PackOutlier {
+        RegionID chartId = INVALID_ID;
+        int textureIndex = -1;
+        int textureW = 0;
+        int textureH = 0;
+        std::size_t faceCount = 0;
+        float mul = 1.0f;
+        vcg::Point2d origin = vcg::Point2d::Zero();
+        double maxAbsCoordPx = 0.0;
+        double floatQuantErrAbsPx = 0.0;
+        double floatQuantErrRebasedPx = 0.0;
+        vcg::Similarity2f tr;
+        vcg::Box2d uvBoxAfter;
+        double maxDeviation = 0.0;
+    };
+    std::vector<PackOutlier> outliers;
+    outliers.reserve(64);
+    std::size_t outOfRangeCharts = 0;
+    std::size_t nonFiniteCharts = 0;
+
+    auto maxDeviationFromUnitSquare = [](const vcg::Box2d& b, double eps) -> double {
+        double d = 0.0;
+        if (b.min.X() < 0.0 - eps) d = std::max(d, -b.min.X());
+        if (b.min.Y() < 0.0 - eps) d = std::max(d, -b.min.Y());
+        if (b.max.X() > 1.0 + eps) d = std::max(d, b.max.X() - 1.0);
+        if (b.max.Y() > 1.0 + eps) d = std::max(d, b.max.Y() - 1.0);
+        return d;
+    };
+
     for (unsigned i = 0; i < charts.size(); ++i) {
         for (auto fptr : charts[i]->fpVec) {
             int ic = chartContainerIndices[i];
@@ -643,11 +811,14 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
                 }
             }
             else {
-                Point2i gridSize = atlasContainerSizes[ic];
+                const Point2i gridSize = atlasContainerSizes[ic];
+                const float mul = chartScaleMul[i];
+                const vcg::Point2d origin = chartUVOrigin[i];
                 for (int j = 0; j < fptr->VN(); ++j) {
-                    Point2d uv = fptr->WT(j).P();
-                    float mul = chartScaleMul[i];
-                    Point2f p = chartPackingTransforms[i] * (Point2f(uv[0] * mul, uv[1] * mul));
+                    const Point2d uv = fptr->WT(j).P();
+                    const double lx = (uv.X() - origin.X()) * double(mul);
+                    const double ly = (uv.Y() - origin.Y()) * double(mul);
+                    Point2f p = chartPackingTransforms[i] * Point2f(static_cast<float>(lx), static_cast<float>(ly));
                     p.X() /= (double) gridSize.X();
                     p.Y() /= (double) gridSize.Y();
                     fptr->V(j)->T().P() = Point2d(p.X(), p.Y());
@@ -657,10 +828,86 @@ int Pack(const std::vector<ChartHandle>& charts, TextureObjectHandle textureObje
                 }
             }
         }
+
+        // Compute chart bounds once, after all faces have been updated.
+        const int ic = chartContainerIndices[i];
+        if (ic >= 0) {
+            vcg::Box2d chartBoxAfter;
+            bool anyNonFinite = false;
+            for (auto fptr : charts[i]->fpVec) {
+                for (int j = 0; j < fptr->VN(); ++j) {
+                    const vcg::Point2d uvOut = fptr->WT(j).P();
+                    if (!std::isfinite(uvOut.X()) || !std::isfinite(uvOut.Y())) {
+                        anyNonFinite = true;
+                    } else {
+                        chartBoxAfter.Add(uvOut);
+                    }
+                }
+            }
+
+            if (anyNonFinite) {
+                nonFiniteCharts++;
+            } else {
+                constexpr double EPS = 1e-6;
+                const double dev = maxDeviationFromUnitSquare(chartBoxAfter, EPS);
+                if (dev > 0.0) {
+                    outOfRangeCharts++;
+                    const Point2i gridSize = atlasContainerSizes[ic];
+                    PackOutlier o;
+                    o.chartId = charts[i]->id;
+                    o.textureIndex = ic;
+                    o.textureW = gridSize.X();
+                    o.textureH = gridSize.Y();
+                    o.faceCount = charts[i]->FN();
+                    o.mul = chartScaleMul[i];
+                    o.origin = chartUVOrigin[i];
+                    o.maxAbsCoordPx = chartMaxAbsCoord[i];
+                    o.floatQuantErrAbsPx = floatQuantErrAbs[i];
+                    o.floatQuantErrRebasedPx = floatQuantErrRebased[i];
+                    o.tr = chartPackingTransforms[i];
+                    o.uvBoxAfter = chartBoxAfter;
+                    o.maxDeviation = dev;
+                    outliers.push_back(o);
+                }
+            }
+        }
     }
 
     for (auto c : charts)
         c->ParameterizationChanged();
+
+    // [DIAG] Emit bounded post-pack chart bounds summary (and top outliers if any).
+    LOG_INFO << "[DIAG][PackApply] charts=" << charts.size()
+             << " packed=" << totPackedCharts
+             << " outOfRangeCharts=" << outOfRangeCharts
+             << " nonFiniteCharts=" << nonFiniteCharts;
+
+    if (!outliers.empty()) {
+        std::sort(outliers.begin(), outliers.end(), [](const PackOutlier& a, const PackOutlier& b) {
+            return a.maxDeviation > b.maxDeviation;
+        });
+        const std::size_t limit = std::min<std::size_t>(25, outliers.size());
+        LOG_WARN << "[DIAG][PackApply] " << outOfRangeCharts
+                 << " charts ended up with UVs outside [0,1] after packing. Showing top " << limit
+                 << " by deviation:";
+        for (std::size_t i = 0; i < limit; ++i) {
+            const auto& o = outliers[i];
+            LOG_WARN << "  chartId=" << o.chartId
+                     << " texIndex=" << o.textureIndex
+                     << " texSize=" << o.textureW << "x" << o.textureH
+                     << " faces=" << o.faceCount
+                     << " mul=" << o.mul
+                     << " origin=(" << o.origin.X() << "," << o.origin.Y() << ")"
+                     << " maxAbsCoordPx=" << o.maxAbsCoordPx
+                     << " floatQuantErrAbsPx=" << o.floatQuantErrAbsPx
+                     << " floatQuantErrRebasedPx=" << o.floatQuantErrRebasedPx
+                     << " tr(tra=(" << o.tr.tra.X() << "," << o.tr.tra.Y() << ") sca=" << o.tr.sca
+                     << " rotRad=" << o.tr.rotRad << ")"
+                     << " uvBoxAfter=[(" << o.uvBoxAfter.min.X() << "," << o.uvBoxAfter.min.Y()
+                     << ")-(" << o.uvBoxAfter.max.X() << "," << o.uvBoxAfter.max.Y() << ")]"
+                     << " maxDeviation=" << o.maxDeviation;
+        }
+    }
 
     // Log rasterizer cache stats for this packing pass
     PackingStats stats;

@@ -43,6 +43,7 @@
 #include <vector>
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <map>
 #include <memory>
 #include <algorithm>
@@ -380,46 +381,132 @@ int main(int argc, char *argv[])
     tri::UpdateNormal<Mesh>::PerFaceNormalized(m);
     tri::UpdateNormal<Mesh>::PerVertexNormalized(m);
 
-    // Pre-scan: enforce normalized UVs in [0,1] at source. If any UV in a chart violates this,
-    // skip the entire chart by zeroing its UVs so it is excluded downstream.
+    // Input UV normalization: some inputs contain UVs outside [0,1] and expect Repeat wrapping.
+    // We wrap them into [0,1] (with small-noise clamping near the boundaries) and log counts.
     {
-        // Ensure topology is available for connected-component traversal
-        tri::UpdateTopology<Mesh>::FaceFace(m);
+        struct WrapStats {
+            std::uint64_t wedgeCount = 0;
+            std::uint64_t nonFinite = 0;
+            std::uint64_t outOfRange = 0;
+            std::uint64_t clampedNoise = 0;
+            std::uint64_t wrappedRepeat = 0;
+            double maxDeviation = 0.0;
+            int worstFaceIndex = -1;
+            int worstCorner = -1;
+            int worstTextureIndex = -1;
+            vcg::Point2d worstUV = vcg::Point2d::Zero();
+        };
 
-        int skippedChartsNonNormalized = 0;
-        {
-            GraphHandle preGraph = ComputeGraph(m, textureObject);
-            for (auto &entry : preGraph->charts) {
-                auto chart = entry.second;
-                bool chartOk = true;
-                for (auto fptr : chart->fpVec) {
-                    for (int i = 0; i < 3; ++i) {
-                        const auto &p = fptr->cWT(i).P();
-                        if (!std::isfinite(p.X()) || !std::isfinite(p.Y()) || p.X() < 0.0 || p.X() > 1.0 || p.Y() < 0.0 || p.Y() > 1.0) {
-                            chartOk = false;
-                            break;
-                        }
-                    }
-                    if (!chartOk) break;
+        WrapStats s;
+
+        auto maxDeviationFromUnitSquare = [](const vcg::Point2d& uv) -> double {
+            double d = 0.0;
+            if (uv.X() < 0.0) d = std::max(d, -uv.X());
+            if (uv.X() > 1.0) d = std::max(d, uv.X() - 1.0);
+            if (uv.Y() < 0.0) d = std::max(d, -uv.Y());
+            if (uv.Y() > 1.0) d = std::max(d, uv.Y() - 1.0);
+            return d;
+        };
+
+        auto wrapComponent01 = [](double x) -> double {
+            // Wrap to [0,1) using positive modulo.
+            double f = x - std::floor(x);
+            // Guard against occasional 1.0 due to numeric edge cases.
+            if (f >= 1.0) f = 0.0;
+            if (f < 0.0) f = 0.0;
+            return f;
+        };
+
+        auto normalizeComponent = [&](double x, double noiseEps, bool& didClamp, bool& didWrap) -> double {
+            if (!std::isfinite(x)) {
+                didClamp = true;
+                return 0.0;
+            }
+            // Clamp very small numerical noise near 0/1.
+            if (noiseEps > 0.0 && x < 0.0 && x > -noiseEps) {
+                didClamp = true;
+                return 0.0;
+            }
+            if (noiseEps > 0.0 && x > 1.0 && x < 1.0 + noiseEps) {
+                didClamp = true;
+                return 1.0;
+            }
+            if (x < 0.0 || x > 1.0) {
+                didWrap = true;
+                return wrapComponent01(x);
+            }
+            return x;
+        };
+
+        for (std::size_t fi = 0; fi < m.face.size(); ++fi) {
+            auto& f = m.face[fi];
+            if (f.IsD()) continue;
+            const int vn = f.VN();
+            const int ti = f.WT(0).N();
+            const int w = (textureObject && ti >= 0 && ti < (int)textureObject->ArraySize())
+                ? textureObject->TextureWidth((std::size_t)ti)
+                : 0;
+            const int h = (textureObject && ti >= 0 && ti < (int)textureObject->ArraySize())
+                ? textureObject->TextureHeight((std::size_t)ti)
+                : 0;
+            // Clamp overshoots up to 1 texel in normalized space (matches typical "floating noise" cases).
+            const double epsU = (w > 0) ? (1.0 / (double)w) : 0.0;
+            const double epsV = (h > 0) ? (1.0 / (double)h) : 0.0;
+            for (int k = 0; k < vn; ++k) {
+                s.wedgeCount++;
+                const vcg::Point2d uv = f.WT(k).P();
+                const bool finite = std::isfinite(uv.X()) && std::isfinite(uv.Y());
+                if (!finite) {
+                    s.nonFinite++;
+                    f.WT(k).P() = vcg::Point2d::Zero();
+                    continue;
                 }
-                if (!chartOk) {
-                    // Skip chart: zero out its UVs so it becomes zero-area and is ignored later
-                    for (auto fptr : chart->fpVec) {
-                        for (int j = 0; j < fptr->VN(); ++j) {
-                            fptr->V(j)->T().P() = Point2d::Zero();
-                            fptr->V(j)->T().N() = 0;
-                            fptr->WT(j).P() = Point2d::Zero();
-                            fptr->WT(j).N() = 0;
-                        }
+
+                const double dev = maxDeviationFromUnitSquare(uv);
+                if (dev > 0.0) {
+                    s.outOfRange++;
+                    if (dev > s.maxDeviation) {
+                        s.maxDeviation = dev;
+                        s.worstFaceIndex = (int)fi;
+                        s.worstCorner = k;
+                        s.worstTextureIndex = f.WT(0).N();
+                        s.worstUV = uv;
                     }
-                    skippedChartsNonNormalized++;
+                }
+
+                bool didClamp = false;
+                bool didWrap = false;
+                const double u2 = normalizeComponent(uv.X(), epsU, didClamp, didWrap);
+                const double v2 = normalizeComponent(uv.Y(), epsV, didClamp, didWrap);
+                if (didClamp) s.clampedNoise++;
+                if (didWrap) s.wrappedRepeat++;
+                if (didClamp || didWrap) {
+                    f.WT(k).P() = vcg::Point2d(u2, v2);
                 }
             }
         }
 
-        if (skippedChartsNonNormalized > 0) {
-            LOG_WARN << "[VALIDATION] Skipped " << skippedChartsNonNormalized
-                     << " charts due to non-normalized or non-finite UVs (expected [0,1]).";
+        {
+            std::ostringstream oss;
+            oss.setf(std::ios::fixed);
+            oss << std::setprecision(6);
+            oss << "[VALIDATION] Input UV wrap: wedges=" << s.wedgeCount
+                << " nonFinite=" << s.nonFinite
+                << " outOfRange=" << s.outOfRange
+                << " wrappedRepeat=" << s.wrappedRepeat
+                << " clampedNoise=" << s.clampedNoise
+                << " maxDeviation=" << s.maxDeviation;
+            LOG_INFO << oss.str();
+            if (s.nonFinite > 0) {
+                LOG_WARN << "[VALIDATION] Input UV wrap: replaced non-finite UVs with (0,0) (count=" << s.nonFinite << ").";
+            }
+            if (s.outOfRange > 0) {
+                LOG_WARN << "[VALIDATION] Input UV wrap: found out-of-range UVs. Worst deviation=" << s.maxDeviation
+                         << " at faceIndex=" << s.worstFaceIndex
+                         << " corner=" << s.worstCorner
+                         << " texIndex=" << s.worstTextureIndex
+                         << " uv=(" << s.worstUV.X() << ", " << s.worstUV.Y() << ").";
+            }
         }
     }
 

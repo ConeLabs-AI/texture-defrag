@@ -163,6 +163,7 @@ int RotateChartForResampling(ChartHandle chart, const std::set<Mesh::FacePointer
         }
     }
 
+    chart->ParameterizationChanged();
     return tri::Index(chart->mesh, anchorFp);
 }
 

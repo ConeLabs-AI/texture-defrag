@@ -187,6 +187,179 @@ static void LogUVRangeStats(const char* stage, const Mesh& m)
     }
 }
 
+static void RebaseInputUVsPerChart(GraphHandle graph, TextureObjectHandle textureObject)
+{
+    if (!graph || !textureObject || textureObject->ArraySize() == 0) return;
+
+    struct Stats {
+        std::size_t charts = 0;
+        std::size_t emptyCharts = 0;
+        std::size_t nonFiniteCharts = 0;
+        std::size_t mixedTextureCharts = 0;
+        std::size_t shiftedCharts = 0;
+        std::size_t unchangedCharts = 0;
+        std::size_t outOfRangeAfterCharts = 0;
+        std::uint64_t clampedNoiseWedges = 0;
+
+        double maxAbsShiftTilesU = 0.0;
+        double maxAbsShiftTilesV = 0.0;
+        double maxAbsShiftPxU = 0.0;
+        double maxAbsShiftPxV = 0.0;
+    };
+
+    Stats stats;
+
+    constexpr double NOISE_EPS_PX = 1.0; // allow up to 1px overshoot before clamping
+
+    auto clampNoisePx = [&](double& x, int period) {
+        if (period <= 0) return;
+        if (x < 0.0 && x > -NOISE_EPS_PX) {
+            x = 0.0;
+            stats.clampedNoiseWedges++;
+        } else if (x > double(period) && x < double(period) + NOISE_EPS_PX) {
+            x = double(period);
+            stats.clampedNoiseWedges++;
+        }
+    };
+
+    auto shiftForDimPx = [&](double minv, double maxv, int period) -> int64_t {
+        if (period <= 0) return 0;
+        const double p = double(period);
+
+        // Already (approximately) inside the base texture domain.
+        if (minv >= -NOISE_EPS_PX && maxv <= p + NOISE_EPS_PX) return 0;
+
+        const double mid = 0.5 * (minv + maxv);
+        if (!std::isfinite(mid)) return 0;
+
+        // Choose the tile index of the interval midpoint.
+        const double tileD = std::floor(mid / p);
+        if (!std::isfinite(tileD)) return 0;
+
+        // Clamp to int64 range (very defensive).
+        const double maxTile = double(std::numeric_limits<int64_t>::max() / period);
+        const double minTile = double(std::numeric_limits<int64_t>::min() / period);
+        const double tileClamped = std::min(std::max(tileD, minTile), maxTile);
+        const int64_t tile = static_cast<int64_t>(tileClamped);
+        return tile * static_cast<int64_t>(period);
+    };
+
+    for (auto& entry : graph->charts) {
+        ChartHandle chart = entry.second;
+        stats.charts++;
+        if (!chart || chart->fpVec.empty()) {
+            stats.emptyCharts++;
+            continue;
+        }
+
+        // Charts should be texture-index coherent due to seam splitting, but validate defensively.
+        const int ti = chart->fpVec.front()->cWT(0).N();
+        bool mixed = false;
+        for (auto fptr : chart->fpVec) {
+            if (fptr->cWT(0).N() != ti) {
+                mixed = true;
+                break;
+            }
+        }
+        if (mixed) {
+            stats.mixedTextureCharts++;
+            continue;
+        }
+
+        if (ti < 0 || ti >= (int)textureObject->ArraySize()) continue;
+        const int texW = textureObject->TextureWidth((std::size_t)ti);
+        const int texH = textureObject->TextureHeight((std::size_t)ti);
+        if (texW <= 0 || texH <= 0) continue;
+
+        vcg::Box2d bb;
+        bool anyNonFinite = false;
+        for (auto fptr : chart->fpVec) {
+            const int vn = fptr->VN();
+            for (int i = 0; i < vn; ++i) {
+                const vcg::Point2d uv = fptr->cWT(i).P();
+                if (!std::isfinite(uv.X()) || !std::isfinite(uv.Y())) {
+                    anyNonFinite = true;
+                    break;
+                }
+                bb.Add(uv);
+            }
+            if (anyNonFinite) break;
+        }
+        if (anyNonFinite) {
+            stats.nonFiniteCharts++;
+            continue;
+        }
+
+        const int64_t shiftU = shiftForDimPx(bb.min.X(), bb.max.X(), texW);
+        const int64_t shiftV = shiftForDimPx(bb.min.Y(), bb.max.Y(), texH);
+
+        if (shiftU != 0 || shiftV != 0) {
+            stats.shiftedCharts++;
+        } else {
+            stats.unchangedCharts++;
+        }
+
+        stats.maxAbsShiftPxU = std::max(stats.maxAbsShiftPxU, std::abs(double(shiftU)));
+        stats.maxAbsShiftPxV = std::max(stats.maxAbsShiftPxV, std::abs(double(shiftV)));
+        stats.maxAbsShiftTilesU = std::max(stats.maxAbsShiftTilesU, std::abs(double(shiftU)) / double(texW));
+        stats.maxAbsShiftTilesV = std::max(stats.maxAbsShiftTilesV, std::abs(double(shiftV)) / double(texH));
+
+        vcg::Box2d bbAfter;
+        for (auto fptr : chart->fpVec) {
+            const int vn = fptr->VN();
+            for (int i = 0; i < vn; ++i) {
+                vcg::Point2d uv = fptr->cWT(i).P();
+                uv.X() -= double(shiftU);
+                uv.Y() -= double(shiftV);
+                clampNoisePx(uv.X(), texW);
+                clampNoisePx(uv.Y(), texH);
+                fptr->WT(i).P() = uv;
+                fptr->V(i)->T().P() = uv;
+                fptr->V(i)->T().N() = fptr->WT(i).N();
+                bbAfter.Add(uv);
+            }
+        }
+        chart->ParameterizationChanged();
+
+        if (bbAfter.min.X() < -NOISE_EPS_PX || bbAfter.min.Y() < -NOISE_EPS_PX
+            || bbAfter.max.X() > double(texW) + NOISE_EPS_PX
+            || bbAfter.max.Y() > double(texH) + NOISE_EPS_PX) {
+            stats.outOfRangeAfterCharts++;
+        }
+    }
+
+    {
+        std::ostringstream oss;
+        oss.setf(std::ios::fixed);
+        oss << std::setprecision(3);
+        oss << "[VALIDATION] Input UV per-chart rebase: charts=" << stats.charts
+            << " shifted=" << stats.shiftedCharts
+            << " unchanged=" << stats.unchangedCharts
+            << " clampedNoiseWedges=" << stats.clampedNoiseWedges
+            << " outOfRangeAfterCharts=" << stats.outOfRangeAfterCharts
+            << " maxAbsShiftTiles(u/v)=" << stats.maxAbsShiftTilesU << "/" << stats.maxAbsShiftTilesV
+            << " maxAbsShiftPx(u/v)=" << stats.maxAbsShiftPxU << "/" << stats.maxAbsShiftPxV;
+        LOG_INFO << oss.str();
+    }
+
+    if (stats.emptyCharts > 0) {
+        LOG_WARN << "[VALIDATION] Input UV per-chart rebase: encountered " << stats.emptyCharts
+                 << " empty charts (skipped).";
+    }
+    if (stats.nonFiniteCharts > 0) {
+        LOG_WARN << "[VALIDATION] Input UV per-chart rebase: encountered " << stats.nonFiniteCharts
+                 << " charts with non-finite UVs (skipped).";
+    }
+    if (stats.mixedTextureCharts > 0) {
+        LOG_WARN << "[VALIDATION] Input UV per-chart rebase: encountered " << stats.mixedTextureCharts
+                 << " charts spanning multiple texture indices (skipped).";
+    }
+    if (stats.outOfRangeAfterCharts > 0) {
+        LOG_WARN << "[VALIDATION] Input UV per-chart rebase: " << stats.outOfRangeAfterCharts
+                 << " charts still fall outside the base texture domain after rebasing.";
+    }
+}
+
 static void LogTextureSizeChanges(const char* stage,
                                   const std::vector<TextureSize>& before,
                                   const std::vector<TextureSize>& after)
@@ -381,15 +554,16 @@ int main(int argc, char *argv[])
     tri::UpdateNormal<Mesh>::PerFaceNormalized(m);
     tri::UpdateNormal<Mesh>::PerVertexNormalized(m);
 
-    // Input UV normalization: some inputs contain UVs outside [0,1] and expect Repeat wrapping.
-    // We wrap them into [0,1] (with small-noise clamping near the boundaries) and log counts.
+    // Input UV validation: some inputs contain UVs outside [0,1] and expect Repeat wrapping.
+    // We do NOT per-wedge wrap here (can explode charts that straddle an integer boundary);
+    // instead we will rebase UVs per-chart after seam cutting.
     {
         struct WrapStats {
             std::uint64_t wedgeCount = 0;
             std::uint64_t nonFinite = 0;
             std::uint64_t outOfRange = 0;
             std::uint64_t clampedNoise = 0;
-            std::uint64_t wrappedRepeat = 0;
+            std::uint64_t repeatDetected = 0;
             double maxDeviation = 0.0;
             int worstFaceIndex = -1;
             int worstCorner = -1;
@@ -408,16 +582,7 @@ int main(int argc, char *argv[])
             return d;
         };
 
-        auto wrapComponent01 = [](double x) -> double {
-            // Wrap to [0,1) using positive modulo.
-            double f = x - std::floor(x);
-            // Guard against occasional 1.0 due to numeric edge cases.
-            if (f >= 1.0) f = 0.0;
-            if (f < 0.0) f = 0.0;
-            return f;
-        };
-
-        auto normalizeComponent = [&](double x, double noiseEps, bool& didClamp, bool& didWrap) -> double {
+        auto clampNoise01 = [&](double x, double noiseEps, bool& didClamp) -> double {
             if (!std::isfinite(x)) {
                 didClamp = true;
                 return 0.0;
@@ -430,10 +595,6 @@ int main(int argc, char *argv[])
             if (noiseEps > 0.0 && x > 1.0 && x < 1.0 + noiseEps) {
                 didClamp = true;
                 return 1.0;
-            }
-            if (x < 0.0 || x > 1.0) {
-                didWrap = true;
-                return wrapComponent01(x);
             }
             return x;
         };
@@ -475,13 +636,15 @@ int main(int argc, char *argv[])
                 }
 
                 bool didClamp = false;
-                bool didWrap = false;
-                const double u2 = normalizeComponent(uv.X(), epsU, didClamp, didWrap);
-                const double v2 = normalizeComponent(uv.Y(), epsV, didClamp, didWrap);
-                if (didClamp) s.clampedNoise++;
-                if (didWrap) s.wrappedRepeat++;
-                if (didClamp || didWrap) {
+                const double u2 = clampNoise01(uv.X(), epsU, didClamp);
+                const double v2 = clampNoise01(uv.Y(), epsV, didClamp);
+                if (didClamp) {
+                    s.clampedNoise++;
                     f.WT(k).P() = vcg::Point2d(u2, v2);
+                }
+
+                if ((uv.X() < 0.0 - epsU) || (uv.X() > 1.0 + epsU) || (uv.Y() < 0.0 - epsV) || (uv.Y() > 1.0 + epsV)) {
+                    s.repeatDetected++;
                 }
             }
         }
@@ -490,18 +653,18 @@ int main(int argc, char *argv[])
             std::ostringstream oss;
             oss.setf(std::ios::fixed);
             oss << std::setprecision(6);
-            oss << "[VALIDATION] Input UV wrap: wedges=" << s.wedgeCount
+            oss << "[VALIDATION] Input UV stats: wedges=" << s.wedgeCount
                 << " nonFinite=" << s.nonFinite
                 << " outOfRange=" << s.outOfRange
-                << " wrappedRepeat=" << s.wrappedRepeat
+                << " repeatDetected=" << s.repeatDetected
                 << " clampedNoise=" << s.clampedNoise
                 << " maxDeviation=" << s.maxDeviation;
             LOG_INFO << oss.str();
             if (s.nonFinite > 0) {
-                LOG_WARN << "[VALIDATION] Input UV wrap: replaced non-finite UVs with (0,0) (count=" << s.nonFinite << ").";
+                LOG_WARN << "[VALIDATION] Input UV stats: replaced non-finite UVs with (0,0) (count=" << s.nonFinite << ").";
             }
             if (s.outOfRange > 0) {
-                LOG_WARN << "[VALIDATION] Input UV wrap: found out-of-range UVs. Worst deviation=" << s.maxDeviation
+                LOG_WARN << "[VALIDATION] Input UV stats: found out-of-range UVs. Worst deviation=" << s.maxDeviation
                          << " at faceIndex=" << s.worstFaceIndex
                          << " corner=" << s.worstCorner
                          << " texIndex=" << s.worstTextureIndex
@@ -516,9 +679,10 @@ int main(int argc, char *argv[])
 
     int vndupIn;
     PrepareMesh(m, &vndupIn);
-    ComputeWedgeTexCoordStorageAttribute(m);
 
     GraphHandle graph = ComputeGraph(m, textureObject);
+    RebaseInputUVsPerChart(graph, textureObject);
+    ComputeWedgeTexCoordStorageAttribute(m);
     timings["Mesh preparation & Graph computation"] = t.TimeSinceLastCheck();
 
     std::map<RegionID, bool> flipped;
